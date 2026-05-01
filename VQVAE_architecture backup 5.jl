@@ -82,21 +82,15 @@ Instead of cat(x, dims=3)
 """
 add_dim3_reshape(::Nothing) = nothing
 
-# ╔═╡ 899a848e-6861-4d1e-9090-50b50e5d6e82
+# ╔═╡ 6ba143e2-50df-441a-8f38-3ea8d9edd4d8
 function add_dim3_reshape(x)
-    nd = ndims(x)
-    if nd == 2
-        return reshape(x, size(x, 1), 1, size(x, 2))
-    elseif nd == 3
-        return x
+    if ndims(x) == 1
+        return reshape(x, :, 1, 1)
+    elseif ndims(x) == 2
+        return reshape(x, size(x, 1), size(x, 2), 1)
     else
         return x
     end
-end
-
-# ╔═╡ e4316ace-3e89-4efd-a613-7204d5cc116b
-function flatten_batch(x)
-    return reshape(x, size(x, 1), :)
 end
 
 # ╔═╡ a0000002-0000-0000-0000-000000000001
@@ -107,25 +101,19 @@ Base.@kwdef struct VQVAE_Para
     nt::Int                                # waveform length (time samples)
     d::Int = 64                            # codebook embedding dimension
     K::Int = 8                             # codebook size (number of entries)
-    T::Int = 1                             # number of RVQ stages (1 = single-stage VQ)
+    T::Int = 1                             # quantized vectors per waveform (1 = single-vector VQ)
     beta_commit::Float32 = 0.25f0          # commitment loss weight
     enc_kernels::Vector{Int} = [32, 16, 8, 4]
     enc_filters::Vector{Int} = [8, 16, 32, 64]
     enc_strides::Vector{Int} = [2, 2, 2, 2]
     dec_kernels::Vector{Int} = [4, 8, 16]
     dec_filters::Vector{Int} = [64, 48, 16, 1]
+    dec_upstrides::Vector{Int} = [2, 2, 1]
     use_bn::Bool = true
-    use_pre_vq_conv::Bool = true           # if true, use 1x1 Conv pre-quant projection (Misha-style) instead of Dense
-    time_resolved_quantization::Bool = false   # if true, quantize each latent time position and decode full latent sequence
-    use_pre_vq_lstm::Bool = false          # if true, apply stacked LSTM on pre-VQ sequence map before quantization
-    pre_vq_lstm_layers::Int = 2            # number of LSTM layers in pre-VQ context stack
-    pre_vq_lstm_residual::Bool = true      # residual connection around stacked LSTM context block
     ema_decay::Float32 = 0.99f0            # EMA decay for codebook updates
     epsilon::Float32 = 1f-5                # EMA Laplace smoothing
     dead_threshold::Int = 2                # reset codebook entry after this many batches unused
     entropy_weight::Float32 = 0.01f0       # entropy bonus to encourage uniform codebook usage
-    decode_codebook_superposition::Bool = false  # if true, decode each VQ slot independently then average
-    use_slot_weights::Bool = false             # if true (and superposition), weight slots by softmax(Dense(z_pre))
     seed = nothing
 end
 
@@ -156,219 +144,16 @@ begin
     end
 
     function (m::Conv1DChain)(x)
-        x_flat = flatten_batch(x)
-        x3 = add_dim3_reshape(x_flat)
-        features = m.chain(x3)
-        if ndims(features) == 3 && size(features, 2) == 1
-            return reshape(features, size(features, 1), size(features, 3))
-        elseif ndims(features) == 3
-            return features
-        end
-        return reshape(features, size(features, 1), size(x_flat, 2))
+        x = add_dim3_reshape(x)
+        n1, n2, n3 = size(x)
+        X = reshape(x, n1, 1, n2 * n3)
+        X = m.chain(X)
+        return reshape(X, :, n2, n3)
     end
-
-    struct SeqConv1DChain
-        chain::Chain
-    end
-    Flux.@layer SeqConv1DChain trainable = (chain,)
-
-    function (m::SeqConv1DChain)(::Nothing)
-        return nothing
-    end
-
-    function (m::SeqConv1DChain)(x)
-        x3 = ndims(x) == 3 ? x : add_dim3_reshape(flatten_batch(x))
-        y = m.chain(x3)
-        if ndims(y) == 3 && size(y, 2) == 1
-            return reshape(y, size(y, 1), size(y, 3))
-        end
-        return y
-    end
-end
-
-# ╔═╡ a0000004-0000-0000-0000-000000000001
-"""
-Build a 1D convolutional encoder.
-
-Returns `(encoder, flat_output_length)`.
-"""
-function get_vq_conv_encoder(nt; kernels=[32, 16, 8, 4], filters=[8, 16, 32, 64],
-                              strides=[2, 2, 2, 2], use_bn::Bool=true,
-                              flatten_output::Bool=true, return_outsize::Bool=false)
-    @assert length(kernels) == length(filters)
-    layers = Any[]
-    nin = 1
-    for (i, k) in enumerate(kernels)
-        nout = filters[i]
-        s = i <= length(strides) ? strides[i] : 1
-        push!(layers, Conv((k,), nin => nout, activation; pad=SamePad(), stride=s))
-        if use_bn && i < length(kernels)
-            push!(layers, BatchNorm(nout))
-        end
-        nin = nout
-    end
-    trunk = Chain(layers...)
-    outsize = Flux.outputsize(trunk, (nt, 1); padbatch=true)
-    flat_len = prod(outsize)
-    if flatten_output
-        push!(layers, Flux.flatten)
-        enc = Conv1DChain(Chain(layers...))
-    else
-        enc = Conv1DChain(trunk)
-    end
-    return return_outsize ? (enc, flat_len, outsize) : (enc, flat_len)
 end
 
 # ╔═╡ a0000005-0000-0000-0000-000000000001
 md"## Conv Decoder"
-
-# ╔═╡ 4b94fad2-0aaa-4308-94ee-cb33a419df17
-"""
-Build a 1D convolutional decoder (transposed convolutions).
-
-Input dimension: `d_in` (latent dim fed to the decoder).
-Output: reconstructed waveform of length `nt`.
-"""
-function get_vq_conv_decoder(nt, d_in; kernels=[4, 8, 16], filters=[64, 48, 16, 1],
-                              upstrides=[2, 2, 1], use_bn=false)
-    @assert length(kernels) == length(filters) - 1
-    @assert length(upstrides) == length(kernels)
-
-    bottleneck_len = nt
-    for s in upstrides
-        bottleneck_len = cld(bottleneck_len, s)
-    end
-    bottleneck_channels = filters[1]
-
-    layers = Any[]
-    # Project from latent to spatial
-    push!(layers, Dense(d_in, bottleneck_len * bottleneck_channels, activation))
-    push!(layers, ReshapeLayer((bottleneck_len, bottleneck_channels)))
-
-    nin = bottleneck_channels
-    for (i, k) in enumerate(kernels)
-        nout = filters[i + 1]
-        s = upstrides[i]
-        if i < length(kernels)
-            push!(layers, ConvTranspose((k,), nin => nout, activation; stride=s, pad=SamePad()))
-            if use_bn
-                push!(layers, BatchNorm(nout))
-            end
-        else
-            # Final layer: no activation, output 1 channel
-            push!(layers, ConvTranspose((k,), nin => nout; stride=s, pad=SamePad()))
-        end
-        nin = nout
-    end
-
-    return Conv1DChain(Chain(layers...)), bottleneck_len, bottleneck_channels
-end
-
-# ╔═╡ 565be3d9-72c7-4ba0-95e1-78c9d6d914c9
-"""
-Build a 1D sequence decoder (transposed convolutions) that preserves latent time axis.
-
-Input: `(L_lat, d_in, batch)` latent sequence map.
-Output: reconstructed waveform `(nt, batch)`.
-"""
-function get_vq_conv_decoder_sequence(nt, d_in; kernels=[4, 8, 16], filters=[64, 48, 16, 1],
-                                      upstrides=[2, 2, 1], use_bn=false)
-    @assert length(kernels) == length(filters) - 1
-    @assert length(upstrides) == length(kernels)
-
-    layers = Any[]
-    push!(layers, Conv((1,), d_in => filters[1], activation; stride=1, pad=SamePad()))
-
-    nin = filters[1]
-    for (i, k) in enumerate(kernels)
-        nout = filters[i + 1]
-        s = upstrides[i]
-        if i < length(kernels)
-            push!(layers, ConvTranspose((k,), nin => nout, activation; stride=s, pad=SamePad()))
-            if use_bn
-                push!(layers, BatchNorm(nout))
-            end
-        else
-            push!(layers, ConvTranspose((k,), nin => nout; stride=s, pad=SamePad()))
-        end
-        nin = nout
-    end
-    return SeqConv1DChain(Chain(layers...))
-end
-
-# ╔═╡ 0e1ccfa6-aa0c-4247-9fd7-89352d949091
-"""
-Infer decoder upstrides from encoder strides (no decoder strides in parameters).
-This keeps only non-trivial downsampling strides and maps them to decoder depth.
-"""
-function infer_dec_upstrides(enc_strides::AbstractVector{<:Integer}, n_dec_layers::Int)
-    vals = reverse(Int[s for s in enc_strides if s > 1])
-    if isempty(vals)
-        vals = [1]
-    end
-    while length(vals) > n_dec_layers
-        vals[2] *= vals[1]
-        deleteat!(vals, 1)
-    end
-    while length(vals) < n_dec_layers
-        push!(vals, 1)
-    end
-    vals
-end
-
-# ╔═╡ 379a84d8-11df-4ef7-b1da-2a9595007036
-"""
-Auto-adjust decoder upstrides so output length matches `nt` exactly.
-Searches around inferred strides with a small bounded grid.
-"""
-function auto_dec_upstrides_for_nt(nt::Int, latent_len::Int, d::Int;
-                                   dec_kernels::AbstractVector{<:Integer},
-                                   dec_filters::AbstractVector{<:Integer},
-                                   use_bn::Bool,
-                                   enc_strides::AbstractVector{<:Integer})
-    n_dec = length(dec_kernels)
-    base = infer_dec_upstrides(enc_strides, n_dec)
-
-    function outlen(strides::Vector{Int})
-        dec = get_vq_conv_decoder_sequence(nt, d;
-            kernels=collect(dec_kernels), filters=collect(dec_filters),
-            upstrides=strides, use_bn=use_bn)
-        Flux.outputsize(dec.chain, (latent_len, d); padbatch=true)[1]
-    end
-
-    if all(base .<= collect(Int, dec_kernels)) && outlen(base) == nt
-        return base
-    end
-
-    # cuDNN-safe constraint: keep stride <= kernel per layer.
-    kmax = collect(Int, dec_kernels)
-    lo = max.(1, base .- 3)
-    hi = min.(kmax, base .+ 3)
-    best = copy(base)
-    best_err = abs(outlen(base) - nt)
-    exact_found = false
-    ranges = [lo[i]:hi[i] for i in 1:n_dec]
-    for cand in Iterators.product(ranges...)
-        s = collect(Int, cand)
-        any(s .> kmax) && continue
-        olen = outlen(s)
-        err = abs(olen - nt)
-        if err < best_err
-            best = s
-            best_err = err
-        end
-        if err == 0
-            exact_found = true
-            best = s
-            break
-        end
-    end
-    if !exact_found
-        error("Could not find exact decoder geometry for nt=$nt with current enc_strides=$(collect(enc_strides)) " *
-              "and decoder kernels=$(collect(dec_kernels)). Try changing enc_strides.")
-    end
-    return best
-end
 
 # ╔═╡ a0000006-0000-0000-0000-000000000001
 md"""## Vector Quantizer (EMA)
@@ -508,149 +293,70 @@ md"## VQ-VAE Model"
 
 # ╔═╡ a0000009-0000-0000-0000-000000000001
 begin
-    struct PreVQLSTMContext{L}
-        layers::L
-        residual::Bool
-    end
-    Flux.@layer PreVQLSTMContext trainable = (layers,)
-
-    function PreVQLSTMContext(ch::Int; num_layers::Int=2, residual::Bool=true)
-        layers = [Flux.LSTM(ch => ch) for _ in 1:num_layers]
-        return PreVQLSTMContext(layers, residual)
-    end
-
-    function (m::PreVQLSTMContext)(x::AbstractArray{Float32,3})
-        h = permutedims(x, (2, 1, 3))  # (C, L, B) for Flux sequence layers
-        for layer in m.layers
-            h = layer(h)
-        end
-        y = permutedims(h, (2, 1, 3))
-        return m.residual ? x .+ y : y
-    end
-
-    function resolve_analysis_time_index(codebook_indices_time, time_index)
-        if isnothing(codebook_indices_time)
-            return nothing
-        end
-        L = size(codebook_indices_time, 2)
-        ti = isnothing(time_index) ? cld(L, 2) : Int(time_index)
-        1 <= ti <= L || throw(ArgumentError("time_index=$ti is out of bounds for latent length $L"))
-        return ti
-    end
-
-    function select_codebook_indices(result; time_index=nothing)
-        if isnothing(result.codebook_indices_time)
-            return result.codebook_indices, nothing
-        end
-        ti = resolve_analysis_time_index(result.codebook_indices_time, time_index)
-        return @view(result.codebook_indices_time[:, ti, :]), ti
-    end
-
-    struct VQVAE{E,P,C,VQ,D}
-        encoder::E         # Conv1DChain: waveform → flat features or feature map
-        pre_vq::P          # Dense(flat→d) or Conv1D(1x1, C_enc→d)
-        pre_vq_context::C  # nothing or stacked LSTM context over (L, d, batch)
-        quantizer::VQ      # Vector{VectorQuantizerEMA}, one codebook per RVQ stage
-        decoder::D         # Conv1DChain/SeqConv1DChain: d → waveform
-        T::Int             # number of RVQ stages
+    struct VQVAE{E,P,VQ,D}
+        encoder::E         # Conv1DChain: waveform → flat features
+        pre_vq::P          # Dense: flat → (d * T)
+        quantizer::VQ      # VectorQuantizerEMA
+        decoder::D         # Conv1DChain: d → waveform (independent component decoder)
+        T::Int             # number of quantized vectors per waveform
         d::Int             # codebook embedding dimension
-        use_pre_vq_conv::Bool  # true => pre_vq is Conv1D map projection
-        time_resolved_quantization::Bool  # true => quantize per latent time step
     end
-    Flux.@layer VQVAE trainable = (encoder, pre_vq, pre_vq_context, decoder)
-
-    function project_pre_vq_map(m::VQVAE, feat)
-        if m.use_pre_vq_conv
-            z_map = m.pre_vq(feat)                              # (L, d, batch)
-            return m.pre_vq_context === nothing ? z_map : m.pre_vq_context(z_map)
-        end
-        feat_flat = reshape(feat, size(feat, 1), :)
-        z_pre = m.pre_vq(feat_flat)                            # (d, batch)
-        return reshape(z_pre, 1, size(z_pre, 1), size(z_pre, 2))  # (1, d, batch)
-    end
-
-    function project_pre_vq(m::VQVAE, feat)
-        z_map = project_pre_vq_map(m, feat)
-        return dropdims(mean(z_map; dims=1); dims=1)           # (d, batch)
-    end
+    Flux.@layer VQVAE trainable = (encoder, pre_vq, decoder)
 
     """
     Forward pass through VQ-VAE.
 
     Arguments:
-    - `x`: input waveform (nt, batch)
+    - `x`: input waveform (nt, ntau, batch) or (nt, batch)
     - `training`: whether to update EMA codebook
 
     Returns named tuple with reconstruction `xhat`, losses, codebook indices, etc.
     """
     function (m::VQVAE)(x; beta_commit::Float32=0.25f0, training::Bool=true)
-        x_flat = flatten_batch(x)
-        feat = m.encoder(x_flat)
-        z_map = project_pre_vq_map(m, feat)
-        L_lat = size(z_map, 1)
-        N_batch = size(z_map, 3)
+        x3 = add_dim3_reshape(x)
+        n1, n2, n3 = size(x3)  # (nt, ntau, batch)
 
-        z_e, N_total = if m.time_resolved_quantization
-            z_pre_time = reshape(permutedims(z_map, (2, 1, 3)), m.d, L_lat * N_batch)
-            (z_pre_time, L_lat * N_batch)
-        else
-            z_pre_vec = dropdims(mean(z_map; dims=1); dims=1)
-            (z_pre_vec, N_batch)
-        end
+        # Encode: (nt, ntau, batch) → (flat, ntau, batch)
+        feat = m.encoder(x3)  # (flat_len, ntau, batch)
+        feat_flat = reshape(feat, size(feat, 1), :)  # (flat_len, ntau*batch)
 
-        # Residual Vector Quantization (RVQ): shared codebook applied T times to residual.
-        residual = z_e
-        z_q_sum = nothing
-        stage_z_q = training ? nothing : Vector{AbstractMatrix{Float32}}(undef, m.T)
-        codebook_indices = training ? nothing : Array{Int}(undef, m.T, N_total)
-        vq_loss_total = 0f0
-        commit_loss_total = 0f0
-        perplexity_sum = 0f0
-        entropy_loss_total = 0f0
+        # Project to VQ space: (flat_len, N) → (d*T, N) → reshape to (d, T*N)
+        z_pre = m.pre_vq(feat_flat)  # (d*T, N)
+        N_total = size(z_pre, 2)  # ntau * batch
+        z_e = reshape(z_pre, m.d, m.T * N_total)  # (d, T * N)
+
+        # Quantize
+        vq_result = m.quantizer(z_e; beta_commit, training)
+
+        # Batch decode all T component vectors in one decoder call (faster)
+        z_q = reshape(vq_result.z_q, m.d, m.T, N_total)  # (d, T, N_total)
+        # Build (d, ntau, batch*T) where each T split holds one component map
+        dec_input_all = zeros(eltype(z_q), m.d, n2, n3 * m.T)
         for t in 1:m.T
-            rt = m.quantizer[t](residual; beta_commit, training)
-            if !training
-                stage_z_q[t] = rt.z_q
-            end
-            z_q_sum = isnothing(z_q_sum) ? rt.z_q : (z_q_sum .+ rt.z_q)
-            residual = residual .- Zygote.@ignore(rt.z_q)
-                if !training
-                    codebook_indices[t, :] .= Int.(cpu(rt.indices))
-                end
-                vq_loss_total += rt.vq_loss
-                commit_loss_total += rt.commit_loss
-                perplexity_sum += rt.perplexity
-                entropy_loss_total += rt.entropy_loss
-            end
-
-        codebook_indices_time = nothing
-        codebook_indices_out = nothing
-        if m.time_resolved_quantization
-            if !training
-                codebook_indices_time = reshape(codebook_indices, m.T, L_lat, N_batch)
-            end
-            z_q_for_dec = permutedims(reshape(z_q_sum, m.d, L_lat, N_batch), (2, 1, 3))  # (L, d, batch)
-            xhat = m.decoder(z_q_for_dec)
-        else
-            if !training
-                codebook_indices_out = codebook_indices
-            end
-            xhat = m.decoder(z_q_sum)
+            # Extract component for all input waveforms
+            z_q_t = reshape(z_q[:, t, :], m.d, n2, n3)  # (d, ntau, batch)
+            dec_input_all[:, :, (t-1)*n3 .+ (1:n3)] = z_q_t
+        end
+        # Single decoder call for all components: (nt, ntau, batch*T)
+        xhat_all = m.decoder(dec_input_all)
+        # Sum component results back into (nt, ntau, batch)
+        xhat = zeros(eltype(xhat_all), n1, n2, n3)
+        for t in 1:m.T
+            xhat .+= xhat_all[:, :, (t-1)*n3 .+ (1:n3)]
         end
 
-        z_q_3d = training ? reshape(z_q_sum, m.d, 1, N_total) : cat([reshape(stage_z_q[t], m.d, 1, N_total) for t in 1:m.T]...; dims=2)
+        # Reshape indices: (T*N,) → (T, ntau, batch) for interpretability
+        codebook_indices = reshape(cpu(vq_result.indices), m.T, n2, n3)
 
         return (;
             xhat,
-            xhat_per_slot = nothing,
-            z_e = reshape(z_e, m.d, 1, N_total),
-            z_q = z_q_3d,
-            codebook_indices = codebook_indices_out,
-            codebook_indices_time,
-            vq_loss      = vq_loss_total,
-            commit_loss  = commit_loss_total,
-            perplexity   = perplexity_sum / m.T,
-            entropy_loss = entropy_loss_total,
+            z_e = reshape(z_e, m.d, m.T, N_total),
+            z_q = reshape(vq_result.z_q, m.d, m.T, N_total),
+            codebook_indices,
+            vq_loss = vq_result.vq_loss,
+            commit_loss = vq_result.commit_loss,
+            perplexity = vq_result.perplexity,
+            entropy_loss = vq_result.entropy_loss,
         )
     end
 
@@ -658,123 +364,101 @@ begin
     Encode-only: get quantized codes and codebook indices for a batch of waveforms.
     No decoder pass.
     """
-    function encode(m, x)
-        x_flat = flatten_batch(x)
-        feat = m.encoder(x_flat)
-        z_map = project_pre_vq_map(m, feat)
-        L_lat = size(z_map, 1)
-        N_batch = size(z_map, 3)
-        z_e, N_total = if m.time_resolved_quantization
-            z_pre_time = reshape(permutedims(z_map, (2, 1, 3)), m.d, L_lat * N_batch)
-            (z_pre_time, L_lat * N_batch)
-        else
-            z_pre_vec = dropdims(mean(z_map; dims=1); dims=1)
-            (z_pre_vec, N_batch)
-        end
-        residual = z_e
-        stage_z_q = Vector{AbstractMatrix{Float32}}(undef, m.T)
-        codebook_indices = Array{Int}(undef, m.T, N_total)
-        for t in 1:m.T
-            rt = m.quantizer[t](residual; training=false)
-            stage_z_q[t] = rt.z_q
-            residual = residual .- rt.z_q
-            codebook_indices[t, :] .= Int.(cpu(rt.indices))
-        end
-        codebook_indices_time = m.time_resolved_quantization ? reshape(codebook_indices, m.T, L_lat, N_batch) : nothing
-        z_q = cat([reshape(stage_z_q[t], m.d, 1, N_total) for t in 1:m.T]...; dims=2)
-        codebook_indices_out = m.time_resolved_quantization ? nothing : codebook_indices
-        return (; z_e=reshape(z_e, m.d, 1, N_total), z_q, codebook_indices=codebook_indices_out, codebook_indices_time)
+    function encode(m::VQVAE, x)
+        x3 = add_dim3_reshape(x)
+        n1, n2, n3 = size(x3)
+        feat = m.encoder(x3)
+        feat_flat = reshape(feat, size(feat, 1), :)
+        z_pre = m.pre_vq(feat_flat)
+        N_total = size(z_pre, 2)
+        z_e = reshape(z_pre, m.d, m.T * N_total)
+        vq_result = m.quantizer(z_e; training=false)
+        codebook_indices = reshape(cpu(vq_result.indices), m.T, n2, n3)
+        z_q = reshape(vq_result.z_q, m.d, m.T, n2, n3)
+        return (; z_e=reshape(z_e, m.d, m.T, n2, n3), z_q, codebook_indices)
     end
 
     """
     Get codebook prototypes: returns (d, K) matrix.
     """
-    get_codebook(m) = [cpu(m.quantizer[t].embedding) for t in 1:m.T]
+    get_codebook(m::VQVAE) = cpu(m.quantizer.embedding)
 
     """
     Get cluster assignment histogram for a batch.
     Returns (K,) vector of percentages.
     """
-    function combination_multipliers(K, T)
-        [K ^ (t - 1) for t in 1:T]
-    end
-
-    function combination_index(digits::AbstractVector{Int}, multipliers::AbstractVector{Int})
-        return sum((digits .- 1) .* multipliers) + 1
-    end
-
-    function combination_digits(idx::Int, K::Int, T::Int)
-        multipliers = combination_multipliers(K, T)
-        digits = zeros(Int, T)
-        n = idx - 1
-        for t in 1:T
-            digits[t] = mod(div(n, multipliers[t]), K) + 1
-        end
-        return digits
-    end
-
-    function combination_labels(K, T)
-        if T == 1
-            return [string(k) for k in 1:K]
-        end
-        total = K ^ T
-        labels = Vector{String}(undef, total)
-        for idx in 1:total
-            labels[idx] = join(combination_digits(idx, K, T), "-")
-        end
-        return labels
-    end
-    function get_cluster_percentages(m, x; time_index=nothing, return_labels::Bool=false)
+    function get_cluster_percentages(m::VQVAE, x)
         result = encode(m, x)
-        ci_sel, resolved_time_index = select_codebook_indices(result; time_index)
-        K = m.quantizer[1].K
-        counts = m.T == 1 ? zeros(Float32, K) : zeros(Float32, K ^ m.T)
-        multipliers = m.T == 1 ? nothing : combination_multipliers(K, m.T)
-        N_total = size(ci_sel, 2)
-        for j in 1:N_total
-            if m.T == 1
-                counts[ci_sel[1, j]] += 1f0
-            else
-                digits = ci_sel[:, j]
-                combo_idx = combination_index(digits, multipliers)
-                counts[combo_idx] += 1f0
+        if m.T == 1
+            indices = vec(result.codebook_indices)
+            K = m.quantizer.K
+            counts = zeros(Float32, K)
+            for idx in indices
+                counts[idx] += 1f0
+            end
+        else
+            ci_flat = reshape(result.codebook_indices, m.T, :)
+            K = m.quantizer.K
+            counts = zeros(Float32, K * m.T)
+            for j in 1:size(ci_flat, 2)
+                for t in 1:m.T
+                    cluster_id = (t - 1) * K + ci_flat[t, j]
+                    counts[cluster_id] += 1f0
+                end
             end
         end
-        labels = m.T == 1 ? [string(k) for k in 1:K] : combination_labels(K, m.T)
-        percentages = counts ./ max(sum(counts), 1f-10) .* 100f0
-        return return_labels ? (; percentages, labels, time_index=resolved_time_index) : percentages
+        return counts ./ sum(counts) .* 100f0
     end
 
     """
-    Get waveforms assigned to the combination `(k₁, k₂, …)` of length `T`.
+    Get waveforms assigned to cluster `k`.
     Returns `(data_in_cluster, indices_in_data)`.
     """
-    function filter_cluster(m, x, ks::NTuple{N, Int}; time_index=nothing) where {N}
-        if N != m.T
-            throw(ArgumentError("Expected tuple of length m.T=" * string(m.T)))
-        end
+    function filter_cluster(m::VQVAE, x, k::Int)
         result = encode(m, x)
-        x_flat = flatten_batch(x)
-        ci_flat, _ = select_codebook_indices(result; time_index)
-        ks_vec = collect(ks)
-        selected = findall(j -> all(ci_flat[:, j] .== ks_vec), 1:size(ci_flat, 2))
-        return x_flat[:, selected], selected
+        if m.T == 1
+            # Single-vector VQ: straightforward cluster assignment
+            idx_flat = vec(result.codebook_indices)  # (ntau * batch,)
+            selected = findall(==(k), idx_flat)
+            x3 = add_dim3_reshape(x)
+            n1, n2, n3 = size(x3)
+            x_flat = reshape(x3, n1, n2 * n3)
+            return x_flat[:, selected], selected
+        else
+            # K*T clusters: for each position t and code index k
+            ci = result.codebook_indices
+            n2, n3 = size(ci, 2), size(ci, 3)
+            x3 = add_dim3_reshape(x)
+            x_flat = reshape(x3, size(x3, 1), n2 * n3)
+            ci_flat = reshape(ci, m.T, n2 * n3)
+            selected = Int[]
+            K = m.quantizer.K
+            for j in 1:size(ci_flat, 2)
+                for t in 1:m.T
+                    cluster_id = (t - 1) * K + ci_flat[t, j]
+                    if cluster_id == k
+                        push!(selected, j)
+                    end
+                end
+            end
+            return x_flat[:, selected], selected
+        end
     end
 
     """
     Get cluster averages: mean waveform per cluster.
     Returns (nt, K) matrix.
     """
-    function get_cluster_averages(m, x; time_index=nothing)
+    function get_cluster_averages(m::VQVAE, x)
         result = encode(m, x)
-        ci_flat, _ = select_codebook_indices(result; time_index)
-        K = m.quantizer[1].K
-        nt = size(x, 1)
-        x_flat = cpu(flatten_batch(x))
-        N_total = size(ci_flat, 2)
+        K = m.quantizer.K
+        x3 = add_dim3_reshape(x)
+        nt = size(x3, 1)
+        n2, n3 = size(result.codebook_indices, 2), size(result.codebook_indices, 3)
+        x_flat = cpu(reshape(x3, nt, n2 * n3))
 
         if m.T == 1
-            indices = vec(ci_flat)
+            indices = vec(result.codebook_indices)
             avgs = zeros(Float32, nt, K)
             counts = zeros(Int, K)
             for (j, k) in enumerate(indices)
@@ -787,178 +471,30 @@ begin
                 end
             end
         else
-            num_combinations = K ^ m.T
-            avgs = zeros(Float32, nt, num_combinations)
-            counts = zeros(Int, num_combinations)
-            multipliers = [K ^ (t - 1) for t in 1:m.T]
-            for j in 1:N_total
-                digits = ci_flat[:, j] .- 1
-                combo_idx = sum(digits .* multipliers) + 1
-                avgs[:, combo_idx] .+= x_flat[:, j]
-                counts[combo_idx] += 1
+            # K*T clusters: for each position t and code index k
+            ci_flat = reshape(result.codebook_indices, m.T, n2 * n3)
+            avgs = zeros(Float32, nt, K * m.T)
+            counts = zeros(Int, K * m.T)
+            for j in 1:size(ci_flat, 2)
+                for t in 1:m.T
+                    k = ci_flat[t, j]
+                    cluster_id = (t - 1) * K + k
+                    avgs[:, cluster_id] .+= x_flat[:, j]
+                    counts[cluster_id] += 1
+                end
             end
-            for idx in 1:num_combinations
-                if counts[idx] > 0
-                    avgs[:, idx] ./= counts[idx]
+            for cluster_id in 1:(K * m.T)
+                if counts[cluster_id] > 0
+                    avgs[:, cluster_id] ./= counts[cluster_id]
                 end
             end
         end
         return avgs
     end
-
-    function reconstruct_at_time_index(m, x; time_index::Int)
-        m.time_resolved_quantization || throw(ArgumentError("reconstruct_at_time_index requires time_resolved_quantization=true"))
-
-        x_flat = flatten_batch(x)
-        feat = m.encoder(x_flat)
-        z_map = project_pre_vq_map(m, feat)
-        L_lat = size(z_map, 1)
-        N_batch = size(z_map, 3)
-        1 <= time_index <= L_lat || throw(ArgumentError("time_index=$time_index is out of bounds for latent length $L_lat"))
-
-        z_e = reshape(permutedims(z_map, (2, 1, 3)), m.d, L_lat * N_batch)
-        residual = z_e
-        z_q_sum = nothing
-        codebook_indices_time = Array{Int}(undef, m.T, L_lat, N_batch)
-
-        for t in 1:m.T
-            rt = m.quantizer[t](residual; training=false)
-            z_q_sum = isnothing(z_q_sum) ? rt.z_q : (z_q_sum .+ rt.z_q)
-            residual = residual .- rt.z_q
-            codebook_indices_time[t, :, :] .= reshape(Int.(cpu(rt.indices)), L_lat, N_batch)
-        end
-
-        z_q_seq = reshape(z_q_sum, m.d, L_lat, N_batch)
-        time_mask = reshape(xpu(Float32.(collect(1:L_lat) .== time_index)), 1, L_lat, 1)
-        z_q_selected = z_q_seq .* time_mask
-        xhat = m.decoder(permutedims(z_q_selected, (2, 1, 3)))
-
-        return (; xhat, z_q_selected, codebook_indices_time, time_index)
-    end
-
-    function decode_cluster_at_time_index(m, ks::NTuple{N, Int}, latent_len::Int; time_index::Int, batchsize::Int=1) where {N}
-        m.time_resolved_quantization || throw(ArgumentError("decode_cluster_at_time_index requires time_resolved_quantization=true"))
-        N == m.T || throw(ArgumentError("Expected tuple of length m.T=" * string(m.T)))
-        1 <= time_index <= latent_len || throw(ArgumentError("time_index=$time_index is out of bounds for latent length $latent_len"))
-
-        slot_code = zeros(Float32, m.d, batchsize) |> xpu
-        for t in 1:m.T
-            1 <= ks[t] <= m.quantizer[t].K || throw(ArgumentError("Code index $(ks[t]) out of bounds for stage $t"))
-            slot_code = slot_code .+ reshape(m.quantizer[t].embedding[:, ks[t]], m.d, 1)
-        end
-
-        time_mask = reshape(xpu(Float32.(collect(1:latent_len) .== time_index)), 1, latent_len, 1)
-        z_q_selected = repeat(reshape(slot_code, m.d, 1, batchsize), 1, latent_len, 1) .* time_mask
-        xhat = m.decoder(permutedims(z_q_selected, (2, 1, 3)))
-
-        return (; xhat, z_q_selected, time_index, cluster=ks)
-    end
 end
 
 # ╔═╡ a0000010-0000-0000-0000-000000000001
 md"## Model Factory"
-
-# ╔═╡ a0000011-0000-0000-0000-000000000001
-"""
-    get_vqvae(para::VQVAE_Para)
-
-Build a VQ-VAE model and loss history from parameters.
-
-Returns `(model, loss_history)`.
-"""
-function get_vqvae(para::VQVAE_Para)
-    if para.seed !== nothing
-        Random.seed!(para.seed)
-    end
-    if para.time_resolved_quantization && !para.use_pre_vq_conv
-        error("time_resolved_quantization=true requires use_pre_vq_conv=true")
-    end
-    if para.use_pre_vq_lstm && !para.use_pre_vq_conv
-        error("use_pre_vq_lstm=true requires use_pre_vq_conv=true")
-    end
-    if para.decode_codebook_superposition || para.use_slot_weights
-        @warn "RVQ path ignores decode_codebook_superposition/use_slot_weights."
-    end
-
-    # Encoder + pre-VQ projection
-    enc_outsize = nothing
-    if para.use_pre_vq_conv
-        encoder, _, enc_outsize = get_vq_conv_encoder(para.nt;
-            kernels=para.enc_kernels, filters=para.enc_filters,
-            strides=para.enc_strides, use_bn=para.use_bn,
-            flatten_output=false, return_outsize=true)
-        enc_channels = enc_outsize[2]
-        # Channel projection before RVQ (1x1 in 1D)
-        pre_vq = Chain(Conv((1,), enc_channels => para.d; stride=1, pad=0)) |> xpu
-    else
-        encoder, flat_len, enc_outsize = get_vq_conv_encoder(para.nt;
-            kernels=para.enc_kernels, filters=para.enc_filters,
-            strides=para.enc_strides, use_bn=para.use_bn,
-            flatten_output=true, return_outsize=true)
-        # Legacy path: flat encoder output → d latent vector
-        pre_vq = Dense(flat_len, para.d) |> xpu
-    end
-    pre_vq_context = para.use_pre_vq_lstm ?
-        xpu(PreVQLSTMContext(para.d;
-            num_layers=para.pre_vq_lstm_layers,
-            residual=para.pre_vq_lstm_residual)) : nothing
-
-    # Separate codebook per RVQ stage (EnCodec-style RVQ)
-    quantizer = [VectorQuantizerEMA(para.K, para.d;
-        decay=para.ema_decay, epsilon=para.epsilon,
-        dead_threshold=para.dead_threshold)
-        for _ in 1:para.T]
-
-    # Decoder strides are derived from encoder strides and auto-adjusted for nt.
-    @assert enc_outsize !== nothing "Encoder outsize unavailable for decoder geometry inference."
-    latent_len = enc_outsize[1]
-    dec_upstrides = auto_dec_upstrides_for_nt(para.nt, latent_len, para.d;
-        dec_kernels=para.dec_kernels, dec_filters=para.dec_filters,
-        use_bn=para.use_bn, enc_strides=para.enc_strides)
-
-    # Decoder (build on CPU first; run geometry checks before moving to GPU)
-    decoder_cpu = if para.time_resolved_quantization
-        get_vq_conv_decoder_sequence(para.nt, para.d;
-            kernels=para.dec_kernels, filters=para.dec_filters,
-            upstrides=dec_upstrides, use_bn=para.use_bn)
-    else
-        get_vq_conv_decoder(para.nt, para.d;
-            kernels=para.dec_kernels, filters=para.dec_filters,
-            upstrides=dec_upstrides, use_bn=para.use_bn)[1]
-    end
-
-    # Enforce exact geometry (Misha-style): decoder output length must match nt exactly.
-    dec_out_len = if para.time_resolved_quantization
-        outsz = Flux.outputsize(decoder_cpu.chain, (latent_len, para.d); padbatch=true)
-        outsz[1]
-    else
-        outsz = Flux.outputsize(decoder_cpu.chain, (para.d,); padbatch=true)
-        outsz[1]
-    end
-    if dec_out_len != para.nt
-        error("Decoder geometry mismatch: output length $dec_out_len != nt $(para.nt). " *
-              "Adjust enc_strides (or decoder kernels/filters).")
-    end
-    @info "Auto decoder upstrides" dec_upstrides nt=para.nt latent_len
-
-    decoder = xpu(decoder_cpu)
-    model = VQVAE(xpu(encoder), xpu(pre_vq), pre_vq_context, quantizer, decoder,
-                  para.T, para.d, para.use_pre_vq_conv,
-                  para.time_resolved_quantization)
-
-    loss_history = (;
-        train_recon = Float32[],
-        test_recon = Float32[],
-        train_commit = Float32[],
-        test_commit = Float32[],
-        train_total = Float32[],
-        test_total = Float32[],
-        train_perplexity = Float32[],
-        test_perplexity = Float32[],
-    )
-
-    return model, loss_history
-end
 
 # ╔═╡ a0000012-0000-0000-0000-000000000001
 md"## Loss Functions"
@@ -978,11 +514,11 @@ Arguments:
 - `para`: VQVAE_Para with loss weights
 - `training`: whether to update EMA codebook
 """
-function loss_vqvae(model, x, para; training::Bool=true)
-    x_flat = xpu(x)
-    result = model(x_flat; beta_commit=para.beta_commit, training)
+function loss_vqvae(model::VQVAE, x, para::VQVAE_Para; training::Bool=true)
+    x3 = add_dim3_reshape(xpu(x))
+    result = model(x3; beta_commit=para.beta_commit, training)
 
-    recon_loss = Flux.mse(result.xhat, x_flat)
+    recon_loss = Flux.mse(result.xhat, x3)
     commit_loss = result.commit_loss
     entropy_loss = result.entropy_loss
 
@@ -995,12 +531,154 @@ end
 # ╔═╡ a0000015-0000-0000-0000-000000000001
 md"## Data Iterator"
 
+# ╔═╡ 6a14416d-83e9-4b1f-903b-cbbfff15471f
+"""
+Unpaired data iterator: yields batches of `(nt, ntau)` from a pooled waveform matrix.
+Samples `ntau` waveforms randomly each step.
+"""
+struct UnpairedDataIterator
+    D::AbstractMatrix{Float32}   # (nt, nwaveforms) pooled causal+acausal on GPU
+    ntau::Int
+    nsteps::Int
+end
+
+# ╔═╡ abeb3f47-fe08-4ea2-a2b7-7282007baff6
+function Base.iterate(it::UnpairedDataIterator, step=1)
+    step > it.nsteps && return nothing
+    nw = size(it.D, 2)
+    idx = sort(randperm(nw)[1:min(it.ntau, nw)])
+    return it.D[:, idx], step + 1
+end
+
+# ╔═╡ 2bbf8d6a-62f7-4496-aa7c-ecb4af456720
+Base.length(it::UnpairedDataIterator) = it.nsteps
+
+# ╔═╡ a0000004-0000-0000-0000-000000000001
+"""
+Build a 1D convolutional encoder.
+
+Returns `(encoder, flat_output_length)`.
+"""
+function get_vq_conv_encoder(nt; kernels=[32, 16, 8, 4], filters=[8, 16, 32, 64],
+                              strides=[2, 2, 2, 2], use_bn::Bool=true)
+    @assert length(kernels) == length(filters)
+    layers = Any[]
+    nin = 1
+    for (i, k) in enumerate(kernels)
+        nout = filters[i]
+        s = i <= length(strides) ? strides[i] : 1
+        push!(layers, Conv((k,), nin => nout, activation; pad=SamePad(), stride=s))
+        if use_bn && i < length(kernels)
+            push!(layers, BatchNorm(nout))
+        end
+        nin = nout
+    end
+    trunk = Chain(layers...)
+    outsize = Flux.outputsize(trunk, (nt, 1); padbatch=true)
+    flat_len = prod(outsize)
+    push!(layers, Flux.flatten)
+    return Conv1DChain(Chain(layers...)), flat_len
+end
+
+# ╔═╡ 64430447-c267-4eec-8d38-63ccf91d82c4
+"""
+Build a 1D convolutional decoder (transposed convolutions).
+
+Input dimension: `d_in` (latent dim fed to the decoder).
+Output: reconstructed waveform of length `nt`.
+"""
+function get_vq_conv_decoder(nt, d_in; kernels=[4, 8, 16], filters=[64, 48, 16, 1],
+                              upstrides=[2, 2, 1], use_bn=false)
+    @assert length(kernels) == length(filters) - 1
+    @assert length(upstrides) == length(kernels)
+
+    bottleneck_len = nt
+    for s in upstrides
+        bottleneck_len = cld(bottleneck_len, s)
+    end
+    bottleneck_channels = filters[1]
+
+    layers = Any[]
+    # Project from latent to spatial
+    push!(layers, Dense(d_in, bottleneck_len * bottleneck_channels, activation))
+    push!(layers, ReshapeLayer((bottleneck_len, bottleneck_channels)))
+
+    nin = bottleneck_channels
+    for (i, k) in enumerate(kernels)
+        nout = filters[i + 1]
+        s = upstrides[i]
+        if i < length(kernels)
+            push!(layers, ConvTranspose((k,), nin => nout, activation; stride=s, pad=SamePad()))
+            if use_bn
+                push!(layers, BatchNorm(nout))
+            end
+        else
+            # Final layer: no activation, output 1 channel
+            push!(layers, ConvTranspose((k,), nin => nout; stride=s, pad=SamePad()))
+        end
+        nin = nout
+    end
+
+    # Trim or pad to exact nt
+    push!(layers, TrimLayer(nt))
+
+    return Conv1DChain(Chain(layers...)), bottleneck_len, bottleneck_channels
+end
+
+# ╔═╡ a0000011-0000-0000-0000-000000000001
+"""
+    get_vqvae(para::VQVAE_Para)
+
+Build a VQ-VAE model and loss history from parameters.
+
+Returns `(model, loss_history)`.
+"""
+function get_vqvae(para::VQVAE_Para)
+    if para.seed !== nothing
+        Random.seed!(para.seed)
+    end
+
+    # Encoder
+    encoder, flat_len = get_vq_conv_encoder(para.nt;
+        kernels=para.enc_kernels, filters=para.enc_filters,
+        strides=para.enc_strides, use_bn=para.use_bn)
+
+    # Pre-VQ projection: flat encoder output → (d * T) latent vectors
+    pre_vq = Dense(flat_len, para.d * para.T) |> xpu
+
+    # Vector Quantizer with EMA
+    quantizer = VectorQuantizerEMA(para.K, para.d;
+        decay=para.ema_decay, epsilon=para.epsilon,
+        dead_threshold=para.dead_threshold)
+
+    # Decoder: d → nt waveform (independent decoding for each codebook vector)
+    decoder, _, _ = get_vq_conv_decoder_donly(para.nt, para.d;
+        kernels=para.dec_kernels, filters=para.dec_filters,
+        upstrides=para.dec_upstrides, use_bn=para.use_bn)
+
+    model = VQVAE(xpu(encoder), xpu(pre_vq), quantizer, xpu(decoder), para.T, para.d)
+
+    loss_history = (;
+        train_recon = Float32[],
+        test_recon = Float32[],
+        train_commit = Float32[],
+        test_commit = Float32[],
+        train_total = Float32[],
+        test_total = Float32[],
+        train_perplexity = Float32[],
+        test_perplexity = Float32[],
+    )
+
+    return model, loss_history
+end
+
 # ╔═╡ a0000017-0000-0000-0000-000000000001
 md"## Training Loop"
 
 # ╔═╡ eafe181e-19e9-409e-ad1d-ce859cf0e672
 Base.@kwdef struct VQVAE_Training_Para
-    batchsize::Int = 100                            # waveforms per batch
+    ntau::Int = 100                            # waveforms per batch
+    nsteps::Int = 100                          # steps per epoch
     nepoch::Int = 30                           # epochs
     nprint::Int = 1                            # print frequency
     initial_learning_rate::Float64 = 0.001
@@ -1022,24 +700,25 @@ Arguments:
 - `para::VQVAE_Para`: architecture & loss parameters
 - `training_para::VQVAE_Training_Para`: training hyperparameters
 """
-function update(model, loss_history, D_train, D_test,
-                para,
-                training_para=VQVAE_Training_Para())
+function update(model::VQVAE, loss_history, D_train, D_test,
+                para::VQVAE_Para,
+                training_para::VQVAE_Training_Para=VQVAE_Training_Para())
 
-    opt_state = Optimisers.setup(Optimisers.Adam(eta=Float64(training_para.initial_learning_rate)), model)
+    lr_s = Exp(start=training_para.initial_learning_rate, decay=training_para.lr_decay)
+    opt_state = Optimisers.setup(Optimisers.AdamW(eta=Float64(training_para.initial_learning_rate)), model)
 
-    batchsize = min(training_para.batchsize, size(D_train, 2))
-    batchsize_test = min(training_para.batchsize, size(D_test, 2))
-    train_loader = Flux.DataLoader(D_train; batchsize=batchsize, shuffle=true)
-    test_loader = Flux.DataLoader(D_test; batchsize=batchsize_test, shuffle=false)
-    monitor_train = first(train_loader)
-    monitor_test = first(test_loader)
+    ntau = min(training_para.ntau, size(D_train, 2))
+    ntau_test = min(training_para.ntau, size(D_test, 2))
 
     stop_early = false
     @progress name = "VQ-VAE training" for epoch = 1:training_para.nepoch
-        # ── Evaluate on monitor batches ──────────────────────────────────
-        x_tr = monitor_train
-        x_te = monitor_test
+        # ── Data iterators ────────────────────────────────────────────────
+        Xtrain = UnpairedDataIterator(D_train, ntau, training_para.nsteps)
+        Xtest = UnpairedDataIterator(D_test, ntau_test, training_para.nsteps)
+
+        # ── Evaluate on first batch ───────────────────────────────────────
+        x_tr = first(Xtrain)
+        x_te = first(Xtest)
 
         train_metrics = loss_vqvae(model, x_tr, para; training=false)
         test_metrics = loss_vqvae(model, x_te, para; training=false)
@@ -1053,13 +732,16 @@ function update(model, loss_history, D_train, D_test,
         push!(loss_history.train_perplexity, train_metrics.perplexity)
         push!(loss_history.test_perplexity, test_metrics.perplexity)
 
+        # ── LR schedule ──────────────────────────────────────────────────
+        Optimisers.adjust!(opt_state, lr_s(epoch))
+
         # ── Gradient-based training (encoder, pre_vq, decoder) ────────────
         # EMA codebook update happens inside the forward pass
         function train_loss(model, x)
             return loss_vqvae(model, x, para; training=true).total
         end
 
-        for x in train_loader
+        for x in Xtrain
             g = Flux.gradient(train_loss, model, x)[1]
             Optimisers.update!(opt_state, model, g)
         end
@@ -1092,30 +774,20 @@ function plot_training_dashboard(loss_history; title="VQ-VAE Training")
     font_spec = attr(family="Computer Modern, Latin Modern Math, serif")
     grid_color = "rgba(128,128,128,0.2)"
 
-    traces = [
-        # Recon loss → subplot 1 (yaxis="y")
-        PlutoPlotly.scatter(x=epochs, y=loss_history.train_recon, mode="lines",
-            name="Train recon", xaxis="x", yaxis="y",
-            line=attr(color="#1f77b4", width=1.5)),
-        PlutoPlotly.scatter(x=epochs, y=loss_history.test_recon, mode="lines",
-            name="Test recon", xaxis="x", yaxis="y",
-            line=attr(color="#1f77b4", width=1.5, dash="dash")),
-        # Perplexity → subplot 2 (yaxis="y2")
-        PlutoPlotly.scatter(x=epochs, y=loss_history.train_perplexity, mode="lines",
-            name="Train perplexity", xaxis="x", yaxis="y2",
-            line=attr(color="#2ca02c", width=1.5)),
-        PlutoPlotly.scatter(x=epochs, y=loss_history.test_perplexity, mode="lines",
-            name="Test perplexity", xaxis="x", yaxis="y2",
-            line=attr(color="#2ca02c", width=1.5, dash="dash")),
-        # Commit loss → subplot 3 (yaxis="y3")
-        PlutoPlotly.scatter(x=epochs, y=loss_history.train_commit, mode="lines",
-            name="Train commit", xaxis="x", yaxis="y3",
-            line=attr(color="#d62728", width=1.5)),
-        PlutoPlotly.scatter(x=epochs, y=loss_history.test_commit, mode="lines",
-            name="Test commit", xaxis="x", yaxis="y3",
-            line=attr(color="#d62728", width=1.5, dash="dash")),
-    ]
-
+        if m.T == 1
+            # Standard: decode as (d, N) → (d*1, N) → decoder
+            z_q_for_dec = reshape(vq_result.z_q, m.d * m.T, N_total)  # (d, N)
+            dec_input = reshape(z_q_for_dec, m.d * m.T, n2, n3)  # (d, ntau, batch)
+            xhat = m.decoder(dec_input)  # (nt, ntau, batch)
+        else
+            # Decode each d-length codebook vector independently, then sum
+            z_q = reshape(vq_result.z_q, m.d, m.T, N_total)  # (d, T, N_total)
+            xhat = zero(x3)
+            for t in 1:m.T
+                z_q_t = view(z_q, :, t, :)  # (d, N_total)
+                dec_input = reshape(z_q_t, m.d, n2, n3)  # (d, ntau, batch)
+                xhat .= xhat .+ m.decoder_d(dec_input)  # (nt, ntau, batch)
+            end
     layout = Layout(
         title=attr(text=title, font=merge(font_spec, attr(size=18))),
         height=700, width=900,
@@ -1146,8 +818,9 @@ end
 """
 Plot cluster assignment histogram.
 """
-function plot_cluster_histogram(pct_ac, pct_c; title="Cluster Usage", labels=nothing)
-    xlabels = labels === nothing ? string.(1:length(pct_ac)) : labels
+function plot_cluster_histogram(pct_ac, pct_c; title="Cluster Usage")
+    K = length(pct_ac)
+    xlabels = string.(1:K)
     traces = [
         PlutoPlotly.bar(x=xlabels, y=pct_ac, name="Acausal",
             marker=attr(color="rgba(31,119,180,0.7)")),
@@ -1156,9 +829,8 @@ function plot_cluster_histogram(pct_ac, pct_c; title="Cluster Usage", labels=not
     ]
     layout = Layout(
         title=attr(text=title, font=attr(size=20, family="Computer Modern, Latin Modern Math, serif")),
-        barmode="group", height=400, width=800,
-        xaxis=attr(title=labels === nothing ? "Cluster (pos, code)" : "Cluster combination",
-            tickangle=labels === nothing ? 0 : -30),
+        barmode="group", height=400, width=600,
+        xaxis=attr(title="Cluster (pos, code)", dtick=1),
         yaxis=attr(title="Percentage (%)"),
         plot_bgcolor="white", paper_bgcolor="white",
     )
@@ -1170,65 +842,76 @@ md"## Codebook Analysis"
 
 # ╔═╡ 09202321-5cf6-46f1-bd59-6069da6488c6
 """
-Compute agreement rate at a selected latent time index: fraction of waveform
-windows where causal and acausal map to the same code combination.
+Compute agreement rate: fraction of waveform windows where causal and acausal
+map to the same codebook entry (for T=1; for T>1 uses majority vote).
 
 High agreement = encoder extracts direction-invariant features for that window.
 """
-function codebook_agreement(model, D_ac, D_c; time_index=nothing)
+function codebook_agreement(model::VQVAE, D_ac, D_c)
     res_ac = encode(model, D_ac)
     res_c = encode(model, D_c)
-    ci_ac, resolved_time_index = select_codebook_indices(res_ac; time_index)
-    ci_c, _ = select_codebook_indices(res_c; time_index=resolved_time_index)
-    nw = min(size(ci_ac, 2), size(ci_c, 2))
-    return mean([all(ci_ac[:, w] .== ci_c[:, w]) for w in 1:nw])
+    if model.T == 1
+        idx_ac = vec(res_ac.codebook_indices)
+        idx_c = vec(res_c.codebook_indices)
+    else
+        function majority(ci, K)
+            ci_flat = reshape(ci, model.T, :)
+            [begin
+                counts = zeros(Int, K)
+                for t in 1:model.T; counts[ci_flat[t, j]] += 1; end
+                argmax(counts)
+            end for j in 1:size(ci_flat, 2)]
+        end
+        K = model.quantizer.K
+        idx_ac = majority(res_ac.codebook_indices, K)
+        idx_c = majority(res_c.codebook_indices, K)
+    end
+    return mean(idx_ac .== idx_c)
 end
 
 # ╔═╡ faa3de6b-96eb-4aeb-b927-77d6771a1d0a
 """
-    codebook_cross_analysis(model, D_ac, D_c; time_index=nothing)
+    codebook_cross_analysis(model, D_ac, D_c)
 
-Post-hoc analysis of codebook usage by branch at a selected latent time index.
+Post-hoc analysis of codebook usage by branch.
 Returns a named tuple:
-- `pct_ac`: (K^T,) percentage of acausal waveforms per combination
-- `pct_c`:  (K^T,) percentage of causal waveforms per combination
-- `confusion`: (K^T, K^T) matrix — confusion[i,j] = fraction of windows where
-    acausal→combo i AND causal→combo j (only meaningful for paired data)
+- `pct_ac`: (K,) percentage of acausal waveforms per codebook entry
+- `pct_c`:  (K,) percentage of causal waveforms per codebook entry
+- `confusion`: (K, K) matrix — confusion[i,j] = fraction of windows where
+  acausal→code i AND causal→code j (only meaningful for paired data)
 - `agreement`: scalar fraction where both branches share the same code
-- `shared_codes`: combinations used by both branches (>5% usage each)
-- `ac_only_codes`: combinations predominantly acausal (ac >5x causal)
-- `c_only_codes`: combinations predominantly causal (c >5x acausal)
-- `labels`: human-readable combination labels
-- `time_index`: latent time index used for the analysis
+- `shared_codes`: codebook entries used by both branches (>5% usage each)
+- `ac_only_codes`: entries predominantly acausal (ac >5x causal)
+- `c_only_codes`: entries predominantly causal (c >5x acausal)
 """
-function codebook_cross_analysis(model, D_ac, D_c; time_index=nothing)
-    K = model.quantizer[1].K
+function codebook_cross_analysis(model::VQVAE, D_ac, D_c)
+    K = model.quantizer.K
     T = model.T
+    KT = K * T
 
-    # Per-branch percentages with combination labels
-    pct_ac_res = get_cluster_percentages(model, D_ac; time_index, return_labels=true)
-    pct_ac = pct_ac_res.percentages
-    combo_labels = pct_ac_res.labels
-    resolved_time_index = pct_ac_res.time_index
-    pct_c = get_cluster_percentages(model, D_c; time_index=resolved_time_index)
-    num_combinations = length(pct_ac)
+    # Per-branch percentages
+    pct_ac = get_cluster_percentages(model, D_ac)
+    pct_c = get_cluster_percentages(model, D_c)
 
     # Agreement and confusion (requires paired windows: same number of columns)
     res_ac = encode(model, D_ac)
     res_c = encode(model, D_c)
-    ci_ac, _ = select_codebook_indices(res_ac; time_index=resolved_time_index)
-    ci_c, _ = select_codebook_indices(res_c; time_index=resolved_time_index)
+    ci_ac = reshape(res_ac.codebook_indices, T, :)
+    ci_c = reshape(res_c.codebook_indices, T, :)
     nw = min(size(ci_ac, 2), size(ci_c, 2))
     # Agreement: both all T codes match
     agreement = mean([all(ci_ac[:,w] .== ci_c[:,w]) for w in 1:nw])
 
-    # Confusion: confusion[i,j] = P(acausal→combo i, causal→combo j) for all combinations
-    confusion = zeros(Float32, num_combinations, num_combinations)
-    multipliers = combination_multipliers(K, T)
+    # Confusion: confusion[i,j] = P(acausal→i, causal→j) for all KT clusters
+    confusion = zeros(Float32, KT, KT)
     for w in 1:nw
-        idx_ac = combination_index(ci_ac[:, w], multipliers)
-        idx_c = combination_index(ci_c[:, w], multipliers)
-        confusion[idx_ac, idx_c] += 1f0
+        for t_ac in 1:T
+            for t_c in 1:T
+                idx_ac = (t_ac-1)*K + ci_ac[t_ac, w]
+                idx_c = (t_c-1)*K + ci_c[t_c, w]
+                confusion[idx_ac, idx_c] += 1f0
+            end
+        end
     end
     confusion ./= max(sum(confusion), 1f-10)
 
@@ -1238,7 +921,7 @@ function codebook_cross_analysis(model, D_ac, D_c; time_index=nothing)
     shared_codes = Int[]
     ac_only_codes = Int[]
     c_only_codes = Int[]
-    for k in 1:num_combinations
+    for k in 1:KT
         ac_used = pct_ac[k] > threshold_pct
         c_used = pct_c[k] > threshold_pct
         if ac_used && c_used
@@ -1251,18 +934,17 @@ function codebook_cross_analysis(model, D_ac, D_c; time_index=nothing)
     end
 
     return (; pct_ac, pct_c, confusion, agreement,
-              shared_codes, ac_only_codes, c_only_codes,
-              labels=combo_labels, time_index=resolved_time_index)
+              shared_codes, ac_only_codes, c_only_codes)
 end
 
 # ╔═╡ 302a9921-c723-41d4-9d7a-234bf658a07e
 """
 Plot confusion matrix of codebook assignments between acausal (rows) and causal (columns).
 """
-function plot_codebook_confusion(confusion; title="Codebook Confusion: Acausal vs Causal", labels=nothing)
+function plot_codebook_confusion(confusion; title="Codebook Confusion: Acausal vs Causal")
     KT = size(confusion, 1)
-    xlabels = labels === nothing ? string.(1:KT) : labels
-    ylabels = labels === nothing ? string.(1:KT) : labels
+    xlabels = string.(1:KT)
+    ylabels = string.(1:KT)
     text_vv = [
         [string(round(confusion[i,j]*100; digits=1), "%") for j in 1:KT]
         for i in 1:KT
@@ -1277,11 +959,9 @@ function plot_codebook_confusion(confusion; title="Codebook Confusion: Acausal v
     )
     layout = Layout(
         title=attr(text=title, font=attr(size=20, family="Computer Modern, Latin Modern Math, serif")),
-        height=900, width=1000,
-        xaxis=attr(title=labels === nothing ? "Causal Cluster (pos, code)" : "Causal combination",
-            dtick=1, constrain="domain"),
-        yaxis=attr(title=labels === nothing ? "Acausal Cluster (pos, code)" : "Acausal combination",
-            dtick=1, scaleanchor="x", constrain="domain"),
+        height=600, width=700,
+        xaxis=attr(title="Causal Cluster (pos, code)", dtick=1, constrain="domain"),
+        yaxis=attr(title="Acausal Cluster (pos, code)", dtick=1, scaleanchor="x", constrain="domain"),
         plot_bgcolor="white", paper_bgcolor="white",
     )
     return PlutoPlotly.plot([trace], layout)
@@ -2989,18 +2669,14 @@ version = "17.7.0+0"
 # ╠═6affb3b3-9dc4-4bbc-a582-495fc1783a7a
 # ╟─a0000001-0000-0000-0000-000000000001
 # ╠═80f77b52-84e0-4664-8aa0-3d79fded40de
-# ╠═899a848e-6861-4d1e-9090-50b50e5d6e82
-# ╠═e4316ace-3e89-4efd-a613-7204d5cc116b
+# ╠═6ba143e2-50df-441a-8f38-3ea8d9edd4d8
 # ╟─a0000002-0000-0000-0000-000000000001
 # ╠═91a25156-e121-4d53-a5a1-422f1230d235
 # ╟─a0000003-0000-0000-0000-000000000001
 # ╠═89599b3f-8c20-46c5-8f5c-ccbb71b26b36
 # ╠═a0000004-0000-0000-0000-000000000001
 # ╟─a0000005-0000-0000-0000-000000000001
-# ╠═4b94fad2-0aaa-4308-94ee-cb33a419df17
-# ╠═565be3d9-72c7-4ba0-95e1-78c9d6d914c9
-# ╠═0e1ccfa6-aa0c-4247-9fd7-89352d949091
-# ╠═379a84d8-11df-4ef7-b1da-2a9595007036
+# ╠═64430447-c267-4eec-8d38-63ccf91d82c4
 # ╟─a0000006-0000-0000-0000-000000000001
 # ╠═a0000007-0000-0000-0000-000000000001
 # ╟─a0000008-0000-0000-0000-000000000001
@@ -3010,6 +2686,9 @@ version = "17.7.0+0"
 # ╟─a0000012-0000-0000-0000-000000000001
 # ╠═a0000013-0000-0000-0000-000000000001
 # ╟─a0000015-0000-0000-0000-000000000001
+# ╠═6a14416d-83e9-4b1f-903b-cbbfff15471f
+# ╠═abeb3f47-fe08-4ea2-a2b7-7282007baff6
+# ╠═2bbf8d6a-62f7-4496-aa7c-ecb4af456720
 # ╟─a0000017-0000-0000-0000-000000000001
 # ╠═eafe181e-19e9-409e-ad1d-ce859cf0e672
 # ╠═a0000018-0000-0000-0000-000000000001
@@ -3023,4 +2702,3 @@ version = "17.7.0+0"
 # ╠═faa3de6b-96eb-4aeb-b927-77d6771a1d0a
 # ╠═302a9921-c723-41d4-9d7a-234bf658a07e
 # ╟─00000000-0000-0000-0000-000000000001
-# ╟─00000000-0000-0000-0000-000000000002

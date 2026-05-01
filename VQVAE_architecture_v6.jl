@@ -1,8 +1,20 @@
 ### A Pluto.jl notebook ###
-# v0.20.21
+# v0.20.23
 
 using Markdown
 using InteractiveUtils
+
+# This Pluto notebook uses @bind for interactivity. When running this notebook outside of Pluto, the following 'mock version' of @bind gives bound variables a default value (instead of an error).
+macro bind(def, element)
+    #! format: off
+    return quote
+        local iv = try Base.loaded_modules[Base.PkgId(Base.UUID("6e696c72-6542-2067-7265-42206c756150"), "AbstractPlutoDingetjes")].Bonds.initial_value catch; b -> missing; end
+        local el = $(esc(element))
+        global $(esc(def)) = Core.applicable(Base.get, el) ? Base.get(el) : iv(el)
+        el
+    end
+    #! format: on
+end
 
 # ╔═╡ cc11647d-1c56-4ceb-9677-703aca03c9f4
 using Functors
@@ -50,17 +62,18 @@ between causal and acausal cross-correlation branches.
 ### Key Ideas
 - **Shared encoder** processes both causal and acausal branches identically
 - **Vector quantization** with finite codebook forces discrete clustering
+- **Optional latent-time windowing** lets you focus on a small region around an arrival
 - **EMA codebook updates** (no gradient through codebook — more stable)
-- **Configurable T** (number of quantized vectors per waveform) controls information bottleneck
+- **Single dense VQ bottleneck** keeps one quantized vector per waveform
 - **Unpaired training**: pool all causal + acausal waveforms, train standard VQ-VAE
 - **Post-hoc analysis**: examine which codebook entries are shared vs branch-specific
 - **Codebook reset** for dead entries prevents codebook collapse
 
 ### Architecture
 ```
-waveform (nt,) → ConvEncoder → z_e (d, T) → VQ → z_q (d, T) → ConvDecoder → x̂ (nt,)
-                                                    ↓
-                                             codebook indices (T,)
+waveform (nt,) → ConvEncoder → 1x1 metric projection → z_metric (d, L) → Dense → z_e (d) → VQ → z_q (d) → ConvDecoder → x̂ (nt,)
+                                                        ↓
+                                                  kNN metric flatten (d*L)
 ```
 """
 
@@ -71,7 +84,7 @@ TableOfContents(include_definitions=true)
 xpu = gpu
 
 # ╔═╡ 6affb3b3-9dc4-4bbc-a582-495fc1783a7a
-activation = x -> leakyrelu(x, 0.1f0)
+const activation = x -> leakyrelu(x, 0.1f0)
 
 # ╔═╡ a0000001-0000-0000-0000-000000000001
 md"## Utilities"
@@ -82,21 +95,22 @@ Instead of cat(x, dims=3)
 """
 add_dim3_reshape(::Nothing) = nothing
 
-# ╔═╡ 899a848e-6861-4d1e-9090-50b50e5d6e82
-function add_dim3_reshape(x)
-    nd = ndims(x)
-    if nd == 2
-        return reshape(x, size(x, 1), 1, size(x, 2))
-    elseif nd == 3
-        return x
-    else
-        return x
+# ╔═╡ 6ba143e2-50df-441a-8f38-3ea8d9edd4d8
+begin
+    function add_dim3_reshape(x)
+        nd = ndims(x)
+        if nd == 2
+            return reshape(x, size(x, 1), 1, size(x, 2))
+        elseif nd == 3
+            return x
+        else
+            return x
+        end
     end
-end
 
-# ╔═╡ e4316ace-3e89-4efd-a613-7204d5cc116b
-function flatten_batch(x)
-    return reshape(x, size(x, 1), :)
+    function flatten_batch(x)
+        return reshape(x, size(x, 1), :)
+    end
 end
 
 # ╔═╡ a0000002-0000-0000-0000-000000000001
@@ -106,8 +120,6 @@ md"## Parameters"
 Base.@kwdef struct VQVAE_Para
     nt::Int                                # waveform length (time samples)
     d::Int = 64                            # codebook embedding dimension
-    K::Int = 8                             # codebook size (number of entries)
-    T::Int = 1                             # number of RVQ stages (1 = single-stage VQ)
     beta_commit::Float32 = 0.25f0          # commitment loss weight
     enc_kernels::Vector{Int} = [32, 16, 8, 4]
     enc_filters::Vector{Int} = [8, 16, 32, 64]
@@ -115,18 +127,28 @@ Base.@kwdef struct VQVAE_Para
     dec_kernels::Vector{Int} = [4, 8, 16]
     dec_filters::Vector{Int} = [64, 48, 16, 1]
     use_bn::Bool = true
-    use_pre_vq_conv::Bool = true           # if true, use 1x1 Conv pre-quant projection (Misha-style) instead of Dense
-    time_resolved_quantization::Bool = false   # if true, quantize each latent time position and decode full latent sequence
-    use_pre_vq_lstm::Bool = false          # if true, apply stacked LSTM on pre-VQ sequence map before quantization
-    pre_vq_lstm_layers::Int = 2            # number of LSTM layers in pre-VQ context stack
-    pre_vq_lstm_residual::Bool = true      # residual connection around stacked LSTM context block
     ema_decay::Float32 = 0.99f0            # EMA decay for codebook updates
     epsilon::Float32 = 1f-5                # EMA Laplace smoothing
     dead_threshold::Int = 2                # reset codebook entry after this many batches unused
     entropy_weight::Float32 = 0.01f0       # entropy bonus to encourage uniform codebook usage
-    decode_codebook_superposition::Bool = false  # if true, decode each VQ slot independently then average
-    use_slot_weights::Bool = false             # if true (and superposition), weight slots by softmax(Dense(z_pre))
-    seed = nothing
+    reconstruction_loss::Symbol = :l1      # :l1 for mean absolute error, :l2 for mean squared error
+    interstation_distance::Union{Nothing,Float64} = nothing  # km; enables latent-time window mode when set
+    dt::Float64 = 1.0                                        # sampling interval (s)
+    velocity_range::Tuple{Float64,Float64} = (2.0, 4.0)      # km/s; (vmin, vmax) group velocity range for window
+    seed::Int = 1234                        # random seed for reproducibility
+    arrival_mse_weight::Float32 = 1.0f0    # Deprecated in v4: arrival focus is handled by latent-time window selection, not weighted MSE
+
+    # Multiscale RVQ: pair-specific coherent codebooks + shared nuisance residual codebooks
+    use_multiscale_rvq::Bool = true
+    Kcoherent::Int = 8                      # coherent/coarse codebook size
+    Knuisance::Int = 16                     # nuisance/detail codebook size
+    detail_stages::Int = 1                  # number of nuisance residual stages (0 = coarse-only)
+    ema_decay_small::Float32 = 0.999f0      # slower EMA for coarse anchors
+    ema_decay_large::Float32 = 0.99f0       # faster EMA for nuisance residuals
+
+    num_pairs::Int = 1
+    pair_codebook_mode::Symbol = :pair_specific_coarse_shared_detail
+    pair_names::Union{Nothing,Vector{String}} = nothing
 end
 
 # ╔═╡ a0000003-0000-0000-0000-000000000001
@@ -137,14 +159,8 @@ begin
     struct ReshapeLayer
         dims::Tuple
     end
-    Flux.@layer ReshapeLayer trainable=()
+    Flux.@layer ReshapeLayer trainable = ()
     (m::ReshapeLayer)(x) = reshape(x, m.dims..., size(x)[end])
-
-    struct TrimLayer
-        n::Int
-    end
-    Flux.@layer TrimLayer trainable=()
-    (m::TrimLayer)(x) = x[1:min(m.n, size(x, 1)), :, :]
 
     struct Conv1DChain
         chain::Chain
@@ -184,17 +200,40 @@ begin
         end
         return y
     end
+
+    struct PerPositionPreVQ{L,P}
+        lstm::L
+        proj::P
+    end
+    Flux.@layer PerPositionPreVQ trainable = (lstm, proj)
+
+    function (m::PerPositionPreVQ)(::Nothing)
+        return nothing
+    end
+
+    function (m::PerPositionPreVQ)(x)
+        x3 = ndims(x) == 3 ? x : add_dim3_reshape(flatten_batch(x))
+        z = if isnothing(m.lstm)
+            x3
+        else
+            # Flux LSTM expects (channels, time, batch); latent path uses (time, channels, batch)
+            Flux.reset!(m.lstm)
+            y = m.lstm(permutedims(x3, (2, 1, 3)))
+            permutedims(y, (2, 1, 3))
+        end
+        return m.proj(z)
+    end
 end
 
-# ╔═╡ a0000004-0000-0000-0000-000000000001
+# ╔═╡ 2f7550d1-e854-4c2f-8efb-ad0bb70d5013
 """
 Build a 1D convolutional encoder.
 
-Returns `(encoder, flat_output_length)`.
+Returns `(encoder, flat_output_length)` or `(encoder, flat_output_length, outsize)`.
 """
 function get_vq_conv_encoder(nt; kernels=[32, 16, 8, 4], filters=[8, 16, 32, 64],
-                              strides=[2, 2, 2, 2], use_bn::Bool=true,
-                              flatten_output::Bool=true, return_outsize::Bool=false)
+    strides=[2, 2, 2, 2], use_bn::Bool=true,
+    flatten_output::Bool=true, return_outsize::Bool=false)
     @assert length(kernels) == length(filters)
     layers = Any[]
     nin = 1
@@ -214,15 +253,29 @@ function get_vq_conv_encoder(nt; kernels=[32, 16, 8, 4], filters=[8, 16, 32, 64]
         push!(layers, Flux.flatten)
         enc = Conv1DChain(Chain(layers...))
     else
-        enc = Conv1DChain(trunk)
+        enc = SeqConv1DChain(trunk)
     end
     return return_outsize ? (enc, flat_len, outsize) : (enc, flat_len)
+end
+
+# ╔═╡ 44e9c4cc-d02b-4e68-ad49-24f173556cbd
+function infer_dec_upstrides(enc_strides::AbstractVector{<:Integer}, n_dec_layers::Int)
+    vals = reverse(Int[s for s in enc_strides if s > 1])
+    isempty(vals) && (vals = [1])
+    while length(vals) > n_dec_layers
+        vals[2] *= vals[1]
+        deleteat!(vals, 1)
+    end
+    while length(vals) < n_dec_layers
+        push!(vals, 1)
+    end
+    return vals
 end
 
 # ╔═╡ a0000005-0000-0000-0000-000000000001
 md"## Conv Decoder"
 
-# ╔═╡ 4b94fad2-0aaa-4308-94ee-cb33a419df17
+# ╔═╡ 64430447-c267-4eec-8d38-63ccf91d82c4
 """
 Build a 1D convolutional decoder (transposed convolutions).
 
@@ -230,7 +283,7 @@ Input dimension: `d_in` (latent dim fed to the decoder).
 Output: reconstructed waveform of length `nt`.
 """
 function get_vq_conv_decoder(nt, d_in; kernels=[4, 8, 16], filters=[64, 48, 16, 1],
-                              upstrides=[2, 2, 1], use_bn=false)
+    upstrides=[2, 2, 1], use_bn=false)
     @assert length(kernels) == length(filters) - 1
     @assert length(upstrides) == length(kernels)
 
@@ -247,7 +300,7 @@ function get_vq_conv_decoder(nt, d_in; kernels=[4, 8, 16], filters=[64, 48, 16, 
 
     nin = bottleneck_channels
     for (i, k) in enumerate(kernels)
-        nout = filters[i + 1]
+        nout = filters[i+1]
         s = upstrides[i]
         if i < length(kernels)
             push!(layers, ConvTranspose((k,), nin => nout, activation; stride=s, pad=SamePad()))
@@ -264,89 +317,31 @@ function get_vq_conv_decoder(nt, d_in; kernels=[4, 8, 16], filters=[64, 48, 16, 
     return Conv1DChain(Chain(layers...)), bottleneck_len, bottleneck_channels
 end
 
-# ╔═╡ 565be3d9-72c7-4ba0-95e1-78c9d6d914c9
-"""
-Build a 1D sequence decoder (transposed convolutions) that preserves latent time axis.
-
-Input: `(L_lat, d_in, batch)` latent sequence map.
-Output: reconstructed waveform `(nt, batch)`.
-"""
-function get_vq_conv_decoder_sequence(nt, d_in; kernels=[4, 8, 16], filters=[64, 48, 16, 1],
-                                      upstrides=[2, 2, 1], use_bn=false)
-    @assert length(kernels) == length(filters) - 1
-    @assert length(upstrides) == length(kernels)
-
-    layers = Any[]
-    push!(layers, Conv((1,), d_in => filters[1], activation; stride=1, pad=SamePad()))
-
-    nin = filters[1]
-    for (i, k) in enumerate(kernels)
-        nout = filters[i + 1]
-        s = upstrides[i]
-        if i < length(kernels)
-            push!(layers, ConvTranspose((k,), nin => nout, activation; stride=s, pad=SamePad()))
-            if use_bn
-                push!(layers, BatchNorm(nout))
-            end
-        else
-            push!(layers, ConvTranspose((k,), nin => nout; stride=s, pad=SamePad()))
-        end
-        nin = nout
-    end
-    return SeqConv1DChain(Chain(layers...))
-end
-
-# ╔═╡ 0e1ccfa6-aa0c-4247-9fd7-89352d949091
-"""
-Infer decoder upstrides from encoder strides (no decoder strides in parameters).
-This keeps only non-trivial downsampling strides and maps them to decoder depth.
-"""
-function infer_dec_upstrides(enc_strides::AbstractVector{<:Integer}, n_dec_layers::Int)
-    vals = reverse(Int[s for s in enc_strides if s > 1])
-    if isempty(vals)
-        vals = [1]
-    end
-    while length(vals) > n_dec_layers
-        vals[2] *= vals[1]
-        deleteat!(vals, 1)
-    end
-    while length(vals) < n_dec_layers
-        push!(vals, 1)
-    end
-    vals
-end
-
-# ╔═╡ 379a84d8-11df-4ef7-b1da-2a9595007036
-"""
-Auto-adjust decoder upstrides so output length matches `nt` exactly.
-Searches around inferred strides with a small bounded grid.
-"""
+# ╔═╡ 8eb0be68-99e1-4df9-97bf-b29b99d8f759
 function auto_dec_upstrides_for_nt(nt::Int, latent_len::Int, d::Int;
-                                   dec_kernels::AbstractVector{<:Integer},
-                                   dec_filters::AbstractVector{<:Integer},
-                                   use_bn::Bool,
-                                   enc_strides::AbstractVector{<:Integer})
+    dec_kernels::AbstractVector{<:Integer},
+    dec_filters::AbstractVector{<:Integer},
+    use_bn::Bool,
+    enc_strides::AbstractVector{<:Integer})
     n_dec = length(dec_kernels)
     base = infer_dec_upstrides(enc_strides, n_dec)
 
     function outlen(strides::Vector{Int})
-        dec = get_vq_conv_decoder_sequence(nt, d;
+        dec, _, _ = get_vq_conv_decoder(nt, d;
             kernels=collect(dec_kernels), filters=collect(dec_filters),
             upstrides=strides, use_bn=use_bn)
-        Flux.outputsize(dec.chain, (latent_len, d); padbatch=true)[1]
+        Flux.outputsize(dec.chain, (d,); padbatch=true)[1]
     end
 
-    if all(base .<= collect(Int, dec_kernels)) && outlen(base) == nt
+    if outlen(base) == nt
         return base
     end
 
-    # cuDNN-safe constraint: keep stride <= kernel per layer.
     kmax = collect(Int, dec_kernels)
     lo = max.(1, base .- 3)
     hi = min.(kmax, base .+ 3)
     best = copy(base)
     best_err = abs(outlen(base) - nt)
-    exact_found = false
     ranges = [lo[i]:hi[i] for i in 1:n_dec]
     for cand in Iterators.product(ranges...)
         s = collect(Int, cand)
@@ -357,15 +352,7 @@ function auto_dec_upstrides_for_nt(nt::Int, latent_len::Int, d::Int;
             best = s
             best_err = err
         end
-        if err == 0
-            exact_found = true
-            best = s
-            break
-        end
-    end
-    if !exact_found
-        error("Could not find exact decoder geometry for nt=$nt with current enc_strides=$(collect(enc_strides)) " *
-              "and decoder kernels=$(collect(dec_kernels)). Try changing enc_strides.")
+        err == 0 && return s
     end
     return best
 end
@@ -379,14 +366,86 @@ Core VQ layer with:
 - **Straight-through estimator**: gradients pass directly from z_q to z_e
 """
 
-# ╔═╡ a0000007-0000-0000-0000-000000000001
+# ╔═╡ ee76dd74-feaa-4422-a9a8-5931eb817c24
+"""Quantize without training updates (inference)."""
+    function quantize_inference(vq, z_e::AbstractMatrix{Float32})
+        return vq(z_e; training=false)
+    end
+
+# ╔═╡ 5fd449bf-d0d5-4944-8fc6-c0d47a0ed83f
+# ── VQ helper functions (separate for JIT specialization) ─────────────────────
+
+"""Compute squared-distance matrix between encoder outputs and codebook entries."""
+function vq_distances(embedding::AbstractMatrix{Float32}, z_e::AbstractMatrix{Float32})
+    z_sq = sum(abs2, z_e; dims=1)          # (1, N)
+    e_sq = sum(abs2, embedding; dims=1)    # (1, K)
+    return e_sq' .+ z_sq .- 2f0 .* (embedding' * z_e)  # (K, N)
+end
+
+# ╔═╡ 1f046042-0695-4a3d-a0ee-9ce4213c9b72
+"""Nearest-neighbour lookup: returns indices (GPU CuVector) and one-hot encodings."""
+function vq_lookup(vq, z_e::AbstractMatrix{Float32})
+    dist = vq_distances(vq.embedding, z_e)
+    indices_cart = dropdims(CUDA.argmin(dist; dims=1); dims=1)
+    indices = getindex.(indices_cart, 1)
+    encodings = Flux.onehotbatch(indices, 1:vq.K)
+    z_q = vq.embedding * encodings
+    return indices, encodings, z_q
+end
+
+# ╔═╡ 0a9a8028-2ba9-43d9-8b3d-8ada32ba314b
+"""In-place EMA codebook update. Returns counts_cpu for reuse in dead-reset."""
+function vq_ema_update!(vq, z_e::AbstractMatrix{Float32},
+                        encodings)
+    enc_sum_vec = vec(sum(encodings; dims=2))
+    vq.ema_cluster_size .= vq.decay .* vq.ema_cluster_size .+ (1f0 - vq.decay) .* enc_sum_vec
+    n = sum(vq.ema_cluster_size)
+    vq.ema_cluster_size .= (vq.ema_cluster_size .+ vq.epsilon) ./ (n .+ Float32(vq.K) .* vq.epsilon) .* n
+    dw = z_e * encodings'
+    vq.ema_dw .= vq.decay .* vq.ema_dw .+ (1f0 - vq.decay) .* dw
+    vq.embedding .= vq.ema_dw ./ reshape(vq.ema_cluster_size, 1, :)
+    return cpu(enc_sum_vec)   # tiny K-vector, needed for dead tracking
+end
+
+# ╔═╡ b70d1b6c-2e5e-4548-9629-ea69011a2585
+"""Reset dead codebook entries to perturbed donor encoder outputs (all GPU ops)."""
+function vq_dead_reset!(vq, z_e,
+                        counts_cpu)
+    N = size(z_e, 2)
+    dead_mask = counts_cpu .< 0.5f0
+    vq.dead_count .= ifelse.(dead_mask, vq.dead_count .+ 1, 0)
+    reset_mask = vq.dead_count .>= vq.dead_threshold
+    n_reset = sum(reset_mask)
+    n_reset == 0 && return nothing
+    reset_idxs = CuArray(Int32.(findall(reset_mask)))
+    donor_js   = CuArray(Int32.(rand(1:N, length(reset_idxs))))
+    donor_cols = z_e[:, donor_js] .+ CUDA.randn(Float32, size(z_e, 1), length(reset_idxs)) .* 0.01f0
+    vq.embedding[:, reset_idxs]      .= donor_cols
+    vq.ema_dw[:, reset_idxs]         .= donor_cols
+    vq.ema_cluster_size[reset_idxs]  .= 1f0
+    vq.dead_count[cpu(reset_idxs)]   .= 0
+    return nothing
+end
+
+# ╔═╡ 802aa1db-04b1-4444-ab9a-d9c4aee17dd9
+"""Compute perplexity and entropy from per-entry probabilities."""
+function vq_metrics(z_e, z_q,
+                    avg_probs)
+    vq_loss_val  = Flux.mse(z_e, z_q)
+    avg_safe     = clamp.(avg_probs, 1f-10, 1f0)
+    perplexity   = exp(-sum(avg_safe .* log.(avg_safe)))
+    entropy_loss = sum(avg_safe .* log.(avg_safe))
+    return vq_loss_val, perplexity, entropy_loss
+end
+
+# ╔═╡ 4cfb91c3-97e4-4006-9ec9-5eedd7de2849
 begin
-    mutable struct VectorQuantizerEMA
+    mutable struct VectorQuantizerEMA{M<:AbstractMatrix{Float32}, V<:AbstractVector{Float32}}
         K::Int                                # number of codebook entries
         d::Int                                # embedding dimension
-        embedding::AbstractMatrix{Float32}    # codebook: (d, K)
-        ema_cluster_size::AbstractVector{Float32}   # (K,) EMA of assignment counts
-        ema_dw::AbstractMatrix{Float32}       # (d, K) EMA of sum of assigned encoder outputs
+        embedding::M   # codebook: (d, K)
+        ema_cluster_size::V  # (K,) EMA of assignment counts
+        ema_dw::M      # (d, K) EMA of sum of assigned encoder outputs
         decay::Float32
         epsilon::Float32
         dead_count::Vector{Int}               # CPU counter: batches since last assignment
@@ -395,112 +454,251 @@ begin
     Flux.@layer VectorQuantizerEMA trainable = ()  # no trainable params — EMA only
 
     function VectorQuantizerEMA(K::Int, d::Int;
-                                 decay::Float32=0.99f0,
-                                 epsilon::Float32=1f-5,
-                                 dead_threshold::Int=2)
-        # Initialize codebook from uniform [-1/K, 1/K]
+        decay::Float32=0.99f0,
+        epsilon::Float32=1f-5,
+        dead_threshold::Int=2)
         embedding = xpu(randn(Float32, d, K) .* (1f0 / K))
         ema_cluster_size = xpu(ones(Float32, K))
         ema_dw = copy(embedding)
         dead_count = zeros(Int, K)
         return VectorQuantizerEMA(K, d, embedding, ema_cluster_size, ema_dw,
-                                   decay, epsilon, dead_count, dead_threshold)
+            decay, epsilon, dead_count, dead_threshold)
     end
 
     """
-    Quantize encoder output `z_e` of shape (d, N) where N = T * batch_size.
+    Quantize encoder output `z_e` of shape (d, N).
 
-    Returns `(; z_q, indices, encodings, vq_loss, commit_loss, perplexity)`.
+    Returns `(; z_q, indices, encodings, vq_loss, commit_loss, perplexity, entropy_loss)`.
     - During training: updates codebook via EMA, resets dead entries.
-    - `z_q` has straight-through gradient (gradient flows to encoder).
+    - `z_q` has straight-through gradient (straight-through estimator).
     """
     function (vq::VectorQuantizerEMA)(z_e::AbstractMatrix{Float32}; beta_commit::Float32=0.25f0, training::Bool=true)
         d, N = size(z_e)
         @assert d == vq.d "Expected embedding dim $(vq.d), got $d"
 
-        # ── Everything inside @ignore is invisible to Zygote ──────────────
         z_q_detached, indices, encodings, vq_loss_val, perplexity, entropy_loss = Zygote.@ignore begin
-            # Nearest-neighbor lookup
-            z_sq = sum(abs2, z_e; dims=1)         # (1, N)
-            e_sq = sum(abs2, vq.embedding; dims=1) # (1, K)
-            dist = e_sq' .+ z_sq .- 2f0 .* (vq.embedding' * z_e)  # (K, N)
+            indices, encodings, z_q = vq_lookup(vq, z_e)
 
-            indices_cart = dropdims(CUDA.argmin(dist; dims=1); dims=1)
-            indices = getindex.(indices_cart, 1)
-
-            encodings = xpu(Float32.(Flux.onehotbatch(cpu(indices), 1:vq.K)))
-            z_q = vq.embedding * encodings  # (d, N)
-
-            # EMA update (training only)
             if training
-                enc_sum_vec = vec(sum(encodings; dims=2))
-
-                vq.ema_cluster_size .= vq.decay .* vq.ema_cluster_size .+ (1f0 - vq.decay) .* enc_sum_vec
-                n = sum(vq.ema_cluster_size)
-                vq.ema_cluster_size .= (vq.ema_cluster_size .+ vq.epsilon) ./ (n .+ Float32(vq.K) .* vq.epsilon) .* n
-
-                dw = z_e * encodings'
-                vq.ema_dw .= vq.decay .* vq.ema_dw .+ (1f0 - vq.decay) .* dw
-                vq.embedding .= vq.ema_dw ./ reshape(vq.ema_cluster_size, 1, :)
-
-                # Dead entry reset (fully vectorized — no scalar GPU indexing)
-                counts_cpu = cpu(enc_sum_vec)
-                dead_mask_cpu = counts_cpu .< 0.5f0
-                vq.dead_count .= ifelse.(dead_mask_cpu, vq.dead_count .+ 1, 0)
-                reset_mask_cpu = vq.dead_count .>= vq.dead_threshold
-                n_reset = sum(reset_mask_cpu)
-                if n_reset > 0
-                    reset_idxs = findall(reset_mask_cpu)
-                    donor_js = rand(1:N, n_reset)
-                    # Gather donor columns and add noise (all on GPU)
-                    donor_cols = z_e[:, donor_js] .+ xpu(randn(Float32, d, n_reset) .* 0.01f0)
-                    # Build full replacement matrices using GPU scatter
-                    emb_cpu = cpu(vq.embedding)
-                    dw_cpu = cpu(vq.ema_dw)
-                    cs_cpu = cpu(vq.ema_cluster_size)
-                    donor_cpu = cpu(donor_cols)
-                    for (i, k) in enumerate(reset_idxs)
-                        emb_cpu[:, k] .= donor_cpu[:, i]
-                        dw_cpu[:, k] .= donor_cpu[:, i]
-                        cs_cpu[k] = 1f0
-                    end
-                    copyto!(vq.embedding, xpu(emb_cpu))
-                    copyto!(vq.ema_dw, xpu(dw_cpu))
-                    copyto!(vq.ema_cluster_size, xpu(cs_cpu))
-                    vq.dead_count[reset_idxs] .= 0
-                end
+                counts_cpu = vq_ema_update!(vq, z_e, encodings)
+                vq_dead_reset!(vq, z_e, counts_cpu)
+                avg_probs = counts_cpu ./ N
+            else
+                avg_probs = cpu(vec(sum(encodings; dims=2))) ./ N
             end
 
-            # Metrics (all non-differentiable)
-            vq_loss_val = Flux.mse(z_e, z_q)
-            avg_probs = mean(cpu(encodings); dims=2) |> vec
-            avg_probs_safe = clamp.(avg_probs, 1f-10, 1f0)
-            perplexity = exp(-sum(avg_probs_safe .* log.(avg_probs_safe)))
-            entropy_loss = sum(avg_probs_safe .* log.(avg_probs_safe))
-
+            vq_loss_val, perplexity, entropy_loss = vq_metrics(z_e, z_q, avg_probs)
             (z_q, indices, encodings, vq_loss_val, perplexity, entropy_loss)
         end
 
-        # ── Differentiable path: straight-through estimator ───────────────
-        # Forward: z_e + (z_q - z_e) = z_q (decoder sees quantized vectors).
-        # Backward: the residual is invisible to Zygote, so dL/dz_e = dL/dz_q_st
-        # (decoder reconstruction gradient flows straight through to encoder).
         st_residual = Zygote.@ignore(z_q_detached .- z_e)
-        z_q_st = z_e .+ st_residual
-
-        # Commitment loss: pushes encoder output toward its assigned codebook entry
+        z_q_st      = z_e .+ st_residual
         commit_loss = beta_commit * Flux.mse(z_e, Zygote.@ignore(z_q_detached))
 
         return (; z_q=z_q_st, indices, encodings, vq_loss=vq_loss_val,
-                  commit_loss, perplexity, entropy_loss)
+            commit_loss, perplexity, entropy_loss)
     end
 
-    """
-    Quantize without training updates (inference).
-    """
-    function quantize_inference(vq::VectorQuantizerEMA, z_e::AbstractMatrix{Float32})
-        return vq(z_e; training=false)
+    struct MultiscaleRVQQuantizer{Q}
+        coarse::Q
+        detail::Vector{Q}
+        K::Int
+        d::Int
     end
+    Flux.@layer MultiscaleRVQQuantizer trainable = ()
+
+    function MultiscaleRVQQuantizer(Kcoherent::Int, Knuisance::Int, d::Int;
+        detail_stages::Int=1,
+        decay_small::Float32=0.999f0,
+        decay_large::Float32=0.99f0,
+        epsilon::Float32=1f-5,
+        dead_threshold::Int=2)
+        detail_stages >= 0 || error("detail_stages must be >= 0, got $detail_stages")
+        coarse = VectorQuantizerEMA(Kcoherent, d; decay=decay_small, epsilon=epsilon, dead_threshold=dead_threshold)
+        detail = typeof(coarse)[
+            VectorQuantizerEMA(Knuisance, d; decay=decay_large, epsilon=epsilon, dead_threshold=dead_threshold)
+            for _ in 1:detail_stages
+        ]
+        return MultiscaleRVQQuantizer(coarse, detail, Kcoherent, d)
+    end
+
+    function Base.getproperty(vq::MultiscaleRVQQuantizer, s::Symbol)
+        if s === :embedding
+            return getfield(vq, :coarse).embedding
+        end
+        return getfield(vq, s)
+    end
+
+    struct PairSpecificMultiscaleRVQQuantizer{Q}
+        coarse::Vector{Q}
+        detail::Vector{Q}
+        K::Int
+        d::Int
+        num_pairs::Int
+    end
+    Flux.@layer PairSpecificMultiscaleRVQQuantizer trainable = ()
+
+    function PairSpecificMultiscaleRVQQuantizer(num_pairs::Int, Kcoherent::Int, Knuisance::Int, d::Int;
+        detail_stages::Int=1,
+        decay_small::Float32=0.999f0,
+        decay_large::Float32=0.99f0,
+        epsilon::Float32=1f-5,
+        dead_threshold::Int=2)
+        num_pairs >= 1 || error("num_pairs must be >= 1, got $num_pairs")
+        detail_stages >= 0 || error("detail_stages must be >= 0, got $detail_stages")
+        coarse = [
+            VectorQuantizerEMA(Kcoherent, d; decay=decay_small, epsilon=epsilon, dead_threshold=dead_threshold)
+            for _ in 1:num_pairs
+        ]
+        detail = eltype(coarse)[
+            VectorQuantizerEMA(Knuisance, d; decay=decay_large, epsilon=epsilon, dead_threshold=dead_threshold)
+            for _ in 1:detail_stages
+        ]
+        return PairSpecificMultiscaleRVQQuantizer(coarse, detail, Kcoherent, d, num_pairs)
+    end
+
+    function Base.getproperty(vq::PairSpecificMultiscaleRVQQuantizer, s::Symbol)
+        if s === :embedding
+            return getfield(vq, :coarse)[1].embedding
+        end
+        return getfield(vq, s)
+    end
+
+    pair_ids_to_cpu(pair_ids::AbstractVector{<:Integer}) = Int.(collect(pair_ids))
+    pair_ids_to_cpu(pair_ids::CuArray{<:Integer}) = Int.(Array(pair_ids))
+
+    function validate_pair_ids(pair_ids, num_pairs::Int, n_expected::Int)
+        ids = pair_ids_to_cpu(pair_ids)
+        length(ids) == n_expected || error("Expected $n_expected pair ids, got $(length(ids))")
+        all(1 .<= ids .<= num_pairs) || error("pair_ids must lie in 1:$num_pairs")
+        return ids
+    end
+
+
+    function (vq::MultiscaleRVQQuantizer)(z_e::AbstractMatrix{Float32}; beta_commit::Float32=0.25f0, training::Bool=true)
+        d, N = size(z_e)
+        @assert d == vq.d "Expected embedding dim $(vq.d), got $d"
+
+        z_coarse_in = z_e
+
+        rt_small = vq.coarse(z_coarse_in; beta_commit=beta_commit, training=training)
+        z_q_total = rt_small.z_q
+        residual = z_e .- Zygote.@ignore(rt_small.z_q)
+
+        detail_indices = training ? nothing : Array{Int}(undef, length(vq.detail), N)
+        vq_loss_detail = 0f0
+        commit_detail = 0f0
+        entropy_detail = 0f0
+        perplexity_detail = 0f0
+
+        for (s, q) in enumerate(vq.detail)
+            rt = q(residual; beta_commit=beta_commit, training=training)
+            z_q_total = z_q_total .+ rt.z_q
+            residual = residual .- Zygote.@ignore(rt.z_q)
+            if !training
+                detail_indices[s, :] = Int.(cpu(rt.indices))
+            end
+            vq_loss_detail += rt.vq_loss
+            commit_detail += rt.commit_loss
+            entropy_detail += rt.entropy_loss
+            perplexity_detail += rt.perplexity
+        end
+
+        n_detail = Float32(length(vq.detail))
+        mean_detail_vq = n_detail > 0f0 ? vq_loss_detail / n_detail : 0f0
+        mean_detail_commit = n_detail > 0f0 ? commit_detail / n_detail : 0f0
+        mean_detail_entropy = n_detail > 0f0 ? entropy_detail / n_detail : 0f0
+        mean_detail_perplexity = n_detail > 0f0 ? perplexity_detail / n_detail : 1f0
+        return (; z_q=z_q_total,
+            indices=rt_small.indices,
+            encodings=rt_small.encodings,
+            vq_loss=rt_small.vq_loss + mean_detail_vq,
+            commit_loss=rt_small.commit_loss + mean_detail_commit,
+            perplexity=rt_small.perplexity,
+            entropy_loss=rt_small.entropy_loss + mean_detail_entropy,
+            coarse_indices=Int.(cpu(rt_small.indices)),
+            detail_indices=detail_indices,
+            perplexity_coarse=rt_small.perplexity,
+            perplexity_detail=mean_detail_perplexity)
+    end
+
+    function (vq::PairSpecificMultiscaleRVQQuantizer)(z_e::AbstractMatrix{Float32}, pair_ids;
+        beta_commit::Float32=0.25f0, training::Bool=true)
+        d, N = size(z_e)
+        @assert d == vq.d "Expected embedding dim $(vq.d), got $d"
+        ids = Zygote.@ignore validate_pair_ids(pair_ids, vq.num_pairs, N)
+        z_coarse_in = z_e
+
+        z_q_coarse = zero(z_e)
+        coarse_indices_acc = training ? nothing : zeros(Float32, N)
+        vq_loss_small = 0f0
+        commit_small = 0f0
+        entropy_small = 0f0
+        perplexity_small = 0f0
+        num_active_pairs = 0
+        for pid in 1:vq.num_pairs
+            sel = findall(==(pid), ids)
+            isempty(sel) && continue
+            rt_small = vq.coarse[pid](z_coarse_in[:, sel]; beta_commit=beta_commit, training=training)
+            sel_mask = xpu(Float32.(reshape(collect(1:N), N, 1) .== reshape(sel, 1, :)))
+            z_q_coarse = z_q_coarse .+ rt_small.z_q * sel_mask'
+            if !training
+                coarse_row = reshape(Float32.(cpu(rt_small.indices)), 1, :)
+                coarse_indices_acc = coarse_indices_acc .+ vec(coarse_row * cpu(sel_mask'))
+            end
+            vq_loss_small += rt_small.vq_loss
+            commit_small += rt_small.commit_loss
+            entropy_small += rt_small.entropy_loss
+            perplexity_small += rt_small.perplexity
+            num_active_pairs += 1
+        end
+
+        n_active = Float32(max(num_active_pairs, 1))
+        residual = z_e .- Zygote.@ignore(z_q_coarse)
+        z_q_total = z_q_coarse
+        detail_indices = training ? nothing : Array{Int}(undef, 0, N)
+        vq_loss_detail = 0f0
+        commit_detail = 0f0
+        entropy_detail = 0f0
+        perplexity_detail = 0f0
+
+        for (s, q) in enumerate(vq.detail)
+            rt = q(residual; beta_commit=beta_commit, training=training)
+            z_q_total = z_q_total .+ rt.z_q
+            residual = residual .- Zygote.@ignore(rt.z_q)
+            if !training
+                detail_row = reshape(Int.(cpu(rt.indices)), 1, :)
+                detail_indices = vcat(detail_indices, detail_row)
+            end
+            vq_loss_detail += rt.vq_loss
+            commit_detail += rt.commit_loss
+            entropy_detail += rt.entropy_loss
+            perplexity_detail += rt.perplexity
+        end
+
+        n_detail = Float32(length(vq.detail))
+        mean_detail_vq = n_detail > 0f0 ? vq_loss_detail / n_detail : 0f0
+        mean_detail_commit = n_detail > 0f0 ? commit_detail / n_detail : 0f0
+        mean_detail_entropy = n_detail > 0f0 ? entropy_detail / n_detail : 0f0
+        mean_detail_perplexity = n_detail > 0f0 ? perplexity_detail / n_detail : 1f0
+        coarse_indices = training ? nothing : Int.(round.(coarse_indices_acc))
+        indices_out = training ? ids : coarse_indices
+        encodings = training ? nothing : Flux.onehotbatch(coarse_indices, 1:vq.K)
+        return (; z_q=z_q_total,
+            indices=indices_out,
+            encodings,
+            vq_loss=vq_loss_small / n_active + mean_detail_vq,
+            commit_loss=commit_small / n_active + mean_detail_commit,
+            perplexity=perplexity_small / n_active,
+            entropy_loss=entropy_small / n_active + mean_detail_entropy,
+            coarse_indices=(training ? nothing : coarse_indices),
+            detail_indices=detail_indices,
+            perplexity_coarse=perplexity_small / n_active,
+            perplexity_detail=mean_detail_perplexity,
+            pair_ids=ids)
+    end
+
+    
 end
 
 # ╔═╡ a0000008-0000-0000-0000-000000000001
@@ -508,70 +706,32 @@ md"## VQ-VAE Model"
 
 # ╔═╡ a0000009-0000-0000-0000-000000000001
 begin
-    struct PreVQLSTMContext{L}
-        layers::L
-        residual::Bool
-    end
-    Flux.@layer PreVQLSTMContext trainable = (layers,)
-
-    function PreVQLSTMContext(ch::Int; num_layers::Int=2, residual::Bool=true)
-        layers = [Flux.LSTM(ch => ch) for _ in 1:num_layers]
-        return PreVQLSTMContext(layers, residual)
-    end
-
-    function (m::PreVQLSTMContext)(x::AbstractArray{Float32,3})
-        h = permutedims(x, (2, 1, 3))  # (C, L, B) for Flux sequence layers
-        for layer in m.layers
-            h = layer(h)
-        end
-        y = permutedims(h, (2, 1, 3))
-        return m.residual ? x .+ y : y
-    end
-
-    function resolve_analysis_time_index(codebook_indices_time, time_index)
-        if isnothing(codebook_indices_time)
-            return nothing
-        end
-        L = size(codebook_indices_time, 2)
-        ti = isnothing(time_index) ? cld(L, 2) : Int(time_index)
-        1 <= ti <= L || throw(ArgumentError("time_index=$ti is out of bounds for latent length $L"))
-        return ti
-    end
-
-    function select_codebook_indices(result; time_index=nothing)
-        if isnothing(result.codebook_indices_time)
-            return result.codebook_indices, nothing
-        end
-        ti = resolve_analysis_time_index(result.codebook_indices_time, time_index)
-        return @view(result.codebook_indices_time[:, ti, :]), ti
-    end
-
-    struct VQVAE{E,P,C,VQ,D}
-        encoder::E         # Conv1DChain: waveform → flat features or feature map
-        pre_vq::P          # Dense(flat→d) or Conv1D(1x1, C_enc→d)
-        pre_vq_context::C  # nothing or stacked LSTM context over (L, d, batch)
-        quantizer::VQ      # Vector{VectorQuantizerEMA}, one codebook per RVQ stage
-        decoder::D         # Conv1DChain/SeqConv1DChain: d → waveform
-        T::Int             # number of RVQ stages
+    struct VQVAE{E,M,P,VQ,D}
+        encoder::E         # SeqConv1DChain: waveform → feature map (L, C, B)
+        metric_proj::M     # 1x1 Conv projection: feature map → z_metric (L, d, B)
+        pre_vq::P          # Dense over flatten(z_metric): (d*L, B) → z_e (d, B)
+        quantizer::VQ      # VectorQuantizerEMA / multiscale RVQ over one vector per waveform
+        decoder::D         # Conv1DChain: z_q (d, B) → waveform
         d::Int             # codebook embedding dimension
-        use_pre_vq_conv::Bool  # true => pre_vq is Conv1D map projection
-        time_resolved_quantization::Bool  # true => quantize per latent time step
+        latent_len::Int    # encoder latent-time length L
     end
-    Flux.@layer VQVAE trainable = (encoder, pre_vq, pre_vq_context, decoder)
+    Flux.@layer VQVAE trainable = (encoder, metric_proj, pre_vq, quantizer, decoder)
 
-    function project_pre_vq_map(m::VQVAE, feat)
-        if m.use_pre_vq_conv
-            z_map = m.pre_vq(feat)                              # (L, d, batch)
-            return m.pre_vq_context === nothing ? z_map : m.pre_vq_context(z_map)
-        end
-        feat_flat = reshape(feat, size(feat, 1), :)
-        z_pre = m.pre_vq(feat_flat)                            # (d, batch)
-        return reshape(z_pre, 1, size(z_pre, 1), size(z_pre, 2))  # (1, d, batch)
-    end
+    codebook_size(m) = m.quantizer.K
 
-    function project_pre_vq(m::VQVAE, feat)
-        z_map = project_pre_vq_map(m, feat)
-        return dropdims(mean(z_map; dims=1); dims=1)           # (d, batch)
+    function metric_latents(m, feat_map)
+        ndims(feat_map) == 3 || error("Metric path expected a 3D encoder tensor, got ndims=$(ndims(feat_map))")
+        z_metric_l = m.metric_proj(feat_map)  # (L, d, B)
+        ndims(z_metric_l) == 3 || error("Metric projection expected a 3D tensor, got ndims=$(ndims(z_metric_l))")
+        L, d, B = size(z_metric_l)
+        d == m.d || error("Metric projection returned d=$d, expected $(m.d)")
+        L == m.latent_len || error("Metric projection returned latent length $L, expected $(m.latent_len)")
+        z_metric = permutedims(z_metric_l, (2, 1, 3))  # (d, L, B)
+        z_metric_flat = reshape(z_metric, m.d * m.latent_len, B)
+        z_pre = m.pre_vq(z_metric_flat)
+        ndims(z_pre) == 2 || error("pre_vq expected a 2D tensor, got ndims=$(ndims(z_pre))")
+        size(z_pre, 1) == m.d || error("pre_vq returned d=$(size(z_pre, 1)), expected $(m.d)")
+        return z_metric, z_metric_flat, z_pre
     end
 
     """
@@ -583,275 +743,142 @@ begin
 
     Returns named tuple with reconstruction `xhat`, losses, codebook indices, etc.
     """
-    function (m::VQVAE)(x; beta_commit::Float32=0.25f0, training::Bool=true)
-        x_flat = flatten_batch(x)
-        feat = m.encoder(x_flat)
-        z_map = project_pre_vq_map(m, feat)
-        L_lat = size(z_map, 1)
-        N_batch = size(z_map, 3)
+    function decode_from_latents(m, result)
+        xhat = m.decoder(result.z_q)
+        return merge(result, (; xhat))
+    end
 
-        z_e, N_total = if m.time_resolved_quantization
-            z_pre_time = reshape(permutedims(z_map, (2, 1, 3)), m.d, L_lat * N_batch)
-            (z_pre_time, L_lat * N_batch)
-        else
-            z_pre_vec = dropdims(mean(z_map; dims=1); dims=1)
-            (z_pre_vec, N_batch)
-        end
-
-        # Residual Vector Quantization (RVQ): shared codebook applied T times to residual.
-        residual = z_e
-        z_q_sum = nothing
-        stage_z_q = training ? nothing : Vector{AbstractMatrix{Float32}}(undef, m.T)
-        codebook_indices = training ? nothing : Array{Int}(undef, m.T, N_total)
-        vq_loss_total = 0f0
-        commit_loss_total = 0f0
-        perplexity_sum = 0f0
-        entropy_loss_total = 0f0
-        for t in 1:m.T
-            rt = m.quantizer[t](residual; beta_commit, training)
-            if !training
-                stage_z_q[t] = rt.z_q
-            end
-            z_q_sum = isnothing(z_q_sum) ? rt.z_q : (z_q_sum .+ rt.z_q)
-            residual = residual .- Zygote.@ignore(rt.z_q)
-                if !training
-                    codebook_indices[t, :] .= Int.(cpu(rt.indices))
-                end
-                vq_loss_total += rt.vq_loss
-                commit_loss_total += rt.commit_loss
-                perplexity_sum += rt.perplexity
-                entropy_loss_total += rt.entropy_loss
-            end
-
-        codebook_indices_time = nothing
-        codebook_indices_out = nothing
-        if m.time_resolved_quantization
-            if !training
-                codebook_indices_time = reshape(codebook_indices, m.T, L_lat, N_batch)
-            end
-            z_q_for_dec = permutedims(reshape(z_q_sum, m.d, L_lat, N_batch), (2, 1, 3))  # (L, d, batch)
-            xhat = m.decoder(z_q_for_dec)
-        else
-            if !training
-                codebook_indices_out = codebook_indices
-            end
-            xhat = m.decoder(z_q_sum)
-        end
-
-        z_q_3d = training ? reshape(z_q_sum, m.d, 1, N_total) : cat([reshape(stage_z_q[t], m.d, 1, N_total) for t in 1:m.T]...; dims=2)
-
-        return (;
-            xhat,
-            xhat_per_slot = nothing,
-            z_e = reshape(z_e, m.d, 1, N_total),
-            z_q = z_q_3d,
-            codebook_indices = codebook_indices_out,
-            codebook_indices_time,
-            vq_loss      = vq_loss_total,
-            commit_loss  = commit_loss_total,
-            perplexity   = perplexity_sum / m.T,
-            entropy_loss = entropy_loss_total,
-        )
+    function (m::VQVAE)(x, pair_ids; beta_commit::Float32=0.25f0, training::Bool=true)
+        return decode_from_latents(m, encode(m, x, pair_ids; beta_commit=beta_commit, training=training))
     end
 
     """
     Encode-only: get quantized codes and codebook indices for a batch of waveforms.
     No decoder pass.
     """
-    function encode(m, x)
+    function encode(m, x, pair_ids; beta_commit::Float32=0.25f0, training::Bool=false)
         x_flat = flatten_batch(x)
-        feat = m.encoder(x_flat)
-        z_map = project_pre_vq_map(m, feat)
-        L_lat = size(z_map, 1)
-        N_batch = size(z_map, 3)
-        z_e, N_total = if m.time_resolved_quantization
-            z_pre_time = reshape(permutedims(z_map, (2, 1, 3)), m.d, L_lat * N_batch)
-            (z_pre_time, L_lat * N_batch)
+        feat_map = m.encoder(x_flat)
+        z_metric, z_metric_flat, z_e = metric_latents(m, feat_map)
+        N_total = size(z_e, 2)
+        pair_ids_cpu = Zygote.@ignore validate_pair_ids(pair_ids,
+            m.quantizer isa PairSpecificMultiscaleRVQQuantizer ? m.quantizer.num_pairs : 1,
+            N_total)
+        rt = if m.quantizer isa PairSpecificMultiscaleRVQQuantizer
+            m.quantizer(z_e, pair_ids_cpu; beta_commit, training)
         else
-            z_pre_vec = dropdims(mean(z_map; dims=1); dims=1)
-            (z_pre_vec, N_batch)
+            m.quantizer(z_e; beta_commit, training)
         end
-        residual = z_e
-        stage_z_q = Vector{AbstractMatrix{Float32}}(undef, m.T)
-        codebook_indices = Array{Int}(undef, m.T, N_total)
-        for t in 1:m.T
-            rt = m.quantizer[t](residual; training=false)
-            stage_z_q[t] = rt.z_q
-            residual = residual .- rt.z_q
-            codebook_indices[t, :] .= Int.(cpu(rt.indices))
+        codebook_indices = training ? nothing : reshape(Int.(cpu(rt.indices)), 1, N_total)
+        coarse_codebook_indices = training ? nothing : begin
+            if hasproperty(rt, :coarse_indices)
+                reshape(Int.(rt.coarse_indices), 1, N_total)
+            else
+                codebook_indices
+            end
         end
-        codebook_indices_time = m.time_resolved_quantization ? reshape(codebook_indices, m.T, L_lat, N_batch) : nothing
-        z_q = cat([reshape(stage_z_q[t], m.d, 1, N_total) for t in 1:m.T]...; dims=2)
-        codebook_indices_out = m.time_resolved_quantization ? nothing : codebook_indices
-        return (; z_e=reshape(z_e, m.d, 1, N_total), z_q, codebook_indices=codebook_indices_out, codebook_indices_time)
+        detail_codebook_indices = training ? nothing : (hasproperty(rt, :detail_indices) ? Int.(rt.detail_indices) : nothing)
+        return (; z_map=feat_map, z_metric, z_metric_flat, z_pre_flat=z_e, z_e, z_q=rt.z_q,
+            pair_ids=pair_ids_cpu,
+            z_q_flat=rt.z_q, codebook_indices,
+            coarse_codebook_indices,
+            detail_codebook_indices,
+            vq_loss=rt.vq_loss,
+            commit_loss=rt.commit_loss,
+            perplexity=rt.perplexity,
+            perplexity_coarse=(hasproperty(rt, :perplexity_coarse) ? rt.perplexity_coarse : rt.perplexity),
+            perplexity_detail=(hasproperty(rt, :perplexity_detail) ? rt.perplexity_detail : rt.perplexity),
+            entropy_loss=rt.entropy_loss)
     end
 
     """
     Get codebook prototypes: returns (d, K) matrix.
     """
-    get_codebook(m) = [cpu(m.quantizer[t].embedding) for t in 1:m.T]
+    function get_codebook(m)
+        if m.quantizer isa PairSpecificMultiscaleRVQQuantizer
+            return cpu(m.quantizer.coarse[1].embedding)
+        elseif m.quantizer isa MultiscaleRVQQuantizer
+            return cpu(m.quantizer.coarse.embedding)
+        end
+        return cpu(m.quantizer.embedding)
+    end
+
+    function get_multiscale_codebooks(m)
+        if m.quantizer isa PairSpecificMultiscaleRVQQuantizer
+            return (; coarse=[cpu(q.embedding) for q in m.quantizer.coarse],
+                detail=[cpu(q.embedding) for q in m.quantizer.detail])
+        elseif !(m.quantizer isa MultiscaleRVQQuantizer)
+            return (; coarse=get_codebook(m), detail=Any[])
+        end
+        return (; coarse=cpu(m.quantizer.coarse.embedding),
+            detail=[cpu(q.embedding) for q in m.quantizer.detail])
+    end
+
+    function get_pair_coarse_codebook(m, pair_id::Int)
+        m.quantizer isa PairSpecificMultiscaleRVQQuantizer || error("Pair-specific coarse codebooks are only available in pair-specific mode.")
+        1 <= pair_id <= m.quantizer.num_pairs || error("pair_id must lie in 1:$(m.quantizer.num_pairs)")
+        return cpu(m.quantizer.coarse[pair_id].embedding)
+    end
+
+    function get_shared_detail_codebooks(m)
+        if m.quantizer isa PairSpecificMultiscaleRVQQuantizer
+            return [cpu(q.embedding) for q in m.quantizer.detail]
+        elseif m.quantizer isa MultiscaleRVQQuantizer
+            return [cpu(q.embedding) for q in m.quantizer.detail]
+        end
+        return Any[]
+    end
 
     """
     Get cluster assignment histogram for a batch.
     Returns (K,) vector of percentages.
     """
-    function combination_multipliers(K, T)
-        [K ^ (t - 1) for t in 1:T]
-    end
-
-    function combination_index(digits::AbstractVector{Int}, multipliers::AbstractVector{Int})
-        return sum((digits .- 1) .* multipliers) + 1
-    end
-
-    function combination_digits(idx::Int, K::Int, T::Int)
-        multipliers = combination_multipliers(K, T)
-        digits = zeros(Int, T)
-        n = idx - 1
-        for t in 1:T
-            digits[t] = mod(div(n, multipliers[t]), K) + 1
+    function get_cluster_percentages(m, x, pair_ids=fill(1, size(flatten_batch(x), 2)); return_labels::Bool=false)
+        result = encode(m, x, pair_ids)
+        K = codebook_size(m)
+        counts = zeros(Float32, K)
+        for k in vec(result.codebook_indices)
+            counts[k] += 1f0
         end
-        return digits
-    end
-
-    function combination_labels(K, T)
-        if T == 1
-            return [string(k) for k in 1:K]
-        end
-        total = K ^ T
-        labels = Vector{String}(undef, total)
-        for idx in 1:total
-            labels[idx] = join(combination_digits(idx, K, T), "-")
-        end
-        return labels
-    end
-    function get_cluster_percentages(m, x; time_index=nothing, return_labels::Bool=false)
-        result = encode(m, x)
-        ci_sel, resolved_time_index = select_codebook_indices(result; time_index)
-        K = m.quantizer[1].K
-        counts = m.T == 1 ? zeros(Float32, K) : zeros(Float32, K ^ m.T)
-        multipliers = m.T == 1 ? nothing : combination_multipliers(K, m.T)
-        N_total = size(ci_sel, 2)
-        for j in 1:N_total
-            if m.T == 1
-                counts[ci_sel[1, j]] += 1f0
-            else
-                digits = ci_sel[:, j]
-                combo_idx = combination_index(digits, multipliers)
-                counts[combo_idx] += 1f0
-            end
-        end
-        labels = m.T == 1 ? [string(k) for k in 1:K] : combination_labels(K, m.T)
+        labels = [string(k) for k in 1:K]
         percentages = counts ./ max(sum(counts), 1f-10) .* 100f0
-        return return_labels ? (; percentages, labels, time_index=resolved_time_index) : percentages
+        return return_labels ? (; percentages, labels) : percentages
     end
 
     """
-    Get waveforms assigned to the combination `(k₁, k₂, …)` of length `T`.
+    Get waveforms assigned to code `k`.
     Returns `(data_in_cluster, indices_in_data)`.
     """
-    function filter_cluster(m, x, ks::NTuple{N, Int}; time_index=nothing) where {N}
-        if N != m.T
-            throw(ArgumentError("Expected tuple of length m.T=" * string(m.T)))
-        end
-        result = encode(m, x)
+    function filter_cluster(m, x, pair_ids, ks::NTuple{N,Int}; time_index=nothing) where {N}
+        N == 1 || throw(ArgumentError("Single-bottleneck VQ expects a single code tuple, e.g. (3,)"))
+        isnothing(time_index) || throw(ArgumentError("time_index is not supported in single-bottleneck VQ."))
+        result = encode(m, x, pair_ids)
         x_flat = flatten_batch(x)
-        ci_flat, _ = select_codebook_indices(result; time_index)
-        ks_vec = collect(ks)
-        selected = findall(j -> all(ci_flat[:, j] .== ks_vec), 1:size(ci_flat, 2))
+        indices = vec(result.codebook_indices)
+        selected = findall(==(ks[1]), indices)
         return x_flat[:, selected], selected
     end
 
     """
     Get cluster averages: mean waveform per cluster.
-    Returns (nt, K) matrix.
     """
-    function get_cluster_averages(m, x; time_index=nothing)
-        result = encode(m, x)
-        ci_flat, _ = select_codebook_indices(result; time_index)
-        K = m.quantizer[1].K
+    function get_cluster_averages(m, x, pair_ids=fill(1, size(flatten_batch(x), 2)); time_index=nothing)
+        isnothing(time_index) || throw(ArgumentError("time_index is not supported in single-bottleneck VQ."))
+        result = encode(m, x, pair_ids)
+        K = codebook_size(m)
         nt = size(x, 1)
         x_flat = cpu(flatten_batch(x))
-        N_total = size(ci_flat, 2)
-
-        if m.T == 1
-            indices = vec(ci_flat)
-            avgs = zeros(Float32, nt, K)
-            counts = zeros(Int, K)
-            for (j, k) in enumerate(indices)
-                avgs[:, k] .+= x_flat[:, j]
-                counts[k] += 1
-            end
-            for k in 1:K
-                if counts[k] > 0
-                    avgs[:, k] ./= counts[k]
-                end
-            end
-        else
-            num_combinations = K ^ m.T
-            avgs = zeros(Float32, nt, num_combinations)
-            counts = zeros(Int, num_combinations)
-            multipliers = [K ^ (t - 1) for t in 1:m.T]
-            for j in 1:N_total
-                digits = ci_flat[:, j] .- 1
-                combo_idx = sum(digits .* multipliers) + 1
-                avgs[:, combo_idx] .+= x_flat[:, j]
-                counts[combo_idx] += 1
-            end
-            for idx in 1:num_combinations
-                if counts[idx] > 0
-                    avgs[:, idx] ./= counts[idx]
-                end
-            end
+        indices = vec(result.codebook_indices)
+        avgs = zeros(Float32, nt, K)
+        counts = zeros(Int, K)
+        for (j, k) in enumerate(indices)
+            avgs[:, k] .+= x_flat[:, j]
+            counts[k] += 1
+        end
+        for k in 1:K
+            counts[k] > 0 && (avgs[:, k] ./= counts[k])
         end
         return avgs
-    end
-
-    function reconstruct_at_time_index(m, x; time_index::Int)
-        m.time_resolved_quantization || throw(ArgumentError("reconstruct_at_time_index requires time_resolved_quantization=true"))
-
-        x_flat = flatten_batch(x)
-        feat = m.encoder(x_flat)
-        z_map = project_pre_vq_map(m, feat)
-        L_lat = size(z_map, 1)
-        N_batch = size(z_map, 3)
-        1 <= time_index <= L_lat || throw(ArgumentError("time_index=$time_index is out of bounds for latent length $L_lat"))
-
-        z_e = reshape(permutedims(z_map, (2, 1, 3)), m.d, L_lat * N_batch)
-        residual = z_e
-        z_q_sum = nothing
-        codebook_indices_time = Array{Int}(undef, m.T, L_lat, N_batch)
-
-        for t in 1:m.T
-            rt = m.quantizer[t](residual; training=false)
-            z_q_sum = isnothing(z_q_sum) ? rt.z_q : (z_q_sum .+ rt.z_q)
-            residual = residual .- rt.z_q
-            codebook_indices_time[t, :, :] .= reshape(Int.(cpu(rt.indices)), L_lat, N_batch)
-        end
-
-        z_q_seq = reshape(z_q_sum, m.d, L_lat, N_batch)
-        time_mask = reshape(xpu(Float32.(collect(1:L_lat) .== time_index)), 1, L_lat, 1)
-        z_q_selected = z_q_seq .* time_mask
-        xhat = m.decoder(permutedims(z_q_selected, (2, 1, 3)))
-
-        return (; xhat, z_q_selected, codebook_indices_time, time_index)
-    end
-
-    function decode_cluster_at_time_index(m, ks::NTuple{N, Int}, latent_len::Int; time_index::Int, batchsize::Int=1) where {N}
-        m.time_resolved_quantization || throw(ArgumentError("decode_cluster_at_time_index requires time_resolved_quantization=true"))
-        N == m.T || throw(ArgumentError("Expected tuple of length m.T=" * string(m.T)))
-        1 <= time_index <= latent_len || throw(ArgumentError("time_index=$time_index is out of bounds for latent length $latent_len"))
-
-        slot_code = zeros(Float32, m.d, batchsize) |> xpu
-        for t in 1:m.T
-            1 <= ks[t] <= m.quantizer[t].K || throw(ArgumentError("Code index $(ks[t]) out of bounds for stage $t"))
-            slot_code = slot_code .+ reshape(m.quantizer[t].embedding[:, ks[t]], m.d, 1)
-        end
-
-        time_mask = reshape(xpu(Float32.(collect(1:latent_len) .== time_index)), 1, latent_len, 1)
-        z_q_selected = repeat(reshape(slot_code, m.d, 1, batchsize), 1, latent_len, 1) .* time_mask
-        xhat = m.decoder(permutedims(z_q_selected, (2, 1, 3)))
-
-        return (; xhat, z_q_selected, time_index, cluster=ks)
     end
 end
 
@@ -859,111 +886,10 @@ end
 md"## Model Factory"
 
 # ╔═╡ a0000011-0000-0000-0000-000000000001
-"""
-    get_vqvae(para::VQVAE_Para)
-
-Build a VQ-VAE model and loss history from parameters.
-
-Returns `(model, loss_history)`.
-"""
-function get_vqvae(para::VQVAE_Para)
-    if para.seed !== nothing
-        Random.seed!(para.seed)
-    end
-    if para.time_resolved_quantization && !para.use_pre_vq_conv
-        error("time_resolved_quantization=true requires use_pre_vq_conv=true")
-    end
-    if para.use_pre_vq_lstm && !para.use_pre_vq_conv
-        error("use_pre_vq_lstm=true requires use_pre_vq_conv=true")
-    end
-    if para.decode_codebook_superposition || para.use_slot_weights
-        @warn "RVQ path ignores decode_codebook_superposition/use_slot_weights."
-    end
-
-    # Encoder + pre-VQ projection
-    enc_outsize = nothing
-    if para.use_pre_vq_conv
-        encoder, _, enc_outsize = get_vq_conv_encoder(para.nt;
-            kernels=para.enc_kernels, filters=para.enc_filters,
-            strides=para.enc_strides, use_bn=para.use_bn,
-            flatten_output=false, return_outsize=true)
-        enc_channels = enc_outsize[2]
-        # Channel projection before RVQ (1x1 in 1D)
-        pre_vq = Chain(Conv((1,), enc_channels => para.d; stride=1, pad=0)) |> xpu
-    else
-        encoder, flat_len, enc_outsize = get_vq_conv_encoder(para.nt;
-            kernels=para.enc_kernels, filters=para.enc_filters,
-            strides=para.enc_strides, use_bn=para.use_bn,
-            flatten_output=true, return_outsize=true)
-        # Legacy path: flat encoder output → d latent vector
-        pre_vq = Dense(flat_len, para.d) |> xpu
-    end
-    pre_vq_context = para.use_pre_vq_lstm ?
-        xpu(PreVQLSTMContext(para.d;
-            num_layers=para.pre_vq_lstm_layers,
-            residual=para.pre_vq_lstm_residual)) : nothing
-
-    # Separate codebook per RVQ stage (EnCodec-style RVQ)
-    quantizer = [VectorQuantizerEMA(para.K, para.d;
-        decay=para.ema_decay, epsilon=para.epsilon,
-        dead_threshold=para.dead_threshold)
-        for _ in 1:para.T]
-
-    # Decoder strides are derived from encoder strides and auto-adjusted for nt.
-    @assert enc_outsize !== nothing "Encoder outsize unavailable for decoder geometry inference."
-    latent_len = enc_outsize[1]
-    dec_upstrides = auto_dec_upstrides_for_nt(para.nt, latent_len, para.d;
-        dec_kernels=para.dec_kernels, dec_filters=para.dec_filters,
-        use_bn=para.use_bn, enc_strides=para.enc_strides)
-
-    # Decoder (build on CPU first; run geometry checks before moving to GPU)
-    decoder_cpu = if para.time_resolved_quantization
-        get_vq_conv_decoder_sequence(para.nt, para.d;
-            kernels=para.dec_kernels, filters=para.dec_filters,
-            upstrides=dec_upstrides, use_bn=para.use_bn)
-    else
-        get_vq_conv_decoder(para.nt, para.d;
-            kernels=para.dec_kernels, filters=para.dec_filters,
-            upstrides=dec_upstrides, use_bn=para.use_bn)[1]
-    end
-
-    # Enforce exact geometry (Misha-style): decoder output length must match nt exactly.
-    dec_out_len = if para.time_resolved_quantization
-        outsz = Flux.outputsize(decoder_cpu.chain, (latent_len, para.d); padbatch=true)
-        outsz[1]
-    else
-        outsz = Flux.outputsize(decoder_cpu.chain, (para.d,); padbatch=true)
-        outsz[1]
-    end
-    if dec_out_len != para.nt
-        error("Decoder geometry mismatch: output length $dec_out_len != nt $(para.nt). " *
-              "Adjust enc_strides (or decoder kernels/filters).")
-    end
-    @info "Auto decoder upstrides" dec_upstrides nt=para.nt latent_len
-
-    decoder = xpu(decoder_cpu)
-    model = VQVAE(xpu(encoder), xpu(pre_vq), pre_vq_context, quantizer, decoder,
-                  para.T, para.d, para.use_pre_vq_conv,
-                  para.time_resolved_quantization)
-
-    loss_history = (;
-        train_recon = Float32[],
-        test_recon = Float32[],
-        train_commit = Float32[],
-        test_commit = Float32[],
-        train_total = Float32[],
-        test_total = Float32[],
-        train_perplexity = Float32[],
-        test_perplexity = Float32[],
-    )
-
-    return model, loss_history
-end
-
 # ╔═╡ a0000012-0000-0000-0000-000000000001
 md"## Loss Functions"
 
-# ╔═╡ a0000013-0000-0000-0000-000000000001
+# ╔═╡ 76930390-49e1-45da-b654-7d1e65c856b1
 """
 VQ-VAE loss (unpaired, standard reconstruction):
 
@@ -978,18 +904,192 @@ Arguments:
 - `para`: VQVAE_Para with loss weights
 - `training`: whether to update EMA codebook
 """
-function loss_vqvae(model, x, para; training::Bool=true)
-    x_flat = xpu(x)
-    result = model(x_flat; beta_commit=para.beta_commit, training)
+function vqvae_forward(model, x, pair_ids, beta_commit::Float32, training::Bool)
+    return model(x, pair_ids; beta_commit=beta_commit, training=training)
+end
 
-    recon_loss = Flux.mse(result.xhat, x_flat)
+# ╔═╡ 8646155e-376f-44e6-89df-c3092d350046
+function reconstruction_loss(xhat, x, loss_type::Symbol)
+    if loss_type === :l1
+        return mean(abs.(xhat .- x))
+    elseif loss_type === :l2
+        return Flux.mse(xhat, x)
+    else
+        error("Unsupported reconstruction_loss=$(loss_type). Use :l1 or :l2.")
+    end
+end
+
+function vqvae_total_loss(result, x, entropy_weight::Float32, loss_type::Symbol)
+    recon_loss = reconstruction_loss(result.xhat, x, loss_type)
+    commit_loss  = result.commit_loss
+    entropy_loss = result.entropy_loss
+    total = recon_loss + commit_loss + entropy_weight * entropy_loss
+    return total, recon_loss, commit_loss, entropy_loss
+end
+
+function _reflect_index(i::Int, n::Int)
+    n == 1 && return 1
+    while i < 1 || i > n
+        i = i < 1 ? 2 - i : 2n - i
+    end
+    return i
+end
+
+function _centered_reflect_moving_average(x::AbstractVector{<:Real}, window::Int)
+    n = length(x)
+    window <= 1 && return Float32.(x)
+    window >= n && return fill(Float32(mean(x)), n)
+    left = div(window - 1, 2)
+    right = window - 1 - left
+    y = Vector{Float32}(undef, n)
+    denom = Float32(window)
+    for t in 1:n
+        acc = 0f0
+        for offset in -left:right
+            acc += Float32(x[_reflect_index(t + offset, n)])
+        end
+        y[t] = acc / denom
+    end
+    return y
+end
+
+function compute_signal_envelope(X; smoothing_window::Int, floor::Real=0.1f0)
+    X_cpu = Float32.(cpu(flatten_batch(X)))
+    T = size(X_cpu, 1)
+    T > 0 || error("Cannot compute envelope for an empty waveform matrix.")
+    floor32 = Float32(floor)
+    0f0 <= floor32 <= 1f0 || error("floor must lie in [0, 1], got $floor")
+    smoothing_window >= 1 || error("smoothing_window must be >= 1, got $smoothing_window")
+    smoothing_window >= T && return ones(Float32, T)
+
+    med = Float32.(vec(median(abs.(X_cpu); dims=2)))
+    smooth = _centered_reflect_moving_average(med, smoothing_window)
+    max_smooth = maximum(smooth)
+    max_smooth > 0f0 || return ones(Float32, T)
+    return max.(smooth ./ max_smooth, floor32)
+end
+
+mutable struct LatentIndex
+    embeddings::Matrix{Float32}
+    neighbor_ids::Matrix{Int}
+    Mnn::Int
+end
+
+LatentIndex(Mnn::Int) = LatentIndex(zeros(Float32, 0, 0), zeros(Int, Mnn, 0), Mnn)
+
+function _l2_normalize_columns!(X::AbstractMatrix{Float32})
+    for j in axes(X, 2)
+        nrm = sqrt(sum(abs2, view(X, :, j)))
+        X[:, j] ./= Float32(nrm + 1f-8)
+    end
+    return X
+end
+
+function _l2_normalize_columns!(X::CuArray{Float32,2})
+    norms = sqrt.(sum(abs2, X; dims=1) .+ 1f-8)
+    X ./= norms
+    return X
+end
+
+function _set_diagonal_neg_inf_kernel!(scores, n::Int)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if i <= n
+        @inbounds scores[i, i] = -Inf32
+    end
+    return nothing
+end
+
+function _set_diagonal_neg_inf!(scores::CuArray{Float32,2})
+    n = min(size(scores, 1), size(scores, 2))
+    threads = 256
+    blocks = cld(n, threads)
+    @cuda threads=threads blocks=blocks _set_diagonal_neg_inf_kernel!(scores, n)
+    return scores
+end
+
+function rebuild_latent_index!(idx::LatentIndex, model, X, pair_ids; Mnn::Int=idx.Mnn, batch_size::Int=256)
+    X_cpu = Float32.(cpu(flatten_batch(X)))
+    pair_ids_cpu = Int.(pair_ids_to_cpu(pair_ids))
+    T, N = size(X_cpu)
+    length(pair_ids_cpu) == N || error("pair_ids length $(length(pair_ids_cpu)) must match X columns $N")
+    Mnn >= 1 || error("Mnn must be >= 1, got $Mnn")
+    batch_size >= 1 || error("batch_size must be >= 1, got $batch_size")
+
+    D = model.d * model.latent_len
+    embeddings_dev = CuArray{Float32}(undef, D, N)
+    for start_idx in 1:batch_size:N
+        cols = start_idx:min(start_idx + batch_size - 1, N)
+        xb = xpu(X_cpu[:, cols])
+        enc = encode(model, xb, pair_ids_cpu[cols]; beta_commit=0f0, training=false)
+        hasproperty(enc, :z_metric) || error("Latent kNN requires encode(...).z_metric in the single-bottleneck architecture.")
+        embeddings_dev[:, cols] .= reshape(enc.z_metric, D, :)
+    end
+    _l2_normalize_columns!(embeddings_dev)
+
+    neighbor_ids = Matrix{Int}(undef, Mnn, N)
+    for pid in sort!(unique(pair_ids_cpu))
+        group_ids = findall(==(pid), pair_ids_cpu)
+        length(group_ids) >= Mnn + 1 ||
+            error("Pair id $pid has only $(length(group_ids)) samples; need at least Mnn + 1 = $(Mnn + 1).")
+        group_embeddings = embeddings_dev[:, group_ids]
+        scores = transpose(group_embeddings) * group_embeddings
+        _set_diagonal_neg_inf!(scores)
+        perm = sortperm(scores; dims=1, rev=true)
+        G = length(group_ids)
+        top_local_dev = ((perm[1:Mnn, :] .- 1) .% G) .+ 1
+        top_local = Array(top_local_dev)
+        neighbor_ids[:, group_ids] .= reshape(group_ids[top_local], Mnn, G)
+    end
+
+    idx.embeddings = Array(embeddings_dev)
+    idx.neighbor_ids = neighbor_ids
+    idx.Mnn = Mnn
+    return idx
+end
+
+function build_ensemble_targets(X, idx::LatentIndex, batch_indices::AbstractVector{<:Integer};
+    Mnn::Int=idx.Mnn, aggregation::Symbol=:mean)
+    X_cpu = Float32.(cpu(flatten_batch(X)))
+    T = size(X_cpu, 1)
+    targets = Matrix{Float32}(undef, T, length(batch_indices))
+    Mnn >= 1 || error("Mnn must be >= 1, got $Mnn")
+    Mnn <= size(idx.neighbor_ids, 1) || error("Requested Mnn=$Mnn, but latent index stores only $(size(idx.neighbor_ids, 1)) neighbors.")
+    aggregation in (:mean, :median) || error("Unsupported ensemble aggregation $aggregation. Use :mean or :median.")
+    for (b, i_raw) in enumerate(batch_indices)
+        i = Int(i_raw)
+        1 <= i <= size(idx.neighbor_ids, 2) || error("Batch index $i is outside latent index size $(size(idx.neighbor_ids, 2)).")
+        nbrs = idx.neighbor_ids[1:Mnn, i]
+        target = aggregation === :mean ?
+            mean(view(X_cpu, :, nbrs); dims=2) :
+            median(view(X_cpu, :, nbrs); dims=2)
+        targets[:, b] = vec(target)
+    end
+    return targets
+end
+
+function weighted_reconstruction_loss(xhat, target, w)
+    wv = reshape(w, :, 1)
+    size(xhat, 1) == length(w) || error("Envelope length $(length(w)) must match reconstruction length $(size(xhat, 1)).")
+    return mean(((xhat .- target) .^ 2) .* wv)
+end
+
+function targeted_vqvae_loss(model, x, pair_ids, target, para; training::Bool=true)
+    result = vqvae_forward(model, x, pair_ids, para.beta_commit, training)
+    recon_loss = Flux.mse(result.xhat, target)
+    regular_mse = Flux.mse(result.xhat, x)
     commit_loss = result.commit_loss
     entropy_loss = result.entropy_loss
-
     total = recon_loss + commit_loss + para.entropy_weight * entropy_loss
+    return (; total, recon_loss, regular_mse, commit_loss, entropy_loss,
+        perplexity=result.perplexity)
+end
 
+# ╔═╡ b4387329-5621-49ec-a01f-3fe0f686d399
+function loss_vqvae(model, x, pair_ids, para; training::Bool=true)
+    result = vqvae_forward(model, x, pair_ids, para.beta_commit, training)
+    total, recon_loss, commit_loss, entropy_loss = vqvae_total_loss(result, x, para.entropy_weight, para.reconstruction_loss)
     return (; total, recon_loss, commit_loss, entropy_loss,
-              perplexity=result.perplexity)
+        perplexity=result.perplexity)
 end
 
 # ╔═╡ a0000015-0000-0000-0000-000000000001
@@ -1000,17 +1100,201 @@ md"## Training Loop"
 
 # ╔═╡ eafe181e-19e9-409e-ad1d-ce859cf0e672
 Base.@kwdef struct VQVAE_Training_Para
-    batchsize::Int = 100                            # waveforms per batch
+    pairs_per_batch::Int = 1
+    per_pair_batchsize::Int = 128
     nepoch::Int = 30                           # epochs
     nprint::Int = 1                            # print frequency
     initial_learning_rate::Float64 = 0.001
     lr_decay::Float64 = 0.99                   # exponential LR decay per epoch
-    stop_on_recon_loss::Union{Nothing, Float64} = nothing  # stop if recon loss below this
+    stop_on_recon_loss::Union{Nothing,Float64} = nothing  # stop if recon loss below this
+    sample_with_replacement::Bool = true
+    Mnn::Union{Nothing,Int} = nothing
+    Mnn_schedule::Vector{Tuple{Int,Int,Symbol}} = [(1, 5, :median), (6, 10, :mean), (26, 25, :mean)]
+    warmup_epochs::Int = 5
+    smoothing_window::Union{Nothing,Int} = nothing
+    envelope_floor::Float32 = 0.1f0
+    index_refresh_every::Int = 1
+    latent_index_batch_size::Int = 256
 end
 
-# ╔═╡ a0000019-0000-0000-0000-000000000001
+function validate_Mnn_schedule(schedule::Vector{Tuple{Int,Int,Symbol}})
+    isempty(schedule) && error("Mnn_schedule must contain at least one phase.")
+    starts = [s[1] for s in schedule]
+    starts[1] == 1 || error("Mnn_schedule first phase must start at post-warmup epoch 1.")
+    issorted(starts) && allunique(starts) || error("Mnn_schedule phase starts must be sorted and unique.")
+    for (post_start, Mnn, aggregation) in schedule
+        post_start >= 1 || error("Mnn_schedule post-warmup starts must be >= 1, got $post_start.")
+        Mnn >= 1 || error("Mnn_schedule Mnn values must be >= 1, got $Mnn.")
+        aggregation in (:mean, :median) || error("Unsupported aggregation $aggregation in Mnn_schedule. Use :mean or :median.")
+    end
+    return nothing
+end
+
+function max_Mnn(training_para::VQVAE_Training_Para)
+    validate_Mnn_schedule(training_para.Mnn_schedule)
+    scheduled = maximum(phase[2] for phase in training_para.Mnn_schedule)
+    if isnothing(training_para.Mnn)
+        return scheduled
+    end
+    training_para.Mnn >= scheduled ||
+        error("Mnn=$(training_para.Mnn) must be at least the largest scheduled Mnn=$scheduled.")
+    return training_para.Mnn
+end
+
+function ensemble_phase(epoch::Int, training_para::VQVAE_Training_Para)
+    post_epoch = epoch - training_para.warmup_epochs
+    post_epoch <= 0 && return (; post_epoch=0, Mnn=0, aggregation=:self)
+    phase = training_para.Mnn_schedule[1]
+    for candidate in training_para.Mnn_schedule
+        candidate[1] <= post_epoch || break
+        phase = candidate
+    end
+    return (; post_epoch, Mnn=phase[2], aggregation=phase[3])
+end
+
+# ╔═╡ 7590d7a2-c8e9-4bb7-9438-aafdc72c84d7
+
+
+# ╔═╡ 2a99c53c-d5fc-4ead-b7dc-3c6360548e57
+function normalize_target_columns(target)
+    target_cpu = Float32.(cpu(flatten_batch(target)))
+    target_norm = Float32.(normalise(target_cpu, dims=1))
+    return target isa CuArray ? xpu(target_norm) : target_norm
+end
+
+function _batch_target(batch, X_cpu, idx::Union{Nothing,LatentIndex}, epoch::Int, training_para::VQVAE_Training_Para)
+    phase = ensemble_phase(epoch, training_para)
+    if phase.post_epoch == 0 || isnothing(idx) || size(idx.neighbor_ids, 2) == 0
+        return normalize_target_columns(batch.x)
+    end
+    targets = build_ensemble_targets(X_cpu, idx, batch.indices;
+        Mnn=phase.Mnn,
+        aggregation=phase.aggregation)
+    return xpu(normalize_target_columns(targets))
+end
+
+function phase_vqvae_loss(model, batch, para, w_dev,
+    X_cpu, idx::Union{Nothing,LatentIndex}, epoch::Int, training_para::VQVAE_Training_Para;
+    training::Bool=true)
+    target = Zygote.@ignore _batch_target(batch, X_cpu, idx, epoch, training_para)
+    return targeted_vqvae_loss(model, batch.x, batch.pair_ids, target, para; training=training)
+end
+
+function vq_eval_metrics(model, train_batch, test_batch, para, w_dev,
+    train_x_cpu, test_x_cpu, train_idx, test_idx, epoch::Int, training_para::VQVAE_Training_Para)
+    train_m = phase_vqvae_loss(model, train_batch, para, w_dev,
+        train_x_cpu, train_idx, epoch, training_para; training=false)
+    test_m = phase_vqvae_loss(model, test_batch, para, w_dev,
+        test_x_cpu, test_idx, epoch, training_para; training=false)
+    return train_m, test_m
+end
+
+function pair_id_index_map(pair_ids)
+    ids = Int.(pair_ids_to_cpu(pair_ids))
+    mapping = Dict{Int,Vector{Int}}()
+    for (idx, pid) in enumerate(ids)
+        push!(get!(mapping, pid, Int[]), idx)
+    end
+    return mapping
+end
+
+function sample_pair_indices(indices::AbstractVector{Int}, nsample::Int; replace::Bool=true)
+    n = length(indices)
+    n > 0 || error("Cannot sample from an empty index set.")
+    if replace || nsample > n
+        return [indices[rand(1:n)] for _ in 1:nsample]
+    end
+    perm = Random.randperm(n)
+    return indices[perm[1:nsample]]
+end
+
+function build_pairwise_batches(data, para, training_para; shuffle_pairs::Bool=true)
+    x = data.x
+    pair_ids = Int32.(pair_ids_to_cpu(data.pair_ids))
+    pair_map = pair_id_index_map(pair_ids)
+    pair_list = sort!(collect(keys(pair_map)))
+    isempty(pair_list) && error("No pair ids found for batch construction.")
+
+    training_para.pairs_per_batch >= 1 || error("pairs_per_batch must be >= 1, got $(training_para.pairs_per_batch)")
+    training_para.per_pair_batchsize >= 1 || error("per_pair_batchsize must be >= 1, got $(training_para.per_pair_batchsize)")
+    pairs_per_batch = min(training_para.pairs_per_batch, length(pair_list))
+    training_para.pairs_per_batch > length(pair_list) &&
+        @warn "pairs_per_batch=$(training_para.pairs_per_batch) exceeds available pairs=$(length(pair_list)); using $pairs_per_batch active pairs per batch."
+    per_pair_batchsize = training_para.per_pair_batchsize
+
+    batches = NamedTuple[]
+    approx_total = sum(length(v) for v in values(pair_map))
+    batch_columns = pairs_per_batch * per_pair_batchsize
+    nbatches = shuffle_pairs ? max(1, cld(approx_total, batch_columns)) : 1
+    for _ in 1:nbatches
+        ordered_pairs = copy(pair_list)
+        shuffle_pairs && Random.shuffle!(ordered_pairs)
+        active_pairs = ordered_pairs[1:pairs_per_batch]
+        batch_indices = Int[]
+        batch_pair_ids = Int32[]
+        for pid in active_pairs
+            sampled = sample_pair_indices(pair_map[pid], per_pair_batchsize;
+                replace=training_para.sample_with_replacement)
+            append!(batch_indices, sampled)
+            append!(batch_pair_ids, fill(Int32(pid), per_pair_batchsize))
+        end
+        push!(batches, (x=x[:, batch_indices], pair_ids=batch_pair_ids, indices=batch_indices))
+    end
+    return batches
+end
+
+# ╔═╡ 5481cf12-dd58-4bf8-965e-0b68aaa7adf6
+"""Append one epoch's metrics onto the loss_history vectors."""
+function record_metrics!(loss_history, train_m, test_m)
+    push!(loss_history.train_recon,      train_m.recon_loss)
+    push!(loss_history.test_recon,       test_m.recon_loss)
+    push!(loss_history.train_regular_mse, train_m.regular_mse)
+    push!(loss_history.test_regular_mse,  test_m.regular_mse)
+    push!(loss_history.train_commit,     train_m.commit_loss)
+    push!(loss_history.test_commit,      test_m.commit_loss)
+    push!(loss_history.train_total,      train_m.total)
+    push!(loss_history.test_total,       test_m.total)
+    push!(loss_history.train_perplexity, train_m.perplexity)
+    push!(loss_history.test_perplexity,  test_m.perplexity)
+end
+
+# ╔═╡ 1a8c1a9f-61d9-4591-b50f-cb7ebca78377
+"""Run one full epoch of gradient updates. Returns nothing."""
+function vq_train_epoch!(model, opt_state, train_loader, para, w_dev,
+    train_x_cpu, train_idx, epoch::Int, training_para::VQVAE_Training_Para)
+    for batch in train_loader
+        g = Flux.gradient(model) do m
+            phase_vqvae_loss(m, batch, para, w_dev,
+                train_x_cpu, train_idx, epoch, training_para; training=true).total
+        end
+        Optimisers.update!(opt_state, model, g[1])
+    end
+    GC.gc(false)
+    CUDA.reclaim()
+    return nothing
+end
+
+# ╔═╡ ce339f4a-0744-4bf1-9f3c-9aa9fb19eaf1
+"""Log epoch summary if on a print interval."""
+function vq_log_epoch(epoch::Int, train_m, test_m, nprint::Int, phase)
+    mod(epoch, nprint) == 0 || return nothing
+    objective = phase.post_epoch == 0 ? :vanilla_warmup : :ensemble
+    @info "Epoch $epoch" objective optimized_recon=train_m.recon_loss regular_mse=train_m.regular_mse commit=train_m.commit_loss perplexity=train_m.perplexity test_optimized_recon=test_m.recon_loss test_regular_mse=test_m.regular_mse post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn aggregation=phase.aggregation
+    return nothing
+end
+
+# ╔═╡ 7f3ff55b-0095-4d95-b3f0-c2371f0b7548
+"""Check early stopping condition; returns true if training should stop."""
+function vq_should_stop(epoch::Int, train_m, stop_threshold)
+    isnothing(stop_threshold) && return false
+    train_m.recon_loss < stop_threshold || return false
+    @info "Early stopping: recon loss $(train_m.recon_loss) < $stop_threshold at epoch $epoch"
+    return true
+end
+
+# ╔═╡ 40e94672-4fc6-4ffa-90e5-5f2cc3f7591d
 """
-    update(model, loss_history, D_train, D_test, para, training_para)
+    update(model, loss_history, train_data, test_data, para, training_para)
 
 Train the VQ-VAE on pooled (unpaired) waveforms.
 
@@ -1020,61 +1304,225 @@ Arguments:
 - `D_train`: GPU matrix (nt, nwaveforms_train) — pooled causal + acausal
 - `D_test`: GPU matrix (nt, nwaveforms_test)
 - `para::VQVAE_Para`: architecture & loss parameters
-- `training_para::VQVAE_Training_Para`: training hyperparameters
+- `training_para::VQVAE_Training_Para`: training hyperparameters, including
+  `pairs_per_batch` and `per_pair_batchsize`
 """
-function update(model, loss_history, D_train, D_test,
-                para,
-                training_para=VQVAE_Training_Para())
+function update(model, loss_history, train_data, test_data,
+    para,
+    training_para=VQVAE_Training_Para())
 
     opt_state = Optimisers.setup(Optimisers.Adam(eta=Float64(training_para.initial_learning_rate)), model)
+    training_para.warmup_epochs >= 0 || error("warmup_epochs must be >= 0, got $(training_para.warmup_epochs)")
+    training_para.index_refresh_every >= 1 || error("index_refresh_every must be >= 1, got $(training_para.index_refresh_every)")
+    index_capacity_Mnn = max_Mnn(training_para)
 
-    batchsize = min(training_para.batchsize, size(D_train, 2))
-    batchsize_test = min(training_para.batchsize, size(D_test, 2))
-    train_loader = Flux.DataLoader(D_train; batchsize=batchsize, shuffle=true)
-    test_loader = Flux.DataLoader(D_test; batchsize=batchsize_test, shuffle=false)
+    train_x_cpu = Float32.(cpu(flatten_batch(train_data.x)))
+    test_x_cpu = Float32.(cpu(flatten_batch(test_data.x)))
+    smoothing_window = isnothing(training_para.smoothing_window) ?
+        max(1, size(train_x_cpu, 1) ÷ 16) : training_para.smoothing_window
+    w_cpu = compute_signal_envelope(train_x_cpu;
+        smoothing_window=smoothing_window,
+        floor=training_para.envelope_floor)
+    w_dev = xpu(w_cpu)
+    train_idx = LatentIndex(index_capacity_Mnn)
+    test_idx = LatentIndex(index_capacity_Mnn)
+
+    train_loader = build_pairwise_batches(train_data, para, training_para; shuffle_pairs=true)
+    test_loader = build_pairwise_batches(test_data, para, training_para; shuffle_pairs=false)
     monitor_train = first(train_loader)
     monitor_test = first(test_loader)
+    last_index_Mnn = 0
 
-    stop_early = false
     @progress name = "VQ-VAE training" for epoch = 1:training_para.nepoch
-        # ── Evaluate on monitor batches ──────────────────────────────────
-        x_tr = monitor_train
-        x_te = monitor_test
-
-        train_metrics = loss_vqvae(model, x_tr, para; training=false)
-        test_metrics = loss_vqvae(model, x_te, para; training=false)
-
-        push!(loss_history.train_recon, train_metrics.recon_loss)
-        push!(loss_history.test_recon, test_metrics.recon_loss)
-        push!(loss_history.train_commit, train_metrics.commit_loss)
-        push!(loss_history.test_commit, test_metrics.commit_loss)
-        push!(loss_history.train_total, train_metrics.total)
-        push!(loss_history.test_total, test_metrics.total)
-        push!(loss_history.train_perplexity, train_metrics.perplexity)
-        push!(loss_history.test_perplexity, test_metrics.perplexity)
-
-        # ── Gradient-based training (encoder, pre_vq, decoder) ────────────
-        # EMA codebook update happens inside the forward pass
-        function train_loss(model, x)
-            return loss_vqvae(model, x, para; training=true).total
+        phase = ensemble_phase(epoch, training_para)
+        if phase.post_epoch > 0 &&
+           (phase.Mnn != last_index_Mnn || mod(phase.post_epoch - 1, training_para.index_refresh_every) == 0)
+            rebuild_latent_index!(train_idx, model, train_x_cpu, train_data.pair_ids;
+                Mnn=phase.Mnn,
+                batch_size=training_para.latent_index_batch_size)
+            rebuild_latent_index!(test_idx, model, test_x_cpu, test_data.pair_ids;
+                Mnn=phase.Mnn,
+                batch_size=training_para.latent_index_batch_size)
+            last_index_Mnn = phase.Mnn
+            @info "Rebuilt latent index" epoch post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn aggregation=phase.aggregation
         end
-
-        for x in train_loader
-            g = Flux.gradient(train_loss, model, x)[1]
-            Optimisers.update!(opt_state, model, g)
-        end
-
-        if mod(epoch, training_para.nprint) == 0
-            @info "Epoch $epoch" recon=train_metrics.recon_loss commit=train_metrics.commit_loss perplexity=train_metrics.perplexity test_recon=test_metrics.recon_loss
-        end
-        # Early stopping if recon loss below threshold
-        if !isnothing(training_para.stop_on_recon_loss) && train_metrics.recon_loss < training_para.stop_on_recon_loss
-            @info "Early stopping: recon loss $(train_metrics.recon_loss) < $(training_para.stop_on_recon_loss) at epoch $epoch"
-            stop_early = true
-            break
-        end
+        train_loader = build_pairwise_batches(train_data, para, training_para; shuffle_pairs=true)
+        monitor_train = first(train_loader)
+        train_m, test_m = vq_eval_metrics(model, monitor_train, monitor_test, para, w_dev,
+            train_x_cpu, test_x_cpu, train_idx, test_idx, epoch, training_para)
+        record_metrics!(loss_history, train_m, test_m)
+        vq_train_epoch!(model, opt_state, train_loader, para, w_dev,
+            train_x_cpu, train_idx, epoch, training_para)
+        vq_log_epoch(epoch, train_m, test_m, training_para.nprint, phase)
+        vq_should_stop(epoch, train_m, training_para.stop_on_recon_loss) && break
     end
     return nothing
+end
+
+function plot_envelope_comparison(X; windows=nothing, floor::Real=0.1f0)
+    X_cpu = Float32.(cpu(flatten_batch(X)))
+    T = size(X_cpu, 1)
+    windows = isnothing(windows) ? [1, max(1, T ÷ 16), max(1, T ÷ 4), T] : collect(windows)
+    traces = [
+        PlutoPlotly.scatter(
+            x=1:T,
+            y=compute_signal_envelope(X_cpu; smoothing_window=w, floor=floor),
+            mode="lines",
+            name="window=$w")
+        for w in windows
+    ]
+    return PlutoPlotly.plot(traces, Layout(
+        title="Signal envelope weights",
+        xaxis_title="Sample",
+        yaxis_title="Weight",
+        yaxis=attr(range=[0, 1.05]),
+        margin=attr(l=60, r=20, t=50, b=50),
+    ))
+end
+
+function plot_ensemble_target_examples(X, idx::LatentIndex; nsamples::Int=5, seed::Int=1234)
+    X_cpu = Float32.(cpu(flatten_batch(X)))
+    N = size(X_cpu, 2)
+    rng = MersenneTwister(seed)
+    sample_ids = sort(rand(rng, 1:N, min(nsamples, N)))
+    targets = build_ensemble_targets(X_cpu, idx, sample_ids)
+    traces = Any[]
+    t = 1:size(X_cpu, 1)
+    for sample_id in sample_ids
+        push!(traces, PlutoPlotly.scatter(x=t, y=X_cpu[:, sample_id], mode="lines",
+            name="input $sample_id", opacity=0.45))
+    end
+    for (j, sample_id) in enumerate(sample_ids)
+        push!(traces, PlutoPlotly.scatter(x=t, y=targets[:, j], mode="lines",
+            name="target $sample_id", line=attr(width=3)))
+    end
+    return PlutoPlotly.plot(traces, Layout(
+        title="Input vs ensemble target",
+        xaxis_title="Sample",
+        yaxis_title="Amplitude",
+        margin=attr(l=60, r=20, t=50, b=50),
+    ))
+end
+
+function plot_neighbor_examples(X, idx::LatentIndex; nsamples::Int=5, nneighbors::Int=min(5, idx.Mnn), seed::Int=1234)
+    X_cpu = Float32.(cpu(flatten_batch(X)))
+    N = size(X_cpu, 2)
+    rng = MersenneTwister(seed)
+    sample_ids = sort(rand(rng, 1:N, min(nsamples, N)))
+    traces = Any[]
+    t = 1:size(X_cpu, 1)
+    for sample_id in sample_ids
+        push!(traces, PlutoPlotly.scatter(x=t, y=X_cpu[:, sample_id], mode="lines",
+            name="query $sample_id", line=attr(width=3)))
+        for nbr in idx.neighbor_ids[1:min(nneighbors, size(idx.neighbor_ids, 1)), sample_id]
+            push!(traces, PlutoPlotly.scatter(x=t, y=X_cpu[:, nbr], mode="lines",
+                name="neighbor $nbr", opacity=0.25))
+        end
+    end
+    return PlutoPlotly.plot(traces, Layout(
+        title="Latent nearest-neighbor inspection",
+        xaxis_title="Sample",
+        yaxis_title="Amplitude",
+        margin=attr(l=60, r=20, t=50, b=50),
+    ))
+end
+
+# ╔═╡ 8f8f3c1a-7c9a-4f3d-8e1f-2a1c1d2e9f5c
+"""
+    train_coarse_to_detail_classifier(coarse_codes, detail_codes; train_ratio=0.8, nepochs=100)
+
+Train a linear classifier to predict detail code trajectories from coarse codes.
+
+This is a simple mutual information proxy: if coarse and detail are disentangled,
+knowing coarse should not predict detail well (accuracy ≈ 50% for binary or baseline).
+If accuracy >> baseline, they are entangled.
+
+Arguments:
+- `coarse_codes::Vector`: coarse code indices (one per sample), e.g., from coarse_ac[1, :]
+- `detail_codes::Matrix`: detail trajectories (T_detail × n_samples)
+- `train_ratio`: fraction for training (default 0.8)
+- `nepochs`: number of training epochs (default 100)
+
+Returns:
+- `train_acc::Float32`: training accuracy on detail prediction
+- `test_acc::Float32`: test accuracy on detail prediction
+- `null_baseline::Float32`: accuracy of always guessing most common detail combo
+- `model`: trained Flux Dense layer
+"""
+function train_coarse_to_detail_classifier(coarse_codes::Vector, detail_codes::Matrix; 
+    train_ratio=0.8, nepochs=100)
+    
+    n_samples = length(coarse_codes)
+    @assert size(detail_codes, 2) == n_samples "Dimension mismatch: coarse_codes ($n_samples) vs detail_codes ($(size(detail_codes, 2)))"
+    
+    Kcoherent = maximum(coarse_codes)     # Coherent codebook size
+    T_detail = size(detail_codes, 1)      # Nuisance trajectory length
+    Knuisance = maximum(detail_codes)     # Nuisance codebook size
+    
+    # Convert detail trajectories into single class labels (combination index)
+    # Each detail trajectory (e.g., [5, 3]) becomes a unique index
+    if T_detail == 1
+        target = vec(detail_codes)
+        n_classes = Knuisance
+    else
+        target = zeros(Int32, n_samples)
+        combo_mult = cumprod(vcat(1, fill(Knuisance, T_detail-1)))
+        for j in 1:n_samples
+            target[j] = sum((detail_codes[:, j] .- 1) .* combo_mult) + 1  # 1-indexed
+        end
+        n_classes = Knuisance^T_detail
+    end
+    
+    # Null baseline: accuracy if always guessing most common detail combo
+    counts = zeros(Int, n_classes)
+    for j in 1:n_samples
+        counts[target[j]] += 1
+    end
+    null_baseline = Float32(maximum(counts) / n_samples)
+    
+    # One-hot encode coarse codes as features
+    X = Flux.onehotbatch(coarse_codes, 1:Kcoherent)  # (Kcoherent × n_samples)
+    y = Flux.onehotbatch(target, 1:n_classes)     # (n_classes × n_samples)
+    
+    # Random train/test split
+    perm = randperm(n_samples)
+    n_train = ceil(Int, train_ratio * n_samples)
+    train_idx = perm[1:n_train]
+    test_idx  = perm[n_train+1:end]
+    
+    X_train = X[:, train_idx] |> gpu
+    y_train = y[:, train_idx] |> gpu
+    X_test  = X[:, test_idx]  |> gpu
+    y_test  = y[:, test_idx]  |> gpu
+    
+    # Train linear classifier (single Dense layer)
+    model = Chain(
+        Dense(Kcoherent, n_classes, identity)
+    ) |> gpu
+    
+    opt = Adam(0.01f0)
+    opt_state = Optimisers.setup(opt, model)
+    
+    for epoch in 1:nepochs
+        g = Flux.gradient(model) do m
+            ŷ = m(X_train)
+            Flux.logitcrossentropy(ŷ, y_train)
+        end
+        Optimisers.update!(opt_state, model, g[1])
+    end
+    
+    # Compute accuracies
+    function compute_accuracy(X, y, m)
+        ŷ = m(X)
+        pred = vec(argmax(cpu(ŷ), dims=1)[1, :])
+        truth = vec(argmax(cpu(y), dims=1)[1, :])
+        return Float32(mean(pred .== truth))
+    end
+    
+    train_acc = compute_accuracy(X_train, y_train, model)
+    test_acc  = compute_accuracy(X_test, y_test, model)
+    
+    return (train_acc=train_acc, test_acc=test_acc, null_baseline=null_baseline, model=model)
 end
 
 # ╔═╡ a0000020-0000-0000-0000-000000000001
@@ -1093,13 +1541,19 @@ function plot_training_dashboard(loss_history; title="VQ-VAE Training")
     grid_color = "rgba(128,128,128,0.2)"
 
     traces = [
-        # Recon loss → subplot 1 (yaxis="y")
+        # Recon losses → subplot 1 (yaxis="y")
         PlutoPlotly.scatter(x=epochs, y=loss_history.train_recon, mode="lines",
-            name="Train recon", xaxis="x", yaxis="y",
+            name="Train ensemble loss", xaxis="x", yaxis="y",
             line=attr(color="#1f77b4", width=1.5)),
         PlutoPlotly.scatter(x=epochs, y=loss_history.test_recon, mode="lines",
-            name="Test recon", xaxis="x", yaxis="y",
+            name="Test ensemble loss", xaxis="x", yaxis="y",
             line=attr(color="#1f77b4", width=1.5, dash="dash")),
+        PlutoPlotly.scatter(x=epochs, y=loss_history.train_regular_mse, mode="lines",
+            name="Train regular MSE", xaxis="x", yaxis="y",
+            line=attr(color="#17becf", width=1.5)),
+        PlutoPlotly.scatter(x=epochs, y=loss_history.test_regular_mse, mode="lines",
+            name="Test regular MSE", xaxis="x", yaxis="y",
+            line=attr(color="#17becf", width=1.5, dash="dash")),
         # Perplexity → subplot 2 (yaxis="y2")
         PlutoPlotly.scatter(x=epochs, y=loss_history.train_perplexity, mode="lines",
             name="Train perplexity", xaxis="x", yaxis="y2",
@@ -1122,25 +1576,27 @@ function plot_training_dashboard(loss_history; title="VQ-VAE Training")
         plot_bgcolor="white", paper_bgcolor="white",
         # Shared x axis anchored at bottom panel
         xaxis=attr(title="Epoch", anchor="y3",
-                   showgrid=true, gridcolor=grid_color),
-        # Top panel: recon loss
-        yaxis=attr(title="Recon loss", domain=[0.70, 1.00], type="log",
-                   showgrid=true, gridcolor=grid_color,
-                   titlefont=attr(color="#1f77b4")),
+            showgrid=true, gridcolor=grid_color),
+        # Top panel: recon losses
+        yaxis=attr(title="Recon losses", domain=[0.70, 1.00], type="log",
+            showgrid=true, gridcolor=grid_color,
+            titlefont=attr(color="#1f77b4")),
         # Middle panel: perplexity
         yaxis2=attr(title="Perplexity", domain=[0.36, 0.64],
-                    showgrid=true, gridcolor=grid_color, rangemode="tozero",
-                    titlefont=attr(color="#2ca02c")),
+            showgrid=true, gridcolor=grid_color, rangemode="tozero",
+            titlefont=attr(color="#2ca02c")),
         # Bottom panel: commit loss
         yaxis3=attr(title="Commit loss", domain=[0.00, 0.30], type="log",
-                    showgrid=true, gridcolor=grid_color,
-                    titlefont=attr(color="#d62728")),
+            showgrid=true, gridcolor=grid_color,
+            titlefont=attr(color="#d62728")),
         legend=attr(x=1.02, xanchor="left", y=0.5, orientation="v",
-                    font=merge(font_spec, attr(size=12))),
+            font=merge(font_spec, attr(size=12))),
         margin=attr(r=160),
     )
     return PlutoPlotly.plot(traces, layout)
 end
+
+
 
 # ╔═╡ a0000023-0000-0000-0000-000000000001
 """
@@ -1170,67 +1626,84 @@ md"## Codebook Analysis"
 
 # ╔═╡ 09202321-5cf6-46f1-bd59-6069da6488c6
 """
-Compute agreement rate at a selected latent time index: fraction of waveform
-windows where causal and acausal map to the same code combination.
+Compute agreement rate: fraction of waveform windows where causal and acausal
+map to the same codebook entry.
 
 High agreement = encoder extracts direction-invariant features for that window.
 """
-function codebook_agreement(model, D_ac, D_c; time_index=nothing)
-    res_ac = encode(model, D_ac)
-    res_c = encode(model, D_c)
-    ci_ac, resolved_time_index = select_codebook_indices(res_ac; time_index)
-    ci_c, _ = select_codebook_indices(res_c; time_index=resolved_time_index)
-    nw = min(size(ci_ac, 2), size(ci_c, 2))
-    return mean([all(ci_ac[:, w] .== ci_c[:, w]) for w in 1:nw])
+function codebook_agreement(model, D_ac, D_c, pair_ids_ac=fill(1, size(D_ac, 2)), pair_ids_c=fill(1, size(D_c, 2)))
+    res_ac = encode(model, D_ac, pair_ids_ac)
+    res_c = encode(model, D_c, pair_ids_c)
+    idx_ac = vec(res_ac.codebook_indices)
+    idx_c = vec(res_c.codebook_indices)
+    return mean(idx_ac .== idx_c)
 end
 
 # ╔═╡ faa3de6b-96eb-4aeb-b927-77d6771a1d0a
 """
-    codebook_cross_analysis(model, D_ac, D_c; time_index=nothing)
+    codebook_cross_analysis(model, D_ac, D_c)
 
-Post-hoc analysis of codebook usage by branch at a selected latent time index.
+Post-hoc analysis of codebook usage by branch across every code combination.
 Returns a named tuple:
-- `pct_ac`: (K^T,) percentage of acausal waveforms per combination
-- `pct_c`:  (K^T,) percentage of causal waveforms per combination
-- `confusion`: (K^T, K^T) matrix — confusion[i,j] = fraction of windows where
-    acausal→combo i AND causal→combo j (only meaningful for paired data)
+- `pct_ac`: (K,) percentage of acausal waveforms per code
+- `pct_c`:  (K,) percentage of causal waveforms per code
+- `confusion`: (K, K) matrix — confusion[i,j] = fraction of windows where
+    acausal→code i AND causal→code j (only meaningful for paired data)
 - `agreement`: scalar fraction where both branches share the same code
-- `shared_codes`: combinations used by both branches (>5% usage each)
-- `ac_only_codes`: combinations predominantly acausal (ac >5x causal)
-- `c_only_codes`: combinations predominantly causal (c >5x acausal)
-- `labels`: human-readable combination labels
-- `time_index`: latent time index used for the analysis
+- `expected_agreement`: chance agreement from marginals
+- `agreement_lift`: `agreement - expected_agreement`
+- `cohens_kappa`: chance-corrected agreement
+- `permutation_pvalue`: one-sided p-value against shuffled pairing
+- `shared_codes`: codes used by both branches (>5% usage each)
+- `ac_only_codes`: codes predominantly acausal (ac >5x causal)
+- `c_only_codes`: codes predominantly causal (c >5x acausal)
+- `labels`: human-readable code labels
 """
-function codebook_cross_analysis(model, D_ac, D_c; time_index=nothing)
-    K = model.quantizer[1].K
-    T = model.T
+function codebook_cross_analysis(model, D_ac, D_c, pair_ids_ac=fill(1, size(D_ac, 2)), pair_ids_c=fill(1, size(D_c, 2)))
+    K = codebook_size(model)
 
-    # Per-branch percentages with combination labels
-    pct_ac_res = get_cluster_percentages(model, D_ac; time_index, return_labels=true)
+    pct_ac_res = get_cluster_percentages(model, D_ac, pair_ids_ac; return_labels=true)
     pct_ac = pct_ac_res.percentages
-    combo_labels = pct_ac_res.labels
-    resolved_time_index = pct_ac_res.time_index
-    pct_c = get_cluster_percentages(model, D_c; time_index=resolved_time_index)
-    num_combinations = length(pct_ac)
+    labels = pct_ac_res.labels
+    pct_c = get_cluster_percentages(model, D_c, pair_ids_c)
 
     # Agreement and confusion (requires paired windows: same number of columns)
-    res_ac = encode(model, D_ac)
-    res_c = encode(model, D_c)
-    ci_ac, _ = select_codebook_indices(res_ac; time_index=resolved_time_index)
-    ci_c, _ = select_codebook_indices(res_c; time_index=resolved_time_index)
-    nw = min(size(ci_ac, 2), size(ci_c, 2))
-    # Agreement: both all T codes match
-    agreement = mean([all(ci_ac[:,w] .== ci_c[:,w]) for w in 1:nw])
-
-    # Confusion: confusion[i,j] = P(acausal→combo i, causal→combo j) for all combinations
-    confusion = zeros(Float32, num_combinations, num_combinations)
-    multipliers = combination_multipliers(K, T)
+    res_ac = encode(model, D_ac, pair_ids_ac)
+    res_c = encode(model, D_c, pair_ids_c)
+    idx_ac = vec(res_ac.codebook_indices)
+    idx_c = vec(res_c.codebook_indices)
+    nw = min(length(idx_ac), length(idx_c))
+    idx_ac = idx_ac[1:nw]
+    idx_c = idx_c[1:nw]
+    confusion = zeros(Float32, K, K)
     for w in 1:nw
-        idx_ac = combination_index(ci_ac[:, w], multipliers)
-        idx_c = combination_index(ci_c[:, w], multipliers)
-        confusion[idx_ac, idx_c] += 1f0
+        confusion[idx_ac[w], idx_c[w]] += 1f0
     end
     confusion ./= max(sum(confusion), 1f-10)
+
+    # Raw agreement can be high even for noise if both marginals are similar.
+    agreement = mean(idx_ac .== idx_c)
+    p_ac = zeros(Float64, K)
+    p_c = zeros(Float64, K)
+    for i in 1:nw
+        p_ac[idx_ac[i]] += 1.0
+        p_c[idx_c[i]] += 1.0
+    end
+    p_ac ./= max(nw, 1)
+    p_c ./= max(nw, 1)
+    expected_agreement = sum(p_ac .* p_c)
+    agreement_lift = agreement - expected_agreement
+    cohens_kappa = (agreement - expected_agreement) / max(1e-8, 1 - expected_agreement)
+
+    # Permutation null: break pairing while preserving both branch marginals.
+    nperm = 200
+    idx_c_perm = copy(idx_c)
+    ge_count = 0
+    for _ in 1:nperm
+        Random.shuffle!(idx_c_perm)
+        ge_count += mean(idx_ac .== idx_c_perm) >= agreement
+    end
+    permutation_pvalue = (ge_count + 1) / (nperm + 1)
 
     # Classify codes
     threshold_pct = 5f0  # minimum percentage to count as "used"
@@ -1238,7 +1711,7 @@ function codebook_cross_analysis(model, D_ac, D_c; time_index=nothing)
     shared_codes = Int[]
     ac_only_codes = Int[]
     c_only_codes = Int[]
-    for k in 1:num_combinations
+    for k in 1:K
         ac_used = pct_ac[k] > threshold_pct
         c_used = pct_c[k] > threshold_pct
         if ac_used && c_used
@@ -1251,8 +1724,9 @@ function codebook_cross_analysis(model, D_ac, D_c; time_index=nothing)
     end
 
     return (; pct_ac, pct_c, confusion, agreement,
-              shared_codes, ac_only_codes, c_only_codes,
-              labels=combo_labels, time_index=resolved_time_index)
+        expected_agreement, agreement_lift, cohens_kappa, permutation_pvalue,
+        shared_codes, ac_only_codes, c_only_codes,
+        labels)
 end
 
 # ╔═╡ 302a9921-c723-41d4-9d7a-234bf658a07e
@@ -1264,7 +1738,7 @@ function plot_codebook_confusion(confusion; title="Codebook Confusion: Acausal v
     xlabels = labels === nothing ? string.(1:KT) : labels
     ylabels = labels === nothing ? string.(1:KT) : labels
     text_vv = [
-        [string(round(confusion[i,j]*100; digits=1), "%") for j in 1:KT]
+        [string(round(confusion[i, j] * 100; digits=1), "%") for j in 1:KT]
         for i in 1:KT
     ]
     trace = PlutoPlotly.heatmap(
@@ -1278,13 +1752,187 @@ function plot_codebook_confusion(confusion; title="Codebook Confusion: Acausal v
     layout = Layout(
         title=attr(text=title, font=attr(size=20, family="Computer Modern, Latin Modern Math, serif")),
         height=900, width=1000,
-        xaxis=attr(title=labels === nothing ? "Causal Cluster (pos, code)" : "Causal combination",
+        xaxis=attr(title="Causal code",
             dtick=1, constrain="domain"),
-        yaxis=attr(title=labels === nothing ? "Acausal Cluster (pos, code)" : "Acausal combination",
+        yaxis=attr(title="Acausal code",
             dtick=1, scaleanchor="x", constrain="domain"),
         plot_bgcolor="white", paper_bgcolor="white",
     )
     return PlutoPlotly.plot([trace], layout)
+end
+
+# ╔═╡ b1c2d3e4-f5a6-7890-abcd-ef1234567890
+"""
+        compute_latent_window(para) -> (latent_time_start, latent_time_end)
+
+From physics parameters in `para`, compute:
+- `latent_time_start`: latent-space index for arrival at `vmax` (fastest).
+- `latent_time_end`: latent-space index for arrival at `vmin` (slowest).
+
+Returns `(nothing, 1)` when `interstation_distance === nothing`.
+"""
+function compute_latent_window(para)
+    para.interstation_distance === nothing && return (nothing, 1)
+    total_stride = prod(para.enc_strides)
+    vmin, vmax = para.velocity_range
+    t_slow = para.interstation_distance / vmin / para.dt   # latest arrival (smallest velocity)
+    t_fast = para.interstation_distance / vmax / para.dt   # earliest arrival (largest velocity)
+        lstart = round(Int, t_fast / total_stride) + 1
+        lend = round(Int, t_slow / total_stride) + 1
+        return (lstart, lend)
+end
+
+# ╔═╡ a0000028-0000-0000-0000-000000000001
+"""
+Compute entropy statistics for the single waveform code.
+
+Returns:
+- `entropy`: raw entropy (nats), returned as a length-1 vector
+- `entropy_norm`: entropy normalized by log(K), in [0, 1]
+- `perplexity`: exp(entropy), returned as a length-1 vector
+- `probs`: (K, 1) probability matrix
+"""
+function per_latent_slot_entropy(model, x, pair_ids=fill(1, size(flatten_batch(x), 2)))
+    res = encode(model, x, pair_ids)
+    ci = res.codebook_indices
+    T = size(ci, 1)
+    N = size(ci, 2)
+    K = codebook_size(model)
+    probs = zeros(Float32, K, T)
+    entropy = zeros(Float32, T)
+    entropy_norm = zeros(Float32, T)
+    perplexity = zeros(Float32, T)
+
+    logk = log(max(K, 2))
+    for t in 1:T
+        counts = zeros(Float32, K)
+        for n in 1:N
+            counts[ci[t, n]] += 1f0
+        end
+        p = counts ./ max(sum(counts), 1f-8)
+        probs[:, t] .= p
+        p_safe = clamp.(p, 1f-10, 1f0)
+        h = -sum(p_safe .* log.(p_safe))
+        entropy[t] = h
+        entropy_norm[t] = h / max(logk, 1f-8)
+        perplexity[t] = exp(h)
+    end
+
+    return (; entropy, entropy_norm, perplexity, probs)
+end
+
+# ╔═╡ a0000029-0000-0000-0000-000000000001
+"""
+Plot normalized entropy per latent slot.
+"""
+function plot_per_latent_slot_entropy(entropy_norm; title="Per-slot entropy")
+    T = length(entropy_norm)
+    xslot = collect(1:T)
+    trace = PlutoPlotly.scatter(
+        x=xslot,
+        y=entropy_norm,
+        mode="lines+markers",
+        line=attr(color="#1f77b4", width=2),
+        marker=attr(size=6),
+        name="Normalized entropy"
+    )
+    layout = Layout(
+        title=attr(text=title, font=attr(size=18, family="Computer Modern, Latin Modern Math, serif")),
+        width=850,
+        height=350,
+        xaxis=attr(title="Latent slot"),
+        yaxis=attr(title="Entropy / log(K)", range=[0, 1.05]),
+        plot_bgcolor="white",
+        paper_bgcolor="white"
+    )
+    return PlutoPlotly.plot([trace], layout)
+end
+
+# ╔═╡ ce3070ae-405e-11f1-b1d1-cb34a215f45c
+"""
+    get_vqvae(para::VQVAE_Para)
+
+Build a VQ-VAE model and loss history from parameters.
+
+Returns `(model, loss_history)`.
+"""
+function get_vqvae(para)
+    if para.seed !== nothing
+        Random.seed!(para.seed)
+    end
+
+    latent_time_start, latent_time_end = compute_latent_window(para)
+    if latent_time_start !== nothing
+        @info "interstation_distance is set; latent window is computed for analysis only in the single-bottleneck architecture." latent_time_start latent_time_end
+    end
+
+    encoder, _, enc_outsize = get_vq_conv_encoder(para.nt;
+        kernels=para.enc_kernels, filters=para.enc_filters,
+        strides=para.enc_strides, use_bn=para.use_bn,
+        flatten_output=false, return_outsize=true)
+    latent_len = enc_outsize[1]
+    enc_channels = enc_outsize[2]
+    metric_proj = SeqConv1DChain(Chain(Conv((1,), enc_channels => para.d))) |> xpu
+    pre_vq = Dense(latent_len * para.d, para.d) |> xpu
+
+    quantizer = if para.use_multiscale_rvq
+        if para.pair_codebook_mode == :pair_specific_coarse_shared_detail
+            para.num_pairs >= 1 || error("num_pairs must be >= 1 for pair-specific coarse codebooks")
+            if !isnothing(para.pair_names)
+                length(para.pair_names) == para.num_pairs || error("Expected $(para.num_pairs) pair names, got $(length(para.pair_names))")
+            end
+            PairSpecificMultiscaleRVQQuantizer(para.num_pairs, para.Kcoherent, para.Knuisance, para.d;
+                detail_stages=para.detail_stages,
+                decay_small=para.ema_decay_small,
+                decay_large=para.ema_decay_large,
+                epsilon=para.epsilon,
+                dead_threshold=para.dead_threshold)
+        else
+            MultiscaleRVQQuantizer(para.Kcoherent, para.Knuisance, para.d;
+                detail_stages=para.detail_stages,
+                decay_small=para.ema_decay_small,
+                decay_large=para.ema_decay_large,
+                epsilon=para.epsilon,
+                dead_threshold=para.dead_threshold)
+        end
+    else
+        VectorQuantizerEMA(para.Kcoherent, para.d;
+            decay=para.ema_decay, epsilon=para.epsilon,
+            dead_threshold=para.dead_threshold)
+    end
+
+    d_in_dec = para.d
+    dec_upstrides = auto_dec_upstrides_for_nt(para.nt, latent_len, d_in_dec;
+        dec_kernels=para.dec_kernels, dec_filters=para.dec_filters,
+        use_bn=para.use_bn, enc_strides=para.enc_strides)
+    decoder, _, _ = get_vq_conv_decoder(para.nt, d_in_dec;
+        kernels=para.dec_kernels, filters=para.dec_filters,
+        upstrides=dec_upstrides, use_bn=para.use_bn)
+
+    dec_out_len = Flux.outputsize(decoder.chain, (d_in_dec,); padbatch=true)[1]
+    if dec_out_len != para.nt
+        error("Decoder geometry mismatch: output length $dec_out_len != nt $(para.nt). " *
+              "Adjust enc_strides or decoder kernels/filters.")
+    end
+    metric_dim = para.d * latent_len
+    @info "VQ-VAE geometry" nt = para.nt latent_len metric_dim enc_outsize dec_upstrides dec_out_len latent_time_start latent_time_end
+
+    model = VQVAE(xpu(encoder), xpu(metric_proj), xpu(pre_vq), quantizer, xpu(decoder), para.d, latent_len)
+
+    loss_history = (;
+        train_recon=Float32[],
+        test_recon=Float32[],
+        train_regular_mse=Float32[],
+        test_regular_mse=Float32[],
+        train_commit=Float32[],
+        test_commit=Float32[],
+        train_total=Float32[],
+        test_total=Float32[],
+        train_perplexity=Float32[],
+        test_perplexity=Float32[],
+    )
+
+    return model, loss_history
 end
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
@@ -1301,6 +1949,7 @@ Functors = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
 JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 MLUtils = "f1d291b0-491e-4a28-83b9-f70985020b54"
+NearestNeighbors = "b8a86587-4115-5ab1-83bc-aa920d37bbce"
 Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
 ParameterSchedulers = "d7d3b36b-41b8-4d0d-a2bf-768c6151755e"
 PlutoHooks = "0ff47ea0-7a50-410d-8455-4348d5de0774"
@@ -1315,16 +1964,17 @@ Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
 [compat]
-BenchmarkTools = "~1.6.3"
-CUDA = "~5.9.6"
+BenchmarkTools = "~1.7.0"
+CUDA = "~5.11.0"
 DSP = "~0.8.4"
 Distances = "~0.10.12"
-Enzyme = "~0.13.134"
+Enzyme = "~0.13.138"
 FFTW = "~1.10.0"
 Flux = "~0.16.9"
 Functors = "~0.5.2"
-JLD2 = "~0.5.15"
+JLD2 = "~0.6.4"
 MLUtils = "~0.4.8"
+NearestNeighbors = "~0.4.27"
 Optimisers = "~0.4.7"
 ParameterSchedulers = "~0.4.3"
 PlutoHooks = "~0.1.0"
@@ -1334,7 +1984,7 @@ PlutoUI = "~0.7.80"
 ProgressLogging = "~0.1.6"
 StatsBase = "~0.34.10"
 Zygote = "~0.7.10"
-cuDNN = "~1.4.6"
+cuDNN = "~1.4.7"
 """
 
 # ╔═╡ 00000000-0000-0000-0000-000000000002
@@ -1343,7 +1993,7 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.12.4"
 manifest_format = "2.0"
-project_hash = "528fd61ab1a3a69c2b47cdc2ec9abb60e6b4aaca"
+project_hash = "612fdbdf4ce3aeb69da7d4fa83eb1a10d25f9e77"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "f7304359109c768cf32dc5fa2d371565bb63b68a"
@@ -1372,6 +2022,11 @@ deps = ["Pkg"]
 git-tree-sha1 = "6e1d2a35f2f90a4bc7c2ed98079b2ba09c35b83a"
 uuid = "6e696c72-6542-2067-7265-42206c756150"
 version = "1.3.2"
+
+[[deps.AbstractTrees]]
+git-tree-sha1 = "2d9c9a55f9c93e8887ad391fbae72f8ef55e1177"
+uuid = "1520ce14-60c1-5f80-bbc7-55ef81b5835c"
+version = "0.4.5"
 
 [[deps.Accessors]]
 deps = ["CompositionsBase", "ConstructionBase", "Dates", "InverseFunctions", "MacroTools"]
@@ -1494,9 +2149,9 @@ version = "0.1.1"
 
 [[deps.BenchmarkTools]]
 deps = ["Compat", "JSON", "Logging", "Printf", "Profile", "Statistics", "UUIDs"]
-git-tree-sha1 = "7fecfb1123b8d0232218e2da0c213004ff15358d"
+git-tree-sha1 = "6876e30dc02dc69f0613cb6ece242144f2ca9e56"
 uuid = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
-version = "1.6.3"
+version = "1.7.0"
 
 [[deps.Bessels]]
 git-tree-sha1 = "4435559dc39793d53a9e3d278e185e920b4619ef"
@@ -1509,10 +2164,10 @@ uuid = "fa961155-64e5-5f13-b03f-caf6b980ea82"
 version = "0.5.0"
 
 [[deps.CUDA]]
-deps = ["AbstractFFTs", "Adapt", "BFloat16s", "CEnum", "CUDA_Compiler_jll", "CUDA_Driver_jll", "CUDA_Runtime_Discovery", "CUDA_Runtime_jll", "Crayons", "DataFrames", "ExprTools", "GPUArrays", "GPUCompiler", "GPUToolbox", "KernelAbstractions", "LLVM", "LLVMLoopInfo", "LazyArtifacts", "Libdl", "LinearAlgebra", "Logging", "NVTX", "Preferences", "PrettyTables", "Printf", "Random", "Random123", "RandomNumbers", "Reexport", "SparseArrays", "StaticArrays", "Statistics", "demumble_jll"]
-git-tree-sha1 = "3fe1fb600b6ec029697416d5851ef0661c538f20"
+deps = ["AbstractFFTs", "Adapt", "BFloat16s", "CEnum", "CUDA_Compiler_jll", "CUDA_Driver_jll", "CUDA_Runtime_Discovery", "CUDA_Runtime_jll", "Crayons", "ExprTools", "GPUArrays", "GPUCompiler", "GPUToolbox", "KernelAbstractions", "LLVM", "LLVMLoopInfo", "LazyArtifacts", "Libdl", "LinearAlgebra", "Logging", "NVTX", "Preferences", "PrettyTables", "Printf", "Random", "Random123", "RandomNumbers", "Reexport", "SparseArrays", "StaticArrays", "Statistics", "demumble_jll"]
+git-tree-sha1 = "ea6a2ab8307059b6c9ea186ff7dfcd032a13b731"
 uuid = "052768ef-5323-5732-b1bb-66c8b64840ba"
-version = "5.9.6"
+version = "5.11.0"
 
     [deps.CUDA.extensions]
     ChainRulesCoreExt = "ChainRulesCore"
@@ -1546,9 +2201,9 @@ version = "1.0.0"
 
 [[deps.CUDA_Runtime_jll]]
 deps = ["Artifacts", "CUDA_Driver_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
-git-tree-sha1 = "92cd84e2b760e471d647153ea5efc5789fc5e8b2"
+git-tree-sha1 = "af17d37b5b8b4d7525f8902eba1ef6141a9a7d3b"
 uuid = "76a88914-d11a-5bdc-97e0-2f5a05c973a2"
-version = "0.19.2+0"
+version = "0.21.0+0"
 
 [[deps.CUDNN_jll]]
 deps = ["Artifacts", "CUDA_Runtime_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
@@ -1564,19 +2219,36 @@ version = "1.73.0"
 
 [[deps.ChainRulesCore]]
 deps = ["Compat", "LinearAlgebra"]
-git-tree-sha1 = "e4c6a16e77171a5f5e25e9646617ab1c276c5607"
+git-tree-sha1 = "12177ad6b3cad7fd50c8b3825ce24a99ad61c18f"
 uuid = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
-version = "1.26.0"
+version = "1.26.1"
 weakdeps = ["SparseArrays"]
 
     [deps.ChainRulesCore.extensions]
     ChainRulesCoreSparseArraysExt = "SparseArrays"
 
+[[deps.ChunkCodecCore]]
+git-tree-sha1 = "1a3ad7e16a321667698a19e77362b35a1e94c544"
+uuid = "0b6fb165-00bc-4d37-ab8b-79f91016dbe1"
+version = "1.0.1"
+
+[[deps.ChunkCodecLibZlib]]
+deps = ["ChunkCodecCore", "Zlib_jll"]
+git-tree-sha1 = "cee8104904c53d39eb94fd06cbe60cb5acde7177"
+uuid = "4c0bbee4-addc-4d73-81a0-b6caacae83c8"
+version = "1.0.0"
+
+[[deps.ChunkCodecLibZstd]]
+deps = ["ChunkCodecCore", "Zstd_jll"]
+git-tree-sha1 = "34d9873079e4cb3d0c62926a225136824677073f"
+uuid = "55437552-ac27-4d47-9aa3-63184e8fd398"
+version = "1.0.0"
+
 [[deps.CodeTracking]]
-deps = ["InteractiveUtils", "UUIDs"]
-git-tree-sha1 = "b7231a755812695b8046e8471ddc34c8268cbad5"
+deps = ["InteractiveUtils", "REPL", "UUIDs"]
+git-tree-sha1 = "cfb7a2e89e245a9d5016b70323db412b3a7438d5"
 uuid = "da1fd8a2-8d9e-5ec2-8556-3022fb5608a2"
-version = "3.0.0"
+version = "3.0.2"
 
 [[deps.ColorSchemes]]
 deps = ["ColorTypes", "ColorVectorSpace", "Colors", "FixedPointNumbers", "PrecompileTools", "Random"]
@@ -1688,17 +2360,11 @@ git-tree-sha1 = "abe83f3a2f1b857aac70ef8b269080af17764bbe"
 uuid = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
 version = "1.16.0"
 
-[[deps.DataFrames]]
-deps = ["Compat", "DataAPI", "DataStructures", "Future", "InlineStrings", "InvertedIndices", "IteratorInterfaceExtensions", "LinearAlgebra", "Markdown", "Missings", "PooledArrays", "PrecompileTools", "PrettyTables", "Printf", "Random", "Reexport", "SentinelArrays", "SortingAlgorithms", "Statistics", "TableTraits", "Tables", "Unicode"]
-git-tree-sha1 = "d8928e9169ff76c6281f39a659f9bca3a573f24c"
-uuid = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
-version = "1.8.1"
-
 [[deps.DataStructures]]
 deps = ["OrderedCollections"]
-git-tree-sha1 = "e357641bb3e0638d353c4b29ea0e40ea644066a6"
+git-tree-sha1 = "e86f4a2805f7f19bec5129bc9150c38208e5dc23"
 uuid = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
-version = "0.19.3"
+version = "0.19.4"
 
 [[deps.DataValueInterfaces]]
 git-tree-sha1 = "bfc1187b79289637fa0ef6d4436ebdfe6905cbd6"
@@ -1761,9 +2427,9 @@ version = "1.7.0"
 
 [[deps.Enzyme]]
 deps = ["CEnum", "EnzymeCore", "Enzyme_jll", "GPUCompiler", "InteractiveUtils", "LLVM", "Libdl", "LinearAlgebra", "ObjectFile", "PrecompileTools", "Preferences", "Printf", "Random", "SparseArrays"]
-git-tree-sha1 = "3b8ff73a9885aaea237bc262bd5fc798b5fd866f"
+git-tree-sha1 = "d6dd65421104fa9f7d5cc37283a998937f359a39"
 uuid = "7da242da-08ed-463a-9acd-ee780be4f1d9"
-version = "0.13.134"
+version = "0.13.138"
 weakdeps = ["ADTypes", "BFloat16s", "ChainRulesCore", "GPUArraysCore", "LogExpFunctions", "SpecialFunctions", "StaticArrays"]
 
     [deps.Enzyme.extensions]
@@ -1775,9 +2441,9 @@ weakdeps = ["ADTypes", "BFloat16s", "ChainRulesCore", "GPUArraysCore", "LogExpFu
     EnzymeStaticArraysExt = "StaticArrays"
 
 [[deps.EnzymeCore]]
-git-tree-sha1 = "990991b8aa76d17693a98e3a915ac7aa49f08d1a"
+git-tree-sha1 = "24bbb6fc8fb87eb71c1f8d00184a60fc22c63903"
 uuid = "f151be2c-9106-41f4-ab19-57ee4f262869"
-version = "0.8.18"
+version = "0.8.19"
 weakdeps = ["Adapt", "ChainRulesCore"]
 
     [deps.EnzymeCore.extensions]
@@ -1924,15 +2590,15 @@ version = "0.2.0"
 
 [[deps.GPUCompiler]]
 deps = ["ExprTools", "InteractiveUtils", "LLVM", "Libdl", "Logging", "PrecompileTools", "Preferences", "Scratch", "Serialization", "TOML", "Tracy", "UUIDs"]
-git-tree-sha1 = "966946d226e8b676ca6409454718accb18c34c54"
+git-tree-sha1 = "fedfe5e7db7035271c3f58359007f971da1dde87"
 uuid = "61eb1bfa-7361-4325-ad38-22787b887f55"
-version = "1.8.2"
+version = "1.9.1"
 
 [[deps.GPUToolbox]]
 deps = ["LLVM"]
-git-tree-sha1 = "e5cc871cac863a14706d745dcf73c91de948eca5"
+git-tree-sha1 = "a589b6c1a0eff953571f5d8b0474f5020831114d"
 uuid = "096a3bc2-3ced-46d0-87f4-dd12716f4bfc"
-version = "1.1.0"
+version = "1.1.1"
 
 [[deps.HashArrayMappedTries]]
 git-tree-sha1 = "2eaa69a7cab70a52b9687c8bf950a5a93ec895ae"
@@ -1983,19 +2649,6 @@ git-tree-sha1 = "4da0f88e9a39111c2fa3add390ab15f3a44f3ca3"
 uuid = "22cec73e-a1b8-11e9-2c92-598750a2cf9c"
 version = "0.3.1"
 
-[[deps.InlineStrings]]
-git-tree-sha1 = "8f3d257792a522b4601c24a577954b0a8cd7334d"
-uuid = "842dd82b-1e85-43dc-bf29-5d0ee9dffc48"
-version = "1.4.5"
-
-    [deps.InlineStrings.extensions]
-    ArrowTypesExt = "ArrowTypes"
-    ParsersExt = "Parsers"
-
-    [deps.InlineStrings.weakdeps]
-    ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
-    Parsers = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
-
 [[deps.IntelOpenMP_jll]]
 deps = ["Artifacts", "JLLWrappers", "LazyArtifacts", "Libdl"]
 git-tree-sha1 = "ec1debd61c300961f98064cfb21287613ad7f303"
@@ -2017,11 +2670,6 @@ weakdeps = ["Dates", "Test"]
     InverseFunctionsDatesExt = "Dates"
     InverseFunctionsTestExt = "Test"
 
-[[deps.InvertedIndices]]
-git-tree-sha1 = "6da3c4316095de0f5ee2ebd875df8721e7e0bdbe"
-uuid = "41ab1584-1d38-5bbf-9106-f11c6c58b48f"
-version = "1.3.1"
-
 [[deps.IrrationalConstants]]
 git-tree-sha1 = "b2d91fe939cae05960e760110b328288867b5758"
 uuid = "92d709cd-6900-40b7-9082-c6be49f344b6"
@@ -2038,10 +2686,10 @@ uuid = "82899510-4779-5014-852e-03e436cf321d"
 version = "1.0.0"
 
 [[deps.JLD2]]
-deps = ["FileIO", "MacroTools", "Mmap", "OrderedCollections", "PrecompileTools", "ScopedValues", "TranscodingStreams"]
-git-tree-sha1 = "d97791feefda45729613fafeccc4fbef3f539151"
+deps = ["ChunkCodecLibZlib", "ChunkCodecLibZstd", "FileIO", "MacroTools", "Mmap", "OrderedCollections", "PrecompileTools", "ScopedValues"]
+git-tree-sha1 = "941f87a0ae1b14d1ac2fa57245425b23a9d7a516"
 uuid = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
-version = "0.5.15"
+version = "0.6.4"
 weakdeps = ["UnPack"]
 
     [deps.JLD2.extensions]
@@ -2055,9 +2703,9 @@ version = "1.7.1"
 
 [[deps.JSON]]
 deps = ["Dates", "Logging", "Parsers", "PrecompileTools", "StructUtils", "UUIDs", "Unicode"]
-git-tree-sha1 = "b3ad4a0255688dcb895a52fafbaae3023b588a90"
+git-tree-sha1 = "67c6f1f085cb2671c93fe34244c9cccde30f7a26"
 uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-version = "1.4.0"
+version = "1.5.0"
 
     [deps.JSON.extensions]
     JSONArrowExt = ["ArrowTypes"]
@@ -2067,9 +2715,9 @@ version = "1.4.0"
 
 [[deps.JuliaInterpreter]]
 deps = ["CodeTracking", "InteractiveUtils", "Random", "UUIDs"]
-git-tree-sha1 = "3d3b79166e2a0afcf875df20db110af91ad3ab61"
+git-tree-sha1 = "58927c485919bf17ea308d9d82156de1adf4b006"
 uuid = "aa1ae85d-cabe-5617-a682-6adf51b2e16a"
-version = "0.10.11"
+version = "0.10.12"
 
 [[deps.JuliaNVTXCallbacks_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
@@ -2373,6 +3021,12 @@ git-tree-sha1 = "1a0fa0e9613f46c9b8c11eee38ebb4f590013c5e"
 uuid = "71a1bf82-56d0-4bbc-8a3c-48b961074391"
 version = "0.1.5"
 
+[[deps.NearestNeighbors]]
+deps = ["AbstractTrees", "Distances", "StaticArrays"]
+git-tree-sha1 = "e2c3bba08dd6dedfe17a17889131b885b8c082f0"
+uuid = "b8a86587-4115-5ab1-83bc-aa920d37bbce"
+version = "0.4.27"
+
 [[deps.NetworkOptions]]
 uuid = "ca575930-c2e3-43a9-ace4-1e988b2c1908"
 version = "1.3.0"
@@ -2528,12 +3182,6 @@ version = "4.1.1"
     MutableArithmetics = "d8a4904e-b15c-11e9-3269-09a3773c0cb0"
     RecipesBase = "3cdcf5f2-1ef4-517c-9805-6587b60abb01"
 
-[[deps.PooledArrays]]
-deps = ["DataAPI", "Future"]
-git-tree-sha1 = "36d8b4b899628fb92c2749eb488d884a926614d3"
-uuid = "2dfb63ee-cc39-5dd5-95bd-886bf059d720"
-version = "1.4.3"
-
 [[deps.PrecompileTools]]
 deps = ["Preferences"]
 git-tree-sha1 = "07a921781cab75691315adc645096ed5e370cb77"
@@ -2553,9 +3201,9 @@ version = "0.2.0"
 
 [[deps.PrettyTables]]
 deps = ["Crayons", "LaTeXStrings", "Markdown", "PrecompileTools", "Printf", "REPL", "Reexport", "StringManipulation", "Tables"]
-git-tree-sha1 = "211530a7dc76ab59087f4d4d1fc3f086fbe87594"
+git-tree-sha1 = "624de6279ab7d94fc9f672f0068107eb6619732c"
 uuid = "08abe8d2-0d0c-5749-adfa-8a2ac140af0d"
-version = "3.2.3"
+version = "3.3.2"
 
     [deps.PrettyTables.extensions]
     PrettyTablesTypstryExt = "Typstry"
@@ -2625,9 +3273,9 @@ version = "1.3.1"
 
 [[deps.Revise]]
 deps = ["CodeTracking", "FileWatching", "InteractiveUtils", "JuliaInterpreter", "LibGit2", "LoweredCodeUtils", "OrderedCollections", "Preferences", "REPL", "UUIDs"]
-git-tree-sha1 = "d97d78d4fc5f858d8ce44f6b88bc972f2023f51d"
+git-tree-sha1 = "5f4f629c085b87e71125eec6773f5f872c74a47a"
 uuid = "295af30f-e4ad-537b-8983-00126c2a3abe"
-version = "3.14.0"
+version = "3.14.2"
 weakdeps = ["Distributed"]
 
     [deps.Revise.extensions]
@@ -2653,12 +3301,6 @@ deps = ["Dates"]
 git-tree-sha1 = "9b81b8393e50b7d4e6d0a9f14e192294d3b7c109"
 uuid = "6c6a2e73-6563-6170-7368-637461726353"
 version = "1.3.0"
-
-[[deps.SentinelArrays]]
-deps = ["Dates", "Random"]
-git-tree-sha1 = "ebe7e59b37c400f694f52b58c93d26201387da70"
-uuid = "91c51154-3ec4-41a3-a24f-3f23e20d615c"
-version = "1.4.9"
 
 [[deps.Serialization]]
 uuid = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
@@ -2704,9 +3346,9 @@ version = "0.1.2"
 
 [[deps.SpecialFunctions]]
 deps = ["IrrationalConstants", "LogExpFunctions", "OpenLibm_jll", "OpenSpecFun_jll"]
-git-tree-sha1 = "5acc6a41b3082920f79ca3c759acbcecf18a8d78"
+git-tree-sha1 = "2700b235561b0335d5bef7097a111dc513b8655e"
 uuid = "276daf66-3868-5448-9aa4-cd146d93841b"
-version = "2.7.1"
+version = "2.7.2"
 weakdeps = ["ChainRulesCore"]
 
     [deps.SpecialFunctions.extensions]
@@ -2764,9 +3406,9 @@ version = "0.4.4"
 
 [[deps.StructArrays]]
 deps = ["ConstructionBase", "DataAPI", "Tables"]
-git-tree-sha1 = "a2c37d815bf00575332b7bd0389f771cb7987214"
+git-tree-sha1 = "ad8002667372439f2e3611cfd14097e03fa4bccd"
 uuid = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
-version = "0.7.2"
+version = "0.7.3"
 weakdeps = ["Adapt", "GPUArraysCore", "KernelAbstractions", "LinearAlgebra", "SparseArrays", "StaticArrays"]
 
     [deps.StructArrays.extensions]
@@ -2855,11 +3497,6 @@ version = "0.1.6"
     [deps.Tracy.weakdeps]
     TracyProfiler_jll = "0c351ed6-8a68-550e-8b79-de6f926da83c"
 
-[[deps.TranscodingStreams]]
-git-tree-sha1 = "0c45878dcfdcfa8480052b6ab162cdd138781742"
-uuid = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
-version = "0.11.3"
-
 [[deps.Transducers]]
 deps = ["Accessors", "ArgCheck", "BangBang", "Baselet", "CompositionsBase", "ConstructionBase", "DefineSingletons", "Distributed", "InitialValues", "Logging", "Markdown", "MicroCollections", "SplittablesBase", "Tables"]
 git-tree-sha1 = "4aa1fdf6c1da74661f6f5d3edfd96648321dade9"
@@ -2920,6 +3557,12 @@ deps = ["Libdl"]
 uuid = "83775a58-1f1d-513f-b197-d71354ab007a"
 version = "1.3.1+2"
 
+[[deps.Zstd_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "446b23e73536f84e8037f5dce465e92275f6a308"
+uuid = "3161d3a3-bdf6-5164-811a-617609db77b4"
+version = "1.5.7+1"
+
 [[deps.Zygote]]
 deps = ["AbstractFFTs", "ChainRules", "ChainRulesCore", "DiffRules", "Distributed", "FillArrays", "ForwardDiff", "GPUArraysCore", "IRTools", "InteractiveUtils", "LinearAlgebra", "LogExpFunctions", "MacroTools", "NaNMath", "PrecompileTools", "Random", "SparseArrays", "SpecialFunctions", "Statistics", "ZygoteRules"]
 git-tree-sha1 = "a29cbf3968d36022198bcc6f23fdfd70f7caf737"
@@ -2946,9 +3589,9 @@ version = "0.2.7"
 
 [[deps.cuDNN]]
 deps = ["CEnum", "CUDA", "CUDA_Runtime_Discovery", "CUDNN_jll"]
-git-tree-sha1 = "c1e756c5b075d06f19595ac0bc6388ab2973237a"
+git-tree-sha1 = "5494b0ae3ddc5ca0f64159d5ed3a396f36e0fcfe"
 uuid = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
-version = "1.4.6"
+version = "1.4.7"
 
 [[deps.demumble_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
@@ -2989,31 +3632,43 @@ version = "17.7.0+0"
 # ╠═6affb3b3-9dc4-4bbc-a582-495fc1783a7a
 # ╟─a0000001-0000-0000-0000-000000000001
 # ╠═80f77b52-84e0-4664-8aa0-3d79fded40de
-# ╠═899a848e-6861-4d1e-9090-50b50e5d6e82
-# ╠═e4316ace-3e89-4efd-a613-7204d5cc116b
+# ╠═6ba143e2-50df-441a-8f38-3ea8d9edd4d8
 # ╟─a0000002-0000-0000-0000-000000000001
 # ╠═91a25156-e121-4d53-a5a1-422f1230d235
 # ╟─a0000003-0000-0000-0000-000000000001
 # ╠═89599b3f-8c20-46c5-8f5c-ccbb71b26b36
-# ╠═a0000004-0000-0000-0000-000000000001
+# ╠═2f7550d1-e854-4c2f-8efb-ad0bb70d5013
+# ╠═44e9c4cc-d02b-4e68-ad49-24f173556cbd
+# ╠═8eb0be68-99e1-4df9-97bf-b29b99d8f759
 # ╟─a0000005-0000-0000-0000-000000000001
-# ╠═4b94fad2-0aaa-4308-94ee-cb33a419df17
-# ╠═565be3d9-72c7-4ba0-95e1-78c9d6d914c9
-# ╠═0e1ccfa6-aa0c-4247-9fd7-89352d949091
-# ╠═379a84d8-11df-4ef7-b1da-2a9595007036
+# ╠═64430447-c267-4eec-8d38-63ccf91d82c4
 # ╟─a0000006-0000-0000-0000-000000000001
-# ╠═a0000007-0000-0000-0000-000000000001
+# ╠═4cfb91c3-97e4-4006-9ec9-5eedd7de2849
+# ╠═ee76dd74-feaa-4422-a9a8-5931eb817c24
+# ╠═5fd449bf-d0d5-4944-8fc6-c0d47a0ed83f
+# ╠═1f046042-0695-4a3d-a0ee-9ce4213c9b72
+# ╠═0a9a8028-2ba9-43d9-8b3d-8ada32ba314b
+# ╠═b70d1b6c-2e5e-4548-9629-ea69011a2585
+# ╠═802aa1db-04b1-4444-ab9a-d9c4aee17dd9
 # ╟─a0000008-0000-0000-0000-000000000001
 # ╠═a0000009-0000-0000-0000-000000000001
 # ╟─a0000010-0000-0000-0000-000000000001
 # ╠═a0000011-0000-0000-0000-000000000001
 # ╟─a0000012-0000-0000-0000-000000000001
-# ╠═a0000013-0000-0000-0000-000000000001
+# ╠═76930390-49e1-45da-b654-7d1e65c856b1
+# ╠═8646155e-376f-44e6-89df-c3092d350046
+# ╠═b4387329-5621-49ec-a01f-3fe0f686d399
 # ╟─a0000015-0000-0000-0000-000000000001
 # ╟─a0000017-0000-0000-0000-000000000001
 # ╠═eafe181e-19e9-409e-ad1d-ce859cf0e672
 # ╠═a0000018-0000-0000-0000-000000000001
-# ╠═a0000019-0000-0000-0000-000000000001
+# ╠═7590d7a2-c8e9-4bb7-9438-aafdc72c84d7
+# ╠═2a99c53c-d5fc-4ead-b7dc-3c6360548e57
+# ╠═5481cf12-dd58-4bf8-965e-0b68aaa7adf6
+# ╠═1a8c1a9f-61d9-4591-b50f-cb7ebca78377
+# ╠═ce339f4a-0744-4bf1-9f3c-9aa9fb19eaf1
+# ╠═7f3ff55b-0095-4d95-b3f0-c2371f0b7548
+# ╠═40e94672-4fc6-4ffa-90e5-5f2cc3f7591d
 # ╟─a0000020-0000-0000-0000-000000000001
 # ╠═a0000021-0000-0000-0000-000000000001
 # ╠═a0000022-0000-0000-0000-000000000001
@@ -3022,5 +3677,12 @@ version = "17.7.0+0"
 # ╠═09202321-5cf6-46f1-bd59-6069da6488c6
 # ╠═faa3de6b-96eb-4aeb-b927-77d6771a1d0a
 # ╠═302a9921-c723-41d4-9d7a-234bf658a07e
+# ╠═b1c2d3e4-f5a6-7890-abcd-ef1234567890
+# ╠═a0000025-0000-0000-0000-000000000001
+# ╠═a0000026-0000-0000-0000-000000000001
+# ╠═a0000027-0000-0000-0000-000000000001
+# ╠═a0000028-0000-0000-0000-000000000001
+# ╠═a0000029-0000-0000-0000-000000000001
+# ╠═ce3070ae-405e-11f1-b1d1-cb34a215f45c
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
