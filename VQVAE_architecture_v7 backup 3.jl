@@ -26,9 +26,6 @@ begin
         Zygote
 end
 
-# ╔═╡ 330652f1-0754-48a4-9a0f-4fb9d6824222
-using Distances
-
 # ╔═╡ 10000002-0000-0000-0000-000000000001
 md"""
 # VQ-VAE v7 Architecture
@@ -96,7 +93,6 @@ Base.@kwdef struct VQVAE_Training_Para
     autodiff_backend::Symbol = :auto
     normalize_target::Bool = true
     verbose::Bool = false
-    knn_search_chunk_size_fraction::Float64 = 0.5
 end
 
 # ╔═╡ 10000007-0000-0000-0000-000000000001
@@ -233,16 +229,14 @@ function init_rvq_state(rng::AbstractRNG, d::Int, K::Tuple)
 end
 
 # ╔═╡ b1a7fdb4-7263-496e-8f9f-4d8a4429f351
-begin
-	function vq_distances(embedding, z)
-	    z_sq = sum(abs2, z; dims=1)
-	    e_sq = sum(abs2, embedding; dims=1)
-	    return e_sq' .+ z_sq .- 2f0 .* (embedding' * z)
-	end
-	
-	_argmin_col_indices(idx::AbstractArray{<:CartesianIndex}) = getindex.(idx, 1)
-	_argmin_col_indices(idx::AbstractArray) = idx
+function vq_distances(embedding, z)
+    z_sq = sum(abs2, z; dims=1)
+    e_sq = sum(abs2, embedding; dims=1)
+    return e_sq' .+ z_sq .- 2f0 .* (embedding' * z)
 end
+
+_argmin_col_indices(idx::AbstractArray{<:CartesianIndex}) = getindex.(idx, 1)
+_argmin_col_indices(idx::AbstractArray) = idx
 
 # ╔═╡ f8da318e-6ff2-4442-a737-28ff9d8f340a
 function assignment_matrix(indices, K::Int)
@@ -309,123 +303,121 @@ function probs_entropy(counts)
 end
 
 # ╔═╡ 66ddf04d-ee60-4a0b-9444-d09af23685ea
-begin
-	function rvq_quantize(z_e, rvq_state, K::Tuple; beta_commit::Float32, ema_decay::Float32,
-	    epsilon::Float32, dead_threshold::Int, training::Bool)
-	    residual = z_e
-	    z_q_total = zero(z_e)
-	    stages = rvq_state.stages
-	    new_stages = stages
-	    all_indices = ()
-	    commit_loss = 0f0
-	    entropy_loss = 0f0
-	    perplexity_total = 0f0
-	    stage_perplexities = ()
-	
-	    for s in eachindex(K)
-	        stage = stages[s]
-	        z_q_detached, indices = EnzymeCore.ignore_derivatives(vq_lookup(stage.embedding, residual))
-	        if !training
-	            all_indices = (all_indices..., reshape(indices, 1, :))
-	        end
-	
-	        counts = if training
-	            new_stage, counts_local = update_rvq_stage_state(stage, residual, indices,
-	                ema_decay, epsilon, dead_threshold)
-	            new_stages = replace_tuple(new_stages, s, new_stage)
-	            counts_local
-	        else
-	            counts_and_sums(EnzymeCore.ignore_derivatives(residual), indices, K[s])[1]
-	        end
-	
-	        z_q = residual .+ EnzymeCore.ignore_derivatives(z_q_detached .- residual)
-	        z_q_total = z_q_total .+ z_q
-	        residual = residual .- EnzymeCore.ignore_derivatives(z_q_detached)
-	        commit_loss += beta_commit * mse_loss(residual .+ EnzymeCore.ignore_derivatives(z_q_detached),
-	            EnzymeCore.ignore_derivatives(z_q_detached))
-	        perplexity, stage_entropy_loss, _ = probs_entropy(counts)
-	        perplexity_total += perplexity
-	        if !training
-	            stage_perplexities = (stage_perplexities..., perplexity)
-	        end
-	        entropy_loss += stage_entropy_loss
-	    end
-	
-	    nstage = Float32(length(K))
-	    stage_indices = training ? nothing : vcat(all_indices...)
-	    coarse_indices = training ? nothing : all_indices[1]
-	    return (; z_q=z_q_total,
-	        stage_indices,
-	        coarse_indices=coarse_indices,
-	        commit_loss=commit_loss / nstage,
-	        entropy_loss=entropy_loss / nstage,
-	        perplexity=perplexity_total / nstage,
-	        stage_perplexities=(training ? nothing : stage_perplexities)), (; stages=new_stages)
-	end
-	
-	function prepare_rvq_payload(z_e, rvq_state, K::Tuple; ema_decay::Float32,
-	    epsilon::Float32, dead_threshold::Int, training::Bool)
-	    residual = z_e
-	    stages = rvq_state.stages
-	    new_stages = stages
-	    z_q_stages = ()
-	    counts_stages = ()
-	    entropy_loss = 0f0
-	    perplexity_total = 0f0
-	
-	    for s in eachindex(K)
-	        stage = stages[s]
-	        z_q_detached, indices = vq_lookup(stage.embedding, residual)
-	        z_q_stages = (z_q_stages..., Float32.(z_q_detached))
-	
-	        counts = if training
-	            new_stage, counts_local = update_rvq_stage_state(stage, residual, indices,
-	                ema_decay, epsilon, dead_threshold)
-	            new_stages = replace_tuple(new_stages, s, new_stage)
-	            counts_local
-	        else
-	            counts_and_sums(residual, indices, K[s])[1]
-	        end
-	
-	        counts_stages = (counts_stages..., Float32.(counts))
-	        residual = residual .- z_q_detached
-	        perplexity, stage_entropy_loss, _ = probs_entropy(counts)
-	        perplexity_total += perplexity
-	        entropy_loss += stage_entropy_loss
-	    end
-	
-	    nstage = Float32(length(K))
-	    payload = (;
-	        z_q_stages,
-	        counts_stages,
-	        entropy_loss=Float32(entropy_loss / nstage),
-	        perplexity=Float32(perplexity_total / nstage),
-	    )
-	    return payload, (; stages=new_stages)
-	end
-	
-	function rvq_quantize_precomputed(z_e, payload, K::Tuple; beta_commit::Float32)
-	    residual = z_e
-	    z_q_total = zero(z_e)
-	    commit_loss = 0f0
-	
-	    for s in eachindex(K)
-	        z_q_detached = EnzymeCore.ignore_derivatives(payload.z_q_stages[s])
-	        z_q = residual .+ EnzymeCore.ignore_derivatives(z_q_detached .- residual)
-	        z_q_total = z_q_total .+ z_q
-	        commit_loss += beta_commit * mse_loss(residual, z_q_detached)
-	        residual = residual .- z_q_detached
-	    end
-	
-	    nstage = Float32(length(K))
-	    return (; z_q=z_q_total,
-	        stage_indices=nothing,
-	        coarse_indices=nothing,
-	        commit_loss=commit_loss / nstage,
-	        entropy_loss=EnzymeCore.ignore_derivatives(payload.entropy_loss),
-	        perplexity=EnzymeCore.ignore_derivatives(payload.perplexity),
-	        stage_perplexities=nothing)
-	end
+function rvq_quantize(z_e, rvq_state, K::Tuple; beta_commit::Float32, ema_decay::Float32,
+    epsilon::Float32, dead_threshold::Int, training::Bool)
+    residual = z_e
+    z_q_total = zero(z_e)
+    stages = rvq_state.stages
+    new_stages = stages
+    all_indices = ()
+    commit_loss = 0f0
+    entropy_loss = 0f0
+    perplexity_total = 0f0
+    stage_perplexities = ()
+
+    for s in eachindex(K)
+        stage = stages[s]
+        z_q_detached, indices = EnzymeCore.ignore_derivatives(vq_lookup(stage.embedding, residual))
+        if !training
+            all_indices = (all_indices..., reshape(indices, 1, :))
+        end
+
+        counts = if training
+            new_stage, counts_local = update_rvq_stage_state(stage, residual, indices,
+                ema_decay, epsilon, dead_threshold)
+            new_stages = replace_tuple(new_stages, s, new_stage)
+            counts_local
+        else
+            counts_and_sums(EnzymeCore.ignore_derivatives(residual), indices, K[s])[1]
+        end
+
+        z_q = residual .+ EnzymeCore.ignore_derivatives(z_q_detached .- residual)
+        z_q_total = z_q_total .+ z_q
+        residual = residual .- EnzymeCore.ignore_derivatives(z_q_detached)
+        commit_loss += beta_commit * mse_loss(residual .+ EnzymeCore.ignore_derivatives(z_q_detached),
+            EnzymeCore.ignore_derivatives(z_q_detached))
+        perplexity, stage_entropy_loss, _ = probs_entropy(counts)
+        perplexity_total += perplexity
+        if !training
+            stage_perplexities = (stage_perplexities..., perplexity)
+        end
+        entropy_loss += stage_entropy_loss
+    end
+
+    nstage = Float32(length(K))
+    stage_indices = training ? nothing : vcat(all_indices...)
+    coarse_indices = training ? nothing : all_indices[1]
+    return (; z_q=z_q_total,
+        stage_indices,
+        coarse_indices=coarse_indices,
+        commit_loss=commit_loss / nstage,
+        entropy_loss=entropy_loss / nstage,
+        perplexity=perplexity_total / nstage,
+        stage_perplexities=(training ? nothing : stage_perplexities)), (; stages=new_stages)
+end
+
+function prepare_rvq_payload(z_e, rvq_state, K::Tuple; ema_decay::Float32,
+    epsilon::Float32, dead_threshold::Int, training::Bool)
+    residual = z_e
+    stages = rvq_state.stages
+    new_stages = stages
+    z_q_stages = ()
+    counts_stages = ()
+    entropy_loss = 0f0
+    perplexity_total = 0f0
+
+    for s in eachindex(K)
+        stage = stages[s]
+        z_q_detached, indices = vq_lookup(stage.embedding, residual)
+        z_q_stages = (z_q_stages..., Float32.(z_q_detached))
+
+        counts = if training
+            new_stage, counts_local = update_rvq_stage_state(stage, residual, indices,
+                ema_decay, epsilon, dead_threshold)
+            new_stages = replace_tuple(new_stages, s, new_stage)
+            counts_local
+        else
+            counts_and_sums(residual, indices, K[s])[1]
+        end
+
+        counts_stages = (counts_stages..., Float32.(counts))
+        residual = residual .- z_q_detached
+        perplexity, stage_entropy_loss, _ = probs_entropy(counts)
+        perplexity_total += perplexity
+        entropy_loss += stage_entropy_loss
+    end
+
+    nstage = Float32(length(K))
+    payload = (;
+        z_q_stages,
+        counts_stages,
+        entropy_loss=Float32(entropy_loss / nstage),
+        perplexity=Float32(perplexity_total / nstage),
+    )
+    return payload, (; stages=new_stages)
+end
+
+function rvq_quantize_precomputed(z_e, payload, K::Tuple; beta_commit::Float32)
+    residual = z_e
+    z_q_total = zero(z_e)
+    commit_loss = 0f0
+
+    for s in eachindex(K)
+        z_q_detached = EnzymeCore.ignore_derivatives(payload.z_q_stages[s])
+        z_q = residual .+ EnzymeCore.ignore_derivatives(z_q_detached .- residual)
+        z_q_total = z_q_total .+ z_q
+        commit_loss += beta_commit * mse_loss(residual, z_q_detached)
+        residual = residual .- z_q_detached
+    end
+
+    nstage = Float32(length(K))
+    return (; z_q=z_q_total,
+        stage_indices=nothing,
+        coarse_indices=nothing,
+        commit_loss=commit_loss / nstage,
+        entropy_loss=EnzymeCore.ignore_derivatives(payload.entropy_loss),
+        perplexity=EnzymeCore.ignore_derivatives(payload.perplexity),
+        stage_perplexities=nothing)
 end
 
 # ╔═╡ 1000000e-0000-0000-0000-000000000001
@@ -497,6 +489,16 @@ begin
         return lat.z_e
     end
 
+	struct LatentIndexScorer end
+
+	function (scorer::LatentIndexScorer)(z)
+	    z_norm = z ./ sqrt.(sum(abs2, z; dims=1) .+ 1f-8)
+	    scores = z_norm' * z_norm
+	    return z_norm, scores
+	end
+
+	latent_index_score_inference(scorer::LatentIndexScorer, z) = scorer(z)
+	
 	function decode_from_latents(m::VQVAE, ps, st, result)
 	    xhat, st_dec = m.decoder(result.z_q, ps.decoder, st.decoder)
 	    return merge(result, (; xhat)), merge(st, (; decoder=st_dec))
@@ -577,26 +579,24 @@ end
 md"## Losses and kNN Targets"
 
 # ╔═╡ 13634a6c-abda-4084-9b5b-f6761fd728ad
-begin
-	function vqvae_loss(model, ps, st, x, target, para::VQVAE_Para; training::Bool)
-	    result, st_new = model(x, ps, st; beta_commit=para.beta_commit, training)
-	    recon_loss = mse_loss(result.xhat, target)
-	    total = recon_loss + result.commit_loss + para.entropy_weight * result.entropy_loss
-	    return total, st_new, (; result, recon_loss,
-	        commit_loss=result.commit_loss, entropy_loss=result.entropy_loss,
-	        perplexity=result.perplexity, stage_perplexities=result.stage_perplexities)
-	end
-	
-	function vqvae_precomputed_loss(model, ps, st, batch, para::VQVAE_Para)
-	    result, st_new = forward_with_precomputed_vq(
-	        model, batch.x, ps, st, batch.vq_payload; beta_commit=para.beta_commit
-	    )
-	    recon_loss = mse_loss(result.xhat, batch.target)
-	    total = recon_loss + result.commit_loss + para.entropy_weight * result.entropy_loss
-	    return total, st_new, (; result, recon_loss,
-	        commit_loss=result.commit_loss, entropy_loss=result.entropy_loss,
-	        perplexity=result.perplexity, stage_perplexities=result.stage_perplexities)
-	end
+function vqvae_loss(model, ps, st, x, target, para::VQVAE_Para; training::Bool)
+    result, st_new = model(x, ps, st; beta_commit=para.beta_commit, training)
+    recon_loss = mse_loss(result.xhat, target)
+    total = recon_loss + result.commit_loss + para.entropy_weight * result.entropy_loss
+    return total, st_new, (; result, recon_loss,
+        commit_loss=result.commit_loss, entropy_loss=result.entropy_loss,
+        perplexity=result.perplexity, stage_perplexities=result.stage_perplexities)
+end
+
+function vqvae_precomputed_loss(model, ps, st, batch, para::VQVAE_Para)
+    result, st_new = forward_with_precomputed_vq(
+        model, batch.x, ps, st, batch.vq_payload; beta_commit=para.beta_commit
+    )
+    recon_loss = mse_loss(result.xhat, batch.target)
+    total = recon_loss + result.commit_loss + para.entropy_weight * result.entropy_loss
+    return total, st_new, (; result, recon_loss,
+        commit_loss=result.commit_loss, entropy_loss=result.entropy_loss,
+        perplexity=result.perplexity, stage_perplexities=result.stage_perplexities)
 end
 
 # ╔═╡ 8950cf6d-f5d2-4bcc-90ab-12ecf79f7c35
@@ -617,11 +617,9 @@ begin
 	mutable struct LatentIndex
 	    embeddings::Matrix{Float32}
 	    neighbor_ids::Matrix{Int}
-	    dist_matrix::Matrix{Float32}
-	    perm_scratch::Vector{Vector{Int}}
 	    Mnn::Int
 	end
-	LatentIndex(Mnn::Int) = LatentIndex(zeros(Float32, 0, 0), zeros(Int, Mnn, 0), zeros(Float32, 0, 0), Vector{Int}[], Mnn)
+	LatentIndex(Mnn::Int) = LatentIndex(zeros(Float32, 0, 0), zeros(Int, Mnn, 0), Mnn)
 end
 
 # ╔═╡ 092511ab-104e-4577-8cf5-dc6deeb73ac7
@@ -636,102 +634,58 @@ end
 # ╔═╡ b1e8b57a-0fa3-492a-a3a1-036423f41373
 function rebuild_latent_index!(idx::LatentIndex, model, ps, st, X;
     Mnn::Int=idx.Mnn, device=identity, cdev=default_cdev(), encode_compiled=nothing,
-    knn_search_chunk_size_fraction::Float64=1.0)
+    score_compiled=nothing, latent_index_scorer=LatentIndexScorer())
     X_cpu = Float32.(cdev(flatten_batch(X)))
     _, N = size(X_cpu)
     Mnn >= 1 || error("Mnn must be >= 1.")
     N >= Mnn + 1 || error("Need at least Mnn + 1 samples; got N=$N and Mnn=$Mnn.")
     D = model.d
-    chunk_size = max(Mnn + 1, round(Int, knn_search_chunk_size_fraction * N))
-    approximate = chunk_size < N
     if isnothing(encode_compiled) && device isa ReactantDevice
         error("A compiled encoder is required to rebuild the latent index on a Reactant device. Ensure encode_z_e_inference compiles successfully.")
+    end
+    if isnothing(score_compiled) && device isa ReactantDevice
+        error("A compiled latent-index scorer is required to rebuild the latent index on a Reactant device. Ensure latent_index_score_inference compiles successfully.")
     end
     embeddings = Matrix{Float32}(undef, D, N)
     ps_dev = device(ps)
     st_eval = Lux.testmode(device(st))
+    scores = Matrix{Float32}(undef, N, N)
+    scoring_device = !isnothing(score_compiled)
     embedding_start = time()
     if isnothing(encode_compiled)
         enc, _ = encode(model, ps_dev, st_eval, device(X_cpu); training=false)
-        embeddings .= Float32.(cdev(enc.z_e))
+        z = enc.z_e
+        embeddings .= Float32.(cdev(z))
+        embedding_time = time() - embedding_start
+        normalize_start = time()
+        _l2_normalize_columns!(embeddings)
+        normalize_time = time() - normalize_start
+        scoring_start = time()
+        scores .= embeddings' * embeddings
+        scoring_time = time() - scoring_start
     else
         z_dev = encode_compiled(model, ps_dev, st_eval, device(X_cpu))
-        embeddings .= Float32.(cdev(z_dev))
+        embedding_time = time() - embedding_start
+        normalize_time = 0.0
+        scoring_start = time()
+        z_norm_dev, scores_dev = score_compiled(latent_index_scorer, z_dev)
+        embeddings .= Float32.(cdev(z_norm_dev))
+        scores .= Float32.(cdev(scores_dev))
+        scoring_time = time() - scoring_start
     end
-    embedding_time = time() - embedding_start
-    normalize_start = time()
-    _l2_normalize_columns!(embeddings)
-    normalize_time = time() - normalize_start
-    knn_start = time()
-    nthreads = Threads.nthreads() + 1
+    diagonal_start = time()
+    for i in 1:N
+        scores[i, i] = -Inf32
+    end
+    diagonal_time = time() - diagonal_start
     neighbor_ids = Matrix{Int}(undef, Mnn, N)
-    if approximate
-        # Partition a random permutation of 1:N into chunks of chunk_size.
-        # Every query in the same chunk shares the same candidate set → one
-        # Distances.pairwise! call per chunk (chunk_size×chunk_size dot products)
-        # instead of N individual BLAS calls.
-        perm = MLUtils.randperm(N)
-        # candidate_ids[:,j] = chunk_size candidate indices for query j (self at end)
-        candidate_ids = Matrix{Int}(undef, chunk_size, N)
-        # score buffer: chunk_size × N; each column holds intra-chunk cosine sims for j
-        if size(idx.dist_matrix) != (chunk_size, N)
-            idx.dist_matrix = Matrix{Float32}(undef, chunk_size, N)
-        end
-        chunk_emb    = Matrix{Float32}(undef, D, chunk_size)           # preallocated, reused per chunk
-        chunk_scores = Matrix{Float32}(undef, chunk_size, chunk_size)   # preallocated, reused per chunk
-        num_chunks = cld(N, chunk_size)
-        for ci in 1:num_chunks
-            chunk_start = (ci - 1) * chunk_size + 1
-            chunk_end   = min(ci * chunk_size, N)
-            chunk       = view(perm, chunk_start:chunk_end)
-            nc          = length(chunk)   # may be < chunk_size for the last chunk
-            # gather embeddings for this chunk's members
-            chunk_emb_view = view(chunk_emb, :, 1:nc)
-            chunk_emb_view .= view(embeddings, :, chunk)
-            # pairwise cosine similarities within chunk: nc × nc (L2-normalised → dot product)
-            chunk_scores_view = view(chunk_scores, 1:nc, 1:nc)
-            Distances.pairwise!(CosineDist(), chunk_scores_view, chunk_emb_view; dims=2)
-            # fill candidate_ids and dist_matrix columns for each member of this chunk
-            for (li, j) in enumerate(chunk)
-                cands = view(candidate_ids, :, j)
-                cands[1:nc] .= chunk
-                # pad short last chunk by wrapping within the same chunk
-                for fi in nc+1:chunk_size
-                    cands[fi] = chunk[mod1(fi, nc)]
-                end
-                # copy distances from the pairwise matrix; self-distance (0.0) is at position li
-                scores = view(idx.dist_matrix, :, j)
-                scores[1:nc] .= view(chunk_scores_view, :, li)
-                scores[li] = Inf32              # exclude self (CosineDist(x,x) == 0)
-                scores[nc+1:chunk_size] .= Inf32   # padded slots never selected
-            end
-        end
-        if length(idx.perm_scratch) != nthreads || (!isempty(idx.perm_scratch) && length(idx.perm_scratch[1]) != chunk_size)
-            idx.perm_scratch = [collect(1:chunk_size) for _ in 1:nthreads]
-        end
-        Threads.@threads for j in 1:N
-            # CosineDist: smaller = more similar; exclude self (+Inf) and padding (+Inf)
-            top_k = partialsortperm!(idx.perm_scratch[Threads.threadid()],
-                view(idx.dist_matrix, 1:chunk_size, j), 1:Mnn; rev=false)
-            neighbor_ids[:, j] .= view(candidate_ids, top_k, j)
-        end
-    else
-        if size(idx.dist_matrix) != (N, N)
-            idx.dist_matrix = Matrix{Float32}(undef, N, N)
-        end
-        if length(idx.perm_scratch) != nthreads || (!isempty(idx.perm_scratch) && length(idx.perm_scratch[1]) != N)
-            idx.perm_scratch = [collect(1:N) for _ in 1:nthreads]
-        end
-        mul!(idx.dist_matrix, embeddings', embeddings)
-        for j in 1:N; idx.dist_matrix[j, j] = -Inf32; end   # zero diagonal before threaded read
-        Threads.@threads for j in 1:N
-            top_k = partialsortperm!(idx.perm_scratch[Threads.threadid()],
-                view(idx.dist_matrix, :, j), 1:Mnn; rev=true)
-            neighbor_ids[:, j] .= top_k
-        end
+    julia_threads = Threads.nthreads()
+    topk_start = time()
+    Threads.@threads for j in 1:N
+        neighbor_ids[:, j] .= partialsortperm(view(scores, :, j), 1:Mnn; rev=true)
     end
-    knn_time = time() - knn_start
-    @debug "Latent index rebuild breakdown" N D Mnn chunk_size approximate julia_threads=Threads.nthreads() embedding_time_s=round(embedding_time; digits=3) normalize_time_s=round(normalize_time; digits=3) knn_time_s=round(knn_time; digits=3)
+    topk_time = time() - topk_start
+    @debug "Latent index rebuild breakdown" N D Mnn scoring_device julia_threads embedding_time_s=round(embedding_time; digits=3) normalize_time_s=round(normalize_time; digits=3) scoring_time_s=round(scoring_time; digits=3) diagonal_time_s=round(diagonal_time; digits=3) topk_time_s=round(topk_time; digits=3)
     idx.embeddings = embeddings
     idx.neighbor_ids = neighbor_ids
     idx.Mnn = Mnn
@@ -789,99 +743,94 @@ function make_batches(X_cpu::AbstractMatrix{Float32}, batchsize::Int; shuffle::B
 end
 
 # ╔═╡ 2d6639d1-ae40-46d0-a811-e1fd34a23613
-begin
-	function batch_with_target(batch, X_cpu, idx::Union{Nothing,LatentIndex},
-	    epoch::Int, training_para::VQVAE_Training_Para; device=identity)
-	    phase = ensemble_phase(epoch, training_para)
-	    target = if phase.post_epoch == 0 || isnothing(idx)
-	        batch.x
-	    else
-	        build_ensemble_targets(X_cpu, idx, batch.indices; Mnn=phase.Mnn)
-	    end
-	    return (; x=device(batch.x), target=device(Float32.(target)))
-	end
-	
-	function make_batch_target(batch, X_cpu, idx::Union{Nothing,LatentIndex},
-	    epoch::Int, training_para::VQVAE_Training_Para, ensemble_targets_cpu::Union{Nothing,AbstractMatrix}=nothing)
-	    phase = ensemble_phase(epoch, training_para)
-	    if phase.post_epoch == 0 || isnothing(idx)
-	        return batch.x
-	    end
-	    if !isnothing(ensemble_targets_cpu)
-	        return ensemble_targets_cpu[:, batch.indices]
-	    end
-	    return build_ensemble_targets(X_cpu, idx, batch.indices; Mnn=phase.Mnn)
-	end
-	
-	function replace_train_state_states(train_state, states)
-	    return Training.TrainState(
-	        train_state.cache,
-	        train_state.objective_function,
-	        train_state.allocator_cache,
-	        train_state.model,
-	        train_state.parameters,
-	        states,
-	        train_state.optimizer,
-	        train_state.optimizer_state,
-	        train_state.step,
-	    )
-	end
-	
-	function prepare_vq_training_batch(model, ps, st, batch, X_cpu, idx::Union{Nothing,LatentIndex},
-	    epoch::Int, para::VQVAE_Para, training_para::VQVAE_Training_Para;
-	    device=identity, cdev=default_cdev(), encode_compiled=nothing,
-	    ensemble_targets_cpu=nothing)
-	    target_start = time()
-	    target_cpu = make_batch_target(batch, X_cpu, idx, epoch, training_para, ensemble_targets_cpu)
-	    target_time = time() - target_start
-	    pack_start = time()
-	    if training_para.normalize_target
-	        target_cpu = Float32.(MLUtils.normalise(target_cpu; dims=1))
-	    end
-	    bdev = (; x=device(batch.x), target=device(Float32.(target_cpu)))
-	    pack_time = time() - pack_start
-	    payload_start = time()
-	    if isnothing(encode_compiled)
-	        ps_cpu = cdev(ps)
-	        st_cpu = Lux.testmode(cdev(st))
-	        lat, _ = encoder_latents(model, batch.x, ps_cpu, st_cpu)
-	        z_e_cpu = lat.z_e
-	        rvq_cpu = st_cpu.rvq
-	    else
-	        z_e_cpu = Float32.(cdev(encode_compiled(model, ps, Lux.testmode(st), device(batch.x))))
-	        rvq_cpu = cdev(st.rvq)
-	    end
-	    payload_cpu, rvq_cpu = prepare_rvq_payload(z_e_cpu, rvq_cpu, model.K;
-	        ema_decay=para.ema_decay,
-	        epsilon=para.epsilon,
-	        dead_threshold=para.dead_threshold,
-	        training=true)
-	    st_dev = merge(st, (; rvq=device(rvq_cpu)))
-	    payload_time = time() - payload_start
-	    return merge(bdev, (; vq_payload=device(payload_cpu))), st_dev, (; target_time, pack_time, payload_time)
-	end
+function batch_with_target(batch, X_cpu, idx::Union{Nothing,LatentIndex},
+    epoch::Int, training_para::VQVAE_Training_Para; device=identity)
+    phase = ensemble_phase(epoch, training_para)
+    target = if phase.post_epoch == 0 || isnothing(idx)
+        batch.x
+    else
+        build_ensemble_targets(X_cpu, idx, batch.indices; Mnn=phase.Mnn)
+    end
+    return (; x=device(batch.x), target=device(Float32.(target)))
+end
+
+function make_batch_target(batch, X_cpu, idx::Union{Nothing,LatentIndex},
+    epoch::Int, training_para::VQVAE_Training_Para, ensemble_targets_cpu::Union{Nothing,AbstractMatrix}=nothing)
+    phase = ensemble_phase(epoch, training_para)
+    if phase.post_epoch == 0 || isnothing(idx)
+        return batch.x
+    end
+    if !isnothing(ensemble_targets_cpu)
+        return ensemble_targets_cpu[:, batch.indices]
+    end
+    return build_ensemble_targets(X_cpu, idx, batch.indices; Mnn=phase.Mnn)
+end
+
+function replace_train_state_states(train_state, states)
+    return Training.TrainState(
+        train_state.cache,
+        train_state.objective_function,
+        train_state.allocator_cache,
+        train_state.model,
+        train_state.parameters,
+        states,
+        train_state.optimizer,
+        train_state.optimizer_state,
+        train_state.step,
+    )
+end
+
+function prepare_vq_training_batch(model, ps, st, batch, X_cpu, idx::Union{Nothing,LatentIndex},
+    epoch::Int, para::VQVAE_Para, training_para::VQVAE_Training_Para;
+    device=identity, cdev=default_cdev(), encode_compiled=nothing,
+    ensemble_targets_cpu=nothing)
+    target_start = time()
+    target_cpu = make_batch_target(batch, X_cpu, idx, epoch, training_para, ensemble_targets_cpu)
+    target_time = time() - target_start
+    pack_start = time()
+    if training_para.normalize_target
+        target_cpu = Float32.(MLUtils.normalise(target_cpu; dims=1))
+    end
+    bdev = (; x=device(batch.x), target=device(Float32.(target_cpu)))
+    pack_time = time() - pack_start
+    payload_start = time()
+    if isnothing(encode_compiled)
+        ps_cpu = cdev(ps)
+        st_cpu = Lux.testmode(cdev(st))
+        lat, _ = encoder_latents(model, batch.x, ps_cpu, st_cpu)
+        z_e_cpu = lat.z_e
+        rvq_cpu = st_cpu.rvq
+    else
+        z_e_cpu = Float32.(cdev(encode_compiled(model, ps, Lux.testmode(st), device(batch.x))))
+        rvq_cpu = cdev(st.rvq)
+    end
+    payload_cpu, rvq_cpu = prepare_rvq_payload(z_e_cpu, rvq_cpu, model.K;
+        ema_decay=para.ema_decay,
+        epsilon=para.epsilon,
+        dead_threshold=para.dead_threshold,
+        training=true)
+    st_dev = merge(st, (; rvq=device(rvq_cpu)))
+    payload_time = time() - payload_start
+    return merge(bdev, (; vq_payload=device(payload_cpu))), st_dev, (; target_time, pack_time, payload_time)
 end
 
 # ╔═╡ cf13347d-e1fa-4ec1-86dc-38299825f65b
-begin
-	function recon_mse_inference(model, ps, st, x; normalize_target::Bool=false)
-	    target = normalize_target ? Float32.(MLUtils.normalise(x; dims=1)) : x
-	    result, _ = model(x, ps, Lux.testmode(st); training=false)
-	    return mse_loss(result.xhat, target)
-	end
-	
-	function record_train_metrics!(loss_history, train_m, test_recon_mse::Real,
-	    epoch_time::Real, throughput::Real)
-	    push!(loss_history.train_objective, train_m.total)
-	    push!(loss_history.train_target_mse, train_m.recon_loss)
-	    push!(loss_history.train_commit, train_m.commit_loss)
-	    push!(loss_history.train_entropy, train_m.entropy_loss)
-	    push!(loss_history.train_perplexity, train_m.perplexity)
-	    push!(loss_history.test_recon_mse, Float32(test_recon_mse))
-	    push!(loss_history.epoch_time_s, Float32(epoch_time))
-	    push!(loss_history.throughput, Float32(throughput))
-	    return loss_history
-	end
+function recon_mse_inference(model, ps, st, x)
+    result, _ = model(x, ps, Lux.testmode(st); training=false)
+    return mse_loss(result.xhat, x)
+end
+
+function record_train_metrics!(loss_history, train_m, test_recon_mse::Real,
+    epoch_time::Real, throughput::Real)
+    push!(loss_history.train_objective, train_m.total)
+    push!(loss_history.train_target_mse, train_m.recon_loss)
+    push!(loss_history.train_commit, train_m.commit_loss)
+    push!(loss_history.train_entropy, train_m.entropy_loss)
+    push!(loss_history.train_perplexity, train_m.perplexity)
+    push!(loss_history.test_recon_mse, Float32(test_recon_mse))
+    push!(loss_history.epoch_time_s, Float32(epoch_time))
+    push!(loss_history.throughput, Float32(throughput))
+    return loss_history
 end
 
 # ╔═╡ 7ec9f7d7-d311-4a53-9c7c-cb07dfd8c093
@@ -910,23 +859,33 @@ function maybe_compile_inference(model, ps, st, sample_x, training_para::VQVAE_T
     else
         nothing
     end
-    @info "Reactant inference compile complete" N=size(sample_x, 2) batch_N=size(train_sample, 2) compile_time_s=round(time() - start; digits=3) encode_compiled=!isnothing(encode_z_e_compiled) train_encode_compiled=!isnothing(encode_z_e_train_compiled)
-    return (; encode_z_e=encode_z_e_compiled, encode_z_e_train=encode_z_e_train_compiled)
+    latent_index_scorer = LatentIndexScorer()
+    score_compiled = if compile_latent_index
+        try
+            sample_z = device(zeros(Float32, model.d, size(sample_x, 2)))
+            @compile latent_index_score_inference(latent_index_scorer, sample_z)
+        catch err
+            error("Reactant @compile failed for latent-index scorer. Cannot rebuild latent index on Reactant without compiled scoring path: $(err)")
+        end
+    else
+        nothing
+    end
+    @info "Reactant inference compile complete" N=size(sample_x, 2) batch_N=size(train_sample, 2) compile_time_s=round(time() - start; digits=3) encode_compiled=!isnothing(encode_z_e_compiled) train_encode_compiled=!isnothing(encode_z_e_train_compiled) score_compiled=!isnothing(score_compiled)
+    return (; encode_z_e=encode_z_e_compiled, encode_z_e_train=encode_z_e_train_compiled,
+        score=score_compiled, latent_index_scorer)
 end
 
 # ╔═╡ 3442ef19-bf2f-4ebf-94fd-bce4dd378745
-begin
-	enzyme_training_backend() = AutoEnzyme(mode=EnzymeCore.set_runtime_activity(EnzymeCore.Reverse))
-	
-	function training_backend(training_para::VQVAE_Training_Para, device)
-	    backend = training_para.autodiff_backend
-	    if backend === :auto
-	        backend = device isa ReactantDevice ? :enzyme : :zygote
-	    end
-	    backend === :zygote && return AutoZygote()
-	    backend === :enzyme && return enzyme_training_backend()
-	    error("Unsupported autodiff_backend=$(training_para.autodiff_backend). Use :auto, :zygote, or :enzyme.")
-	end
+enzyme_training_backend() = AutoEnzyme(mode=EnzymeCore.set_runtime_activity(EnzymeCore.Reverse))
+
+function training_backend(training_para::VQVAE_Training_Para, device)
+    backend = training_para.autodiff_backend
+    if backend === :auto
+        backend = device isa ReactantDevice ? :enzyme : :zygote
+    end
+    backend === :zygote && return AutoZygote()
+    backend === :enzyme && return enzyme_training_backend()
+    error("Unsupported autodiff_backend=$(training_para.autodiff_backend). Use :auto, :zygote, or :enzyme.")
 end
 
 # ╔═╡ 10000015-0000-0000-0000-000000000001
@@ -1153,29 +1112,6 @@ function plot_state_average_matrix(avg; title::String, dt::Real=1.0, reverse_tim
         yaxis_title="State + offset", width=900, height=max(400, 70 * nstates)))
 end
 
-function plot_cluster_histogram(counts_ac, counts_c; title="Cluster Usage")
-    K = length(counts_ac)
-    total_ac = max(sum(counts_ac), 1)
-    total_c  = max(sum(counts_c),  1)
-    pct_ac = 100f0 .* counts_ac ./ total_ac
-    pct_c  = 100f0 .* counts_c  ./ total_c
-    xlabels = string.(1:K)
-    traces = [
-        PlutoPlotly.bar(x=xlabels, y=pct_ac, name="Acausal",
-            marker=attr(color="rgba(31,119,180,0.7)")),
-        PlutoPlotly.bar(x=xlabels, y=pct_c,  name="Causal",
-            marker=attr(color="rgba(214,39,40,0.7)")),
-    ]
-    layout = Layout(
-        title=attr(text=title, font=attr(size=18)),
-        barmode="group", height=400, width=700,
-        xaxis=attr(title="Source state"),
-        yaxis=attr(title="Usage (%)"),
-        plot_bgcolor="white", paper_bgcolor="white",
-    )
-    return PlutoPlotly.plot(traces, layout)
-end
-
 # ╔═╡ f140b608-0c12-4c5e-8dad-1ac81f6e2d99
 function plot_reconstruction_examples(model, ps, st, X; nsamples::Int=8, dt::Real=1.0,
     device=identity, cdev=default_cdev(), title="Reconstruction examples")
@@ -1229,7 +1165,7 @@ function update(model, ps, st, loss_history, train_data, test_data,
         phase = ensemble_phase(epoch, training_para)
         if phase.post_epoch > 0 &&
            (phase.Mnn != last_index_Mnn || mod(phase.post_epoch - 1, training_para.index_refresh_every) == 0)
-            if isnothing(inference_compiled.encode_z_e)
+            if isnothing(inference_compiled.encode_z_e) || isnothing(inference_compiled.score)
                 latent_compiled = maybe_compile_inference(
                     train_state.model, train_state.parameters, train_state.states,
                     device(train_x_cpu),
@@ -1242,19 +1178,22 @@ function update(model, ps, st, loss_history, train_data, test_data,
                 inference_compiled = (;
                     encode_z_e=latent_compiled.encode_z_e,
                     encode_z_e_train=inference_compiled.encode_z_e_train,
+                    score=latent_compiled.score,
+                    latent_index_scorer=latent_compiled.latent_index_scorer,
                 )
             end
             index_start = time()
             rebuild_latent_index!(idx, train_state.model, train_state.parameters, train_state.states, train_x_cpu;
                 Mnn=phase.Mnn, device, cdev,
                 encode_compiled=inference_compiled.encode_z_e,
-                knn_search_chunk_size_fraction=training_para.knn_search_chunk_size_fraction)
+                score_compiled=inference_compiled.score,
+                latent_index_scorer=inference_compiled.latent_index_scorer)
             latent_index_time = time() - index_start
             target_cache_start = time()
             ensemble_targets_cpu = build_ensemble_targets(train_x_cpu, idx, 1:size(train_x_cpu, 2); Mnn=phase.Mnn)
             target_cache_time = time() - target_cache_start
             last_index_Mnn = phase.Mnn
-            training_para.verbose && @info "Rebuilt latent index" epoch post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn latent_index_time_s=round(latent_index_time; digits=3) ensemble_target_cache_time_s=round(target_cache_time; digits=3)
+            @info "Rebuilt latent index" epoch post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn latent_index_time_s=round(latent_index_time; digits=3) ensemble_target_cache_time_s=round(target_cache_time; digits=3)
         end
 
         batches = make_batches(train_x_cpu, training_para.batchsize)
@@ -1265,7 +1204,6 @@ function update(model, ps, st, loss_history, train_data, test_data,
         last_commit = NaN32
         last_entropy = NaN32
         last_perplexity = NaN32
-        epoch_counts = zeros(Float32, sum(para.K))   # accumulated codebook counts across all batches
         prep_time = 0.0
         target_time = 0.0
         pack_time = 0.0
@@ -1293,20 +1231,8 @@ function update(model, ps, st, loss_history, train_data, test_data,
             (_, loss, stats, train_state) = Training.single_train_step!(
                 ad_backend, loss_fn, bdev, train_state; return_gradients=Val(false)
             )
-            # Reactant's compiled step overwrites ts.states with the XLA-traced st (which
-            # has the old rvq frozen in). Re-inject the CPU-side EMA-updated rvq so it
-            # survives into the next batch's prepare_vq_training_batch call.
-            train_state = replace_train_state_states(train_state,
-                merge(train_state.states, (; rvq=st_updated.rvq)))
             step_time += time() - step_start
             total_seen += size(batch.x, 2)
-            # accumulate per-stage EMA cluster sizes for epoch-level perplexity
-            offset = 0
-            for stage in st_updated.rvq.stages
-                cs = Float32.(cdev(stage.ema_cluster_size))
-                epoch_counts[offset+1:offset+length(cs)] .+= cs
-                offset += length(cs)
-            end
             if batch_idx == length(batches)
                 metric_sync_start = time()
                 batch_metrics = cdev((;
@@ -1314,6 +1240,7 @@ function update(model, ps, st, loss_history, train_data, test_data,
                     recon_loss=stats.recon_loss,
                     commit_loss=stats.commit_loss,
                     entropy_loss=stats.entropy_loss,
+                    perplexity=stats.perplexity,
                 ))
                 metric_sync_time += time() - metric_sync_start
                 last_loss = Float32(batch_metrics.loss)
@@ -1321,22 +1248,11 @@ function update(model, ps, st, loss_history, train_data, test_data,
                 last_recon = Float32(batch_metrics.recon_loss)
                 last_commit = Float32(batch_metrics.commit_loss)
                 last_entropy = Float32(batch_metrics.entropy_loss)
+                last_perplexity = Float32(batch_metrics.perplexity)
             end
         end
         epoch_time = time() - start
         throughput = total_seen / max(epoch_time, 1e-8)
-        # epoch perplexity from accumulated counts across all batches
-        nstages = length(para.K)
-        epoch_perplexity = 0f0
-        offset = 0
-        for k in para.K
-            stage_counts = epoch_counts[offset+1:offset+k]
-            p = stage_counts ./ max(sum(stage_counts), 1f-8)
-            psafe = clamp.(p, 1f-10, 1f0)
-            epoch_perplexity += exp(-sum(psafe .* log.(psafe)))
-            offset += k
-        end
-        last_perplexity = epoch_perplexity / nstages
         train_m = (;
             total=last_loss,
             recon_loss=last_recon,
@@ -1345,8 +1261,7 @@ function update(model, ps, st, loss_history, train_data, test_data,
             perplexity=last_perplexity,
         )
         test_recon_mse = recon_mse_inference(
-            train_state.model, cdev(train_state.parameters), cdev(train_state.states), test_eval_x_cpu;
-            normalize_target=training_para.normalize_target)
+            train_state.model, cdev(train_state.parameters), cdev(train_state.states), test_eval_x_cpu)
         record_train_metrics!(loss_history, train_m, test_recon_mse, epoch_time, throughput)
 
         if mod(epoch, training_para.nprint) == 0
@@ -3177,7 +3092,6 @@ version = "17.7.0+0"
 
 # ╔═╡ Cell order:
 # ╠═10000001-0000-0000-0000-000000000001
-# ╠═330652f1-0754-48a4-9a0f-4fb9d6824222
 # ╟─10000002-0000-0000-0000-000000000001
 # ╠═10000003-0000-0000-0000-000000000001
 # ╠═10000004-0000-0000-0000-000000000001
@@ -3185,6 +3099,8 @@ version = "17.7.0+0"
 # ╠═10000006-0000-0000-0000-000000000001
 # ╠═10000007-0000-0000-0000-000000000001
 # ╠═10000008-0000-0000-0000-000000000001
+# ╠═4163883e-b855-4d81-bf86-5e75b410c213
+# ╠═05e015d7-ce25-49c6-8b3f-af150e1ca448
 # ╟─1000000a-0000-0000-0000-000000000001
 # ╠═ef07d7ea-9aaa-4fed-b3f3-a6a2acc85650
 # ╠═0e5e3563-8738-4831-a9b5-16c6803743f7
@@ -3208,6 +3124,8 @@ version = "17.7.0+0"
 # ╠═91a4fb9f-f5d4-406f-b384-282d8a48257f
 # ╠═86dfe031-7e05-402b-8916-cc2d2758e6b4
 # ╠═092511ab-104e-4577-8cf5-dc6deeb73ac7
+# ╠═71f99223-5223-4dec-9a0d-cc58faa57039
+# ╠═a0a73d43-204d-47c6-a9f5-0e2c37944c3d
 # ╠═b1e8b57a-0fa3-492a-a3a1-036423f41373
 # ╠═2f88be66-ffea-4d0e-8ea5-65a39b7d10db
 # ╠═2ee07196-8b28-418c-a0d4-40866584bc6f
@@ -3216,6 +3134,7 @@ version = "17.7.0+0"
 # ╠═5e716b73-ab88-4b84-a8bf-dd064dc82fd8
 # ╠═2d6639d1-ae40-46d0-a811-e1fd34a23613
 # ╠═cf13347d-e1fa-4ec1-86dc-38299825f65b
+# ╠═0fca4564-08ef-4a48-aa64-6109c5a76a43
 # ╠═7ec9f7d7-d311-4a53-9c7c-cb07dfd8c093
 # ╠═3442ef19-bf2f-4ebf-94fd-bce4dd378745
 # ╠═10000015-0000-0000-0000-000000000001
@@ -3236,6 +3155,7 @@ version = "17.7.0+0"
 # ╠═4f2b1382-c158-417b-9fc0-1b8d04d90ed2
 # ╠═c974342d-4bcc-4175-9d71-8f9cfbb7105a
 # ╠═70a460bf-b3e4-4e7c-aa4d-2674a450379a
+# ╠═845c8321-0d2d-41dd-b2e4-8f1699a02926
 # ╠═2168a07c-e17a-4e94-bec7-5f881a5b5f09
 # ╠═d7d22b36-79b6-41d6-b9ce-403d34d4165b
 # ╠═93982359-07a8-4259-8c14-f51794a462f9

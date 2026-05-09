@@ -4,5 +4,7 @@
 			"path": "."
 		}
 	],
-	"settings": {}
+	"settings": {
+		"pluto-notebook.juliaVersion": "1.12.6"
+	}
 }

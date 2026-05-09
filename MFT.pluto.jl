@@ -122,7 +122,7 @@ md"## Core Functions"
 # ╔═╡ fcf48627-0b80-4c6b-b204-f40da981aaa5
 function perform_mft_analysis(trace::SeismicTrace, period_range, n_periods; kwargs...)
 	period_min, period_max = Float64.(period_range)
-	periods_analysis = collect(exp10.(range(log10(period_min), log10(period_max), length=n_periods)))
+	periods_analysis = collect(logrange(period_min, period_max, length=n_periods))
 	return perform_mft_analysis(trace, periods_analysis; kwargs...)
 end
 
@@ -167,8 +167,8 @@ function narrow_band_filter(data::AbstractArray, dt::Float64, center_freq::Float
 end
 
 # ╔═╡ 4192fcef-4662-4944-b354-71e8e00285b1
-md"""
-narrow_band_filter_analytic(data, dt, center_freq, bandwidth_factor=sqrt(2/25)) -> Vector{ComplexF64}
+"""
+    narrow_band_filter_analytic(data, dt, center_freq, bandwidth_factor=sqrt(2/25)) -> Vector{ComplexF64}
 
 Apply a one-sided Gaussian narrowband filter and return the **complex analytic signal**.
 
@@ -201,9 +201,6 @@ two-sided envelope (Hilbert-transform convention).
 - `Vector{ComplexF64}` — complex analytic signal;
   `abs.(z)` = envelope,  `angle.(z)` = instantaneous phase
 """
-
-
-# ╔═╡ 2c1a711e-261e-4e82-ade2-2fb6bc0e6b93
 function narrow_band_filter_analytic(data::AbstractVector{<:Real}, dt::Float64,
                                      center_freq::Float64,
                                      bandwidth_factor::Float64=sqrt(2.0 / 25.0))
@@ -589,7 +586,6 @@ function plot_envelopes(res::MFTResult;
         ),
         xaxis = attr(
             title = "Period (s)",
-            type = "linear",
             showgrid = true,
             gridcolor = "rgba(128,128,128,0.2)",
             zeroline = false,
@@ -747,7 +743,6 @@ function plot_dispersion_curve(results::AbstractVector{MFTResult};
         ),
         xaxis = attr(
             title = "Period (s)",
-            type = "linear",
             showgrid = true,
             gridcolor = "rgba(128,128,128,0.2)",
             zeroline = false,
@@ -843,7 +838,6 @@ function plot_dispersion_curve(res::MFTResult;
         ),
         xaxis = attr(
             title = "Period (s)",
-            type = "linear",
             showgrid = true,
             gridcolor = "rgba(128,128,128,0.2)",
             zeroline = false,
@@ -1164,7 +1158,6 @@ let
         ),
         xaxis = attr(
             title = "Period (s)",
-            type = "linear",
             showgrid = true,
             gridcolor = "rgba(128,128,128,0.2)",
             titlefont = attr(size = 18),
@@ -1378,8 +1371,8 @@ let
             title = "Frequency Domain: 3-Band Pre-filtering",
             xaxis = attr(
                 title = "Frequency (Hz)",
-                range = [-2, log10(0.3)],
-                type = "log"
+                range = [0, 0.3],
+                type = "linear"
             ),
             yaxis = attr(
                 title = "Normalized Amplitude",
@@ -1538,7 +1531,6 @@ function plot_phase_velocities(res::MFTResult;
         ),
         xaxis = attr(
             title = "Period (s)",
-            type = "linear",
             showgrid = true,
             gridcolor = "rgba(128,128,128,0.2)",
             zeroline = false,
@@ -2014,7 +2006,7 @@ function plot_branch_correlation(result::BranchAnalysisResult;
     
     layout = Layout(
         title=attr(text=title, font=attr(size=font_size+2, family=font_family)),
-        xaxis=attr(title="Period (s)", type="linear", range=[minimum(result.periods), maximum(result.periods)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        xaxis=attr(title="Period (s)", showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
         yaxis=attr(title="Correlation Coefficient", range=[-0.1, 1.05], 
                   showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
         width=width, height=height,
@@ -2189,7 +2181,7 @@ function plot_multipeak_dispersion(modes::Vector{MultimodalDispersion};
             font=attr(size=font_size+2, family=font_family)
         ),
         xaxis=attr(
-            title="Period (s)", type="linear",
+            title="Period (s)",
             showgrid=true,
             gridcolor="rgba(128,128,128,0.2)",
             zeroline=false,
@@ -2347,8 +2339,8 @@ function plot_branch_comparison(result::BranchAnalysisResult;
     
     layout = Layout(
         title=attr(text=title, font=attr(size=font_size+2, family=font_family)),
-        xaxis1=attr(title="Period (s)", type="linear", domain=[0, 0.45], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        xaxis2=attr(title="Period (s)", type="linear", domain=[0.55, 1], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        xaxis1=attr(title="Period (s)", domain=[0, 0.45], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        xaxis2=attr(title="Period (s)", domain=[0.55, 1], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
         yaxis1=attr(title="Group Velocity (km/s)", range=[vel_min, vel_max], 
                    showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
         width=width, height=height,
@@ -2483,8 +2475,7 @@ function plot_branch_correlation(result::BranchBatchAnalysisResult;
 
     layout = Layout(
         title = attr(text = title, font = attr(size = font_size + 2, family = font_family)),
-        xaxis = attr(title = "Period (s)",
-            type = "linear", showgrid = true, gridcolor = "rgba(128,128,128,0.2)"),
+        xaxis = attr(title = "Period (s)", showgrid = true, gridcolor = "rgba(128,128,128,0.2)"),
         yaxis = attr(title = "Correlation Coefficient", range = [-0.1, 1.05], showgrid = true, gridcolor = "rgba(128,128,128,0.2)"),
         width = width,
         height = height,
@@ -2672,14 +2663,14 @@ end
 Build analysis periods in seconds from the Nyquist period `2dt` up to `period_max`
 with increment `dT`.
 """
-function _periods_from_nyquist(dt::Float64; period_min::Union{Float64, Nothing}=nothing, dT::Float64=0.5, period_max::Float64=60.0)
+function _periods_from_nyquist(dt::Float64; dT::Float64=0.5, period_max::Float64=60.0)
     dT > 0.0 || throw(ArgumentError("dT must be positive"))
     period_max > 0.0 || throw(ArgumentError("period_max must be positive"))
 
-    period_min = period_min === nothing ? 2.0 * dt : period_min
+    period_min = 2.0 * dt
     period_max >= period_min || throw(ArgumentError("period_max=$(period_max) must be >= Nyquist period $(period_min)"))
 
-    periods = collect(exp10.(range(log10(period_min), log10(period_max), length=400)))
+    periods = collect(logrange(period_min, period_max, length=100))
     isempty(periods) && (periods = [period_min])
     return periods
 end
@@ -2694,13 +2685,12 @@ Nyquist-default API: periods are auto-generated from `2dt:dT:period_max`.
 """
 function analyze_causal_acausal_branches(trace_causal::SeismicTrace,
                                          trace_acausal::SeismicTrace;
-                                         period_min::Union{Float64, Nothing}=nothing,
                                          dT::Float64=0.5,
                                          period_max::Float64=60.0,
                                          max_modes::Int=4,
                                          compute_correlation::Bool=true,
                                          kwargs...)
-    periods = _periods_from_nyquist(trace_causal.dt; period_min=period_min, dT=dT, period_max=period_max)
+    periods = _periods_from_nyquist(trace_causal.dt; dT=dT, period_max=period_max)
     return analyze_causal_acausal_branches(trace_causal, trace_acausal, periods;
                                            max_modes=max_modes,
                                            compute_correlation=compute_correlation,
@@ -2724,7 +2714,6 @@ Batch Nyquist-default API: one common period axis is auto-generated from
 function analyze_causal_acausal_branches(traces_causal::AbstractVector{<:SeismicTrace},
                                          traces_acausal::AbstractVector{<:SeismicTrace};
                                          state_labels=nothing,
-                                         period_min::Union{Float64, Nothing}=nothing,
                                          dT::Float64=0.5,
                                          period_max::Float64=60.0,
                                          max_modes::Int=4,
@@ -2740,7 +2729,7 @@ function analyze_causal_acausal_branches(traces_causal::AbstractVector{<:Seismic
         @assert traces_causal[i].dt ≈ dt_ref "All source states must share the same dt for batch Nyquist-default analysis"
     end
 
-    periods = _periods_from_nyquist(dt_ref; period_min=period_min, dT=dT, period_max=period_max)
+    periods = _periods_from_nyquist(dt_ref; dT=dT, period_max=period_max)
     return analyze_causal_acausal_branches(traces_causal, traces_acausal, periods;
                                            state_labels=state_labels,
                                            max_modes=max_modes,
@@ -2933,13 +2922,13 @@ function plot_all_highcorr_groupvelocity_picks(result::BranchAnalysisResult;
         return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No valid high-correlation picks"]))
     end
 
-    y_min = 0.9 * minimum(all_vels)
-    y_max = 1.1 * maximum(all_vels)
+    y_min = 0.5
+    y_max = 10.0
     n_hi = length(hi_idx)
 
     layout = Layout(
         title=attr(text="$(title) (N=$(n_hi), threshold=$(correlation_threshold))", font=attr(size=font_size + 2, family=font_family)),
-        xaxis=attr(title="Period (s)", type="linear", range=[minimum(result.periods), maximum(result.periods)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        xaxis=attr(title="Period (s)", showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
         yaxis=attr(title="Group Velocity (km/s)", range=[y_min, y_max], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
         width=width,
         height=height,
@@ -3101,12 +3090,12 @@ function plot_all_highcorr_groupvelocity_picks(result::BranchBatchAnalysisResult
         return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No valid high-correlation picks"]))
     end
 
-    y_min = 0.9 * minimum(all_vels)
-    y_max = 1.1 * maximum(all_vels)
+    y_min = 0.5
+    y_max = 10.0
 
     layout = Layout(
         title=attr(text="$(title) (threshold=$(correlation_threshold), high-corr samples=$(total_hi))", font=attr(size=font_size + 2, family=font_family)),
-        xaxis=attr(title="Period (s)", type="linear", range=[minimum(result.periods), maximum(result.periods)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        xaxis=attr(title="Period (s)", showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
         yaxis=attr(title="Group Velocity (km/s)", range=[y_min, y_max], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
         width=width,
         height=height,
@@ -3118,859 +3107,6 @@ function plot_all_highcorr_groupvelocity_picks(result::BranchBatchAnalysisResult
     )
 
     return PlutoPlotly.plot(traces, layout)
-end
-
-# ╔═╡ a079a952-8252-4f56-a4c7-2a9ae58e0f11
-"""
-    SourceStateConsensusPick
-
-Consensus group-velocity picks combined across source states for one receiver pair.
-
-Fields:
-- `periods`: Analysis periods [s]
-- `group_velocities`: Final consensus group velocity per period [km/s]
-- `arrival_times`: Final arrival time per period [s]
-- `confidence`: Confidence score per period [0,1]
-- `support`: Number of unique source states supporting the selected cluster
-- `candidate_velocities`: All causal/acausal-matched candidate velocities per period
-- `accepted_candidate_velocities`: Candidate velocities inside the selected cluster
-- `rejected_candidate_velocities`: Candidate velocities outside the selected cluster
-- `selected_cluster_index`: Selected cluster index per period, or 0 when no pick is accepted
-- `candidate_group_velocities`: Smooth consensus candidate branches [period, candidate]
-- `candidate_arrival_times`: Candidate arrival times [period, candidate]
-- `candidate_confidence`: Candidate confidence scores [period, candidate]
-- `candidate_support`: Candidate source-state support counts [period, candidate]
-- `candidate_cluster_index`: Selected cluster index for each candidate branch [period, candidate]
-"""
-struct SourceStateConsensusPick
-    periods::Vector{Float64}
-    group_velocities::Vector{Float64}
-    arrival_times::Vector{Float64}
-    confidence::Vector{Float64}
-    support::Vector{Int}
-    candidate_velocities::Vector{Vector{Float64}}
-    accepted_candidate_velocities::Vector{Vector{Float64}}
-    rejected_candidate_velocities::Vector{Vector{Float64}}
-    selected_cluster_index::Vector{Int}
-    candidate_group_velocities::Matrix{Float64}
-    candidate_arrival_times::Matrix{Float64}
-    candidate_confidence::Matrix{Float64}
-    candidate_support::Matrix{Int}
-    candidate_cluster_index::Matrix{Int}
-end
-
-# ╔═╡ f2c83612-d161-4fef-a728-c2dcbfa48b1c
-struct _ConsensusCandidate
-    velocity::Float64
-    state_index::Int
-    branch_correlation::Float64
-end
-
-# ╔═╡ 1c36878c-f684-46a8-a2ab-4203a01d0169
-struct _ConsensusCluster
-    velocity::Float64
-    confidence::Float64
-    support::Int
-    candidate_indices::Vector{Int}
-end
-
-# ╔═╡ 7f9cbf19-46b3-403b-90f8-a4591fd5ef4f
-function _relative_difference(a::Float64, b::Float64)
-    denom = max((abs(a) + abs(b)) / 2.0, eps(Float64))
-    return abs(a - b) / denom
-end
-
-# ╔═╡ f7f4e17f-0784-43db-9a6b-c2b07a963f94
-function _median_sorted(vals::Vector{Float64})
-    isempty(vals) && return NaN
-    s = sort(vals)
-    n = length(s)
-    mid = fld(n + 1, 2)
-    return isodd(n) ? s[mid] : 0.5 * (s[mid] + s[mid + 1])
-end
-
-# ╔═╡ c17d7f26-3d82-44b8-860c-b12df0bf9293
-function _mean_finite(vals::Vector{Float64})
-    good = [v for v in vals if isfinite(v)]
-    isempty(good) && return NaN
-    return sum(good) / length(good)
-end
-
-# ╔═╡ 1a7d4cbb-a1ea-4319-a404-2293faf72069
-function _cluster_consensus_candidates(candidates::Vector{_ConsensusCandidate},
-                                       nstates::Int;
-                                       cluster_tolerance_fraction::Float64=0.08)
-    cluster_tolerance_fraction >= 0.0 || throw(ArgumentError("cluster_tolerance_fraction must be >= 0"))
-    isempty(candidates) && return _ConsensusCluster[]
-
-    order = sortperm([c.velocity for c in candidates])
-    groups = Vector{Vector{Int}}()
-
-    for idx in order
-        v = candidates[idx].velocity
-        if isempty(groups)
-            push!(groups, [idx])
-            continue
-        end
-
-        last_group = groups[end]
-        center = _median_sorted([candidates[j].velocity for j in last_group])
-        if _relative_difference(v, center) <= cluster_tolerance_fraction
-            push!(last_group, idx)
-        else
-            push!(groups, [idx])
-        end
-    end
-
-    clusters = _ConsensusCluster[]
-    for group in groups
-        velocities = [candidates[j].velocity for j in group]
-        corrs = [candidates[j].branch_correlation for j in group]
-        states = unique([candidates[j].state_index for j in group])
-
-        v_med = _median_sorted(velocities)
-        v_avg = _mean_finite(velocities)
-        mean_corr = clamp(_mean_finite(corrs), 0.0, 1.0)
-        support_fraction = nstates > 0 ? clamp(length(states) / nstates, 0.0, 1.0) : 0.0
-
-        compactness = 1.0
-        if length(velocities) > 1 && isfinite(v_med) && v_med > 0.0
-            rel_spread = maximum(abs.(velocities .- v_med)) / v_med
-            compactness = clamp(1.0 - rel_spread / max(cluster_tolerance_fraction, eps(Float64)), 0.0, 1.0)
-        end
-
-        confidence = clamp(0.45 * support_fraction + 0.35 * mean_corr + 0.20 * compactness, 0.0, 1.0)
-        push!(clusters, _ConsensusCluster(v_avg, confidence, length(states), group))
-    end
-
-    return clusters
-end
-
-# ╔═╡ c7600895-0b53-477d-aaca-19925dec0d91
-function _select_consensus_clusters(period_clusters::Vector{Vector{_ConsensusCluster}};
-                                    min_support::Int=1,
-                                    min_confidence::Float64=0.0,
-                                    smoothness_weight::Float64=1.0)
-    min_support >= 1 || throw(ArgumentError("min_support must be >= 1"))
-    0.0 <= min_confidence <= 1.0 || throw(ArgumentError("min_confidence must be in [0, 1]"))
-    smoothness_weight >= 0.0 || throw(ArgumentError("smoothness_weight must be >= 0"))
-
-    nperiods = length(period_clusters)
-    selected = zeros(Int, nperiods)
-    prev_velocity = NaN
-
-    for ip in 1:nperiods
-        clusters = period_clusters[ip]
-        best_j = 0
-        best_score = -Inf
-
-        for (j, cluster) in enumerate(clusters)
-            cluster.support < min_support && continue
-            cluster.confidence < min_confidence && continue
-
-            smooth_penalty = 0.0
-            if isfinite(prev_velocity) && isfinite(cluster.velocity) && cluster.velocity > 0.0
-                smooth_penalty = smoothness_weight * _relative_difference(cluster.velocity, prev_velocity)
-            end
-
-            score = cluster.confidence + 0.08 * cluster.support - smooth_penalty
-            if score > best_score
-                best_score = score
-                best_j = j
-            end
-        end
-
-        selected[ip] = best_j
-        if best_j > 0
-            prev_velocity = clusters[best_j].velocity
-        end
-    end
-
-    return selected
-end
-
-# ╔═╡ 07914f7d-70fb-477d-bb05-dfa2a68d03ff
-function _eligible_cluster_indices(clusters::Vector{_ConsensusCluster},
-                                   used::AbstractVector{Bool};
-                                   min_support::Int,
-                                   min_confidence::Float64)
-    return [j for j in eachindex(clusters)
-            if !used[j] &&
-               clusters[j].support >= min_support &&
-	               clusters[j].confidence >= min_confidence]
-end
-
-# ╔═╡ 2e76ea52-ad8e-4f32-9b01-b88d7d1163f9
-function _local_low_velocity_bonus(clusters::Vector{_ConsensusCluster}, j::Int,
-                                   eligible::Vector{Int})
-    isempty(eligible) && return 0.0
-    vals = [clusters[k].velocity for k in eligible if isfinite(clusters[k].velocity)]
-    isempty(vals) && return 0.0
-    vmin = minimum(vals)
-    vmax = maximum(vals)
-    span = vmax - vmin
-    span <= eps(Float64) && return 0.5
-    return clamp((vmax - clusters[j].velocity) / span, 0.0, 1.0)
-end
-
-# ╔═╡ bdccfc35-4436-4716-a868-bec5a18317d3
-function _select_smooth_consensus_candidate_branches(period_clusters::Vector{Vector{_ConsensusCluster}};
-                                                     max_candidates::Int=3,
-                                                     min_support::Int=1,
-                                                     min_confidence::Float64=0.0,
-                                                     smoothness_weight::Float64=1.0,
-                                                     max_smooth_jump_fraction::Float64=0.12,
-                                                     max_gap_periods::Int=1,
-                                                     selection_mode::Symbol=:low_velocity)
-    max_candidates >= 1 || throw(ArgumentError("max_candidates must be >= 1"))
-    min_support >= 1 || throw(ArgumentError("min_support must be >= 1"))
-    0.0 <= min_confidence <= 1.0 || throw(ArgumentError("min_confidence must be in [0, 1]"))
-    smoothness_weight >= 0.0 || throw(ArgumentError("smoothness_weight must be >= 0"))
-    max_smooth_jump_fraction >= 0.0 || throw(ArgumentError("max_smooth_jump_fraction must be >= 0"))
-    max_gap_periods >= 0 || throw(ArgumentError("max_gap_periods must be >= 0"))
-    selection_mode in (:low_velocity, :confidence) || throw(ArgumentError("selection_mode must be :low_velocity or :confidence"))
-
-    nperiods = length(period_clusters)
-    selected = zeros(Int, nperiods, max_candidates)
-    used = [falses(length(clusters)) for clusters in period_clusters]
-
-    for icand in 1:max_candidates
-        seed_ip = 0
-        seed_j = 0
-        seed_score = -Inf
-
-        for ip in 1:nperiods
-            eligible = _eligible_cluster_indices(period_clusters[ip], used[ip];
-                                                 min_support=min_support,
-                                                 min_confidence=min_confidence)
-            for j in eligible
-                cluster = period_clusters[ip][j]
-                low_bonus = _local_low_velocity_bonus(period_clusters[ip], j, eligible)
-                score = selection_mode == :low_velocity ?
-                        (cluster.confidence + 0.08 * cluster.support + 0.12 * low_bonus) :
-                        (cluster.confidence + 0.08 * cluster.support)
-                if score > seed_score
-                    seed_score = score
-                    seed_ip = ip
-                    seed_j = j
-                end
-            end
-        end
-
-        seed_j == 0 && break
-
-        selected[seed_ip, icand] = seed_j
-        used[seed_ip][seed_j] = true
-
-        for direction in (-1, 1)
-            prev_velocity = period_clusters[seed_ip][seed_j].velocity
-            gap_count = 0
-            ip_range = direction == -1 ? ((seed_ip - 1):-1:1) : ((seed_ip + 1):nperiods)
-
-            for ip in ip_range
-                best_j = 0
-                best_score = -Inf
-
-                eligible = _eligible_cluster_indices(period_clusters[ip], used[ip];
-                                                     min_support=min_support,
-                                                     min_confidence=min_confidence)
-
-                for j in eligible
-                    cluster = period_clusters[ip][j]
-                    rel_jump = _relative_difference(cluster.velocity, prev_velocity)
-                    rel_jump <= max_smooth_jump_fraction || continue
-
-                    low_bonus = _local_low_velocity_bonus(period_clusters[ip], j, eligible)
-                    score = selection_mode == :low_velocity ?
-                            (cluster.confidence + 0.08 * cluster.support + 0.12 * low_bonus - smoothness_weight * rel_jump) :
-                            (cluster.confidence + 0.08 * cluster.support - smoothness_weight * rel_jump)
-                    if score > best_score
-                        best_score = score
-                        best_j = j
-                    end
-                end
-
-                if best_j == 0
-                    gap_count += 1
-                    gap_count > max_gap_periods && break
-                    continue
-                end
-
-                selected[ip, icand] = best_j
-                used[ip][best_j] = true
-                prev_velocity = period_clusters[ip][best_j].velocity
-                gap_count = 0
-            end
-        end
-    end
-
-    return selected
-end
-
-# ╔═╡ 0eed3963-d6e2-4c6d-938b-7e233811364c
-"""
-    consensus_group_velocity_picks(result::BranchBatchAnalysisResult;
-        correlation_threshold=0.85,
-        velocity_tolerance_fraction=0.10,
-        cluster_tolerance_fraction=nothing,
-        min_support=1,
-        min_confidence=0.0,
-        smoothness_weight=1.0,
-        max_candidates=3,
-        max_smooth_jump_fraction=0.12,
-        max_gap_periods=1,
-        selection_mode=:low_velocity,
-        min_candidate_periods=2)
-
-Combine causal/acausal-matched group-velocity candidates across source states
-for one receiver pair. Causal/acausal agreement is required inside each source
-state, while source states are pooled with OR-style support. The output keeps
-up to `max_candidates` smooth candidate branches with gaps allowed.
-	Use `selection_mode=:low_velocity` to trace the local minimum group-velocity
-	envelope; use `selection_mode=:confidence` for the older confidence-first
-	branch ordering. Candidate branches that cover more periods are ordered ahead
-	of shorter branches; set `min_candidate_periods=1` to keep single-period islands.
-	"""
-function consensus_group_velocity_picks(result::BranchBatchAnalysisResult;
-                                        correlation_threshold::Float64=0.85,
-                                        velocity_tolerance_fraction::Float64=0.10,
-                                        cluster_tolerance_fraction::Union{Float64,Nothing}=nothing,
-                                        min_support::Int=1,
-                                        min_confidence::Float64=0.0,
-                                        smoothness_weight::Float64=1.0,
-                                        max_candidates::Int=3,
-                                        max_smooth_jump_fraction::Float64=0.12,
-                                        max_gap_periods::Int=1,
-                                        selection_mode::Symbol=:low_velocity,
-                                        min_candidate_periods::Int=2)
-    nstates = length(result.state_results)
-    nstates > 0 || throw(ArgumentError("At least one source state is required"))
-    min_candidate_periods >= 1 || throw(ArgumentError("min_candidate_periods must be >= 1"))
-    cluster_tol = isnothing(cluster_tolerance_fraction) ? velocity_tolerance_fraction : cluster_tolerance_fraction
-    cluster_tol >= 0.0 || throw(ArgumentError("cluster_tolerance_fraction must be >= 0"))
-    nperiods = length(result.periods)
-    distance_ref = result.state_results[1].distance
-    for (istate, st) in enumerate(result.state_results)
-        st.distance ≈ distance_ref || throw(ArgumentError("State $(istate) distance $(st.distance) does not match receiver-pair distance $(distance_ref)"))
-    end
-
-    period_candidates = [Vector{_ConsensusCandidate}() for _ in 1:nperiods]
-    candidate_velocities = [Float64[] for _ in 1:nperiods]
-
-    for (istate, st) in enumerate(result.state_results)
-        for ip in 1:nperiods
-            corr = st.branch_correlation[ip]
-            (isfinite(corr) && corr >= correlation_threshold) || continue
-
-            causal_peaks = st.causal_result.all_peaks[ip]
-            acausal_peaks = st.acausal_result.all_peaks[ip]
-            matched_velocities = _matched_peak_average_velocities(causal_peaks, acausal_peaks, st.distance;
-                                                                  velocity_tolerance_fraction=velocity_tolerance_fraction)
-            for velocity in matched_velocities
-                isfinite(velocity) && velocity > 0.0 || continue
-                push!(period_candidates[ip], _ConsensusCandidate(velocity, istate, corr))
-                push!(candidate_velocities[ip], velocity)
-            end
-        end
-    end
-
-    period_clusters = [_cluster_consensus_candidates(period_candidates[ip], nstates;
-                                                     cluster_tolerance_fraction=cluster_tol)
-                       for ip in 1:nperiods]
-    candidate_cluster_index = _select_smooth_consensus_candidate_branches(period_clusters;
-                                                                          max_candidates=max_candidates,
-                                                                          min_support=min_support,
-                                                                          min_confidence=min_confidence,
-                                                                          smoothness_weight=smoothness_weight,
-                                                                          max_smooth_jump_fraction=max_smooth_jump_fraction,
-                                                                          max_gap_periods=max_gap_periods,
-                                                                          selection_mode=selection_mode)
-    selected_cluster_index = vec(candidate_cluster_index[:, 1])
-
-    group_velocities = fill(NaN, nperiods)
-    arrival_times = fill(NaN, nperiods)
-    confidence = fill(0.0, nperiods)
-    support = zeros(Int, nperiods)
-    candidate_group_velocities = fill(NaN, nperiods, max_candidates)
-    candidate_arrival_times = fill(NaN, nperiods, max_candidates)
-    candidate_confidence = fill(0.0, nperiods, max_candidates)
-    candidate_support = zeros(Int, nperiods, max_candidates)
-    accepted_candidate_velocities = [Float64[] for _ in 1:nperiods]
-    rejected_candidate_velocities = [copy(candidate_velocities[ip]) for ip in 1:nperiods]
-
-    for icand in 1:max_candidates
-        for ip in 1:nperiods
-            j = candidate_cluster_index[ip, icand]
-            j == 0 && continue
-
-            cluster = period_clusters[ip][j]
-            candidate_group_velocities[ip, icand] = cluster.velocity
-            candidate_confidence[ip, icand] = cluster.confidence
-            candidate_support[ip, icand] = cluster.support
-
-            if isfinite(distance_ref) && distance_ref > 0.0 && isfinite(cluster.velocity) && cluster.velocity > 0.0
-                candidate_arrival_times[ip, icand] = distance_ref / cluster.velocity
-            end
-        end
-    end
-
-    candidate_counts = [count(v -> isfinite(v) && v > 0.0, candidate_group_velocities[:, icand])
-                        for icand in 1:max_candidates]
-    for icand in 1:max_candidates
-        if candidate_counts[icand] < min_candidate_periods
-            candidate_group_velocities[:, icand] .= NaN
-            candidate_arrival_times[:, icand] .= NaN
-            candidate_confidence[:, icand] .= 0.0
-            candidate_support[:, icand] .= 0
-            candidate_cluster_index[:, icand] .= 0
-        end
-    end
-
-    candidate_counts = [count(v -> isfinite(v) && v > 0.0, candidate_group_velocities[:, icand])
-                        for icand in 1:max_candidates]
-    candidate_medians = [_median_sorted([v for v in candidate_group_velocities[:, icand] if isfinite(v) && v > 0.0])
-                         for icand in 1:max_candidates]
-    candidate_mean_conf = [_mean_finite([v for v in candidate_confidence[:, icand] if isfinite(v) && v > 0.0])
-                           for icand in 1:max_candidates]
-    for icand in 1:max_candidates
-        isnan(candidate_medians[icand]) && (candidate_medians[icand] = Inf)
-        isnan(candidate_mean_conf[icand]) && (candidate_mean_conf[icand] = 0.0)
-    end
-
-    order = if selection_mode == :low_velocity
-        sortperm(1:max_candidates, by=icand -> (-candidate_counts[icand],
-                                                candidate_medians[icand],
-                                                -candidate_mean_conf[icand]))
-    else
-        sortperm(1:max_candidates, by=icand -> (-candidate_counts[icand],
-                                                -candidate_mean_conf[icand],
-                                                candidate_medians[icand]))
-    end
-
-    candidate_group_velocities = candidate_group_velocities[:, order]
-    candidate_arrival_times = candidate_arrival_times[:, order]
-    candidate_confidence = candidate_confidence[:, order]
-    candidate_support = candidate_support[:, order]
-    candidate_cluster_index = candidate_cluster_index[:, order]
-
-    for ip in 1:nperiods
-        group_velocities[ip] = candidate_group_velocities[ip, 1]
-        arrival_times[ip] = candidate_arrival_times[ip, 1]
-        confidence[ip] = candidate_confidence[ip, 1]
-        support[ip] = candidate_support[ip, 1]
-
-        accepted_all = Set{Int}()
-        for icand in 1:max_candidates
-            j = candidate_cluster_index[ip, icand]
-            j == 0 && continue
-            union!(accepted_all, period_clusters[ip][j].candidate_indices)
-        end
-
-        accepted_candidate_velocities[ip] = [period_candidates[ip][k].velocity for k in sort(collect(accepted_all))]
-        rejected_candidate_velocities[ip] = [period_candidates[ip][k].velocity
-                                             for k in eachindex(period_candidates[ip])
-                                             if !(k in accepted_all)]
-    end
-
-    return SourceStateConsensusPick(result.periods, group_velocities, arrival_times,
-                                    confidence, support, candidate_velocities,
-                                    accepted_candidate_velocities, rejected_candidate_velocities,
-                                    selected_cluster_index,
-                                    candidate_group_velocities, candidate_arrival_times,
-                                    candidate_confidence, candidate_support,
-                                    candidate_cluster_index)
-end
-
-# ╔═╡ a669a82b-b147-45d8-bf4e-c2e4d97c1bd3
-"""
-    plot_consensus_groupvelocity_picks(batch_result, consensus_result; ...)
-
-Plot all causal/acausal-matched source-state candidates as faint markers and
-overlay the accepted OR-style source-state consensus group-velocity curve.
-"""
-function plot_consensus_groupvelocity_picks(batch_result::BranchBatchAnalysisResult,
-                                            consensus_result::SourceStateConsensusPick;
-                                            correlation_threshold::Float64=0.85,
-                                            velocity_tolerance_fraction::Float64=0.10,
-                                            colorscale::String="Viridis",
-                                            width::Int=1200,
-                                            height::Int=700,
-                                            font_family::String="Arial, sans-serif",
-                                            font_size::Int=13,
-                                            title::String="Source-State Consensus Group-Velocity Picks")
-    nperiods = length(consensus_result.periods)
-    nstates = length(batch_result.state_results)
-    state_colors = _sample_scheme_colors(colorscale, max(nstates, 2))
-    traces = [scatter()]
-    all_vels = Float64[]
-
-    for istate in 1:nstates
-        xp = Float64[]
-        yp = Float64[]
-        cp = Float64[]
-        label = batch_result.state_labels[istate]
-
-        for ip in 1:nperiods
-            st = batch_result.state_results[istate]
-            corr = st.branch_correlation[ip]
-            (isfinite(corr) && corr >= correlation_threshold) || continue
-            causal_peaks = st.causal_result.all_peaks[ip]
-            acausal_peaks = st.acausal_result.all_peaks[ip]
-            matched_velocities = _matched_peak_average_velocities(causal_peaks, acausal_peaks, st.distance;
-                                                                  velocity_tolerance_fraction=velocity_tolerance_fraction)
-            for velocity in matched_velocities
-                isfinite(velocity) && velocity > 0.0 || continue
-                push!(xp, consensus_result.periods[ip])
-                push!(yp, velocity)
-                push!(cp, corr)
-                push!(all_vels, velocity)
-            end
-        end
-
-        isempty(xp) && continue
-        push!(traces, scatter(
-            x=xp,
-            y=yp,
-            mode="markers",
-            marker=attr(size=6, color=state_colors[istate], opacity=0.28, symbol="circle"),
-            name="$(label) candidates",
-            hovertemplate="State: $(label)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
-            customdata=cp
-        ))
-    end
-
-    candidate_colors = ["#111111", "#d62728", "#1f77b4", "#2ca02c", "#9467bd"]
-    ncandidates = size(consensus_result.candidate_group_velocities, 2)
-
-    for icand in 1:ncandidates
-        vels = consensus_result.candidate_group_velocities[:, icand]
-        valid = findall(v -> isfinite(v) && v > 0.0, vels)
-        isempty(valid) && continue
-
-        append!(all_vels, vels[valid])
-        marker_sizes = [8 + 3 * consensus_result.candidate_support[ip, icand] for ip in valid]
-        custom = [[consensus_result.candidate_confidence[ip, icand],
-                   consensus_result.candidate_support[ip, icand],
-                   icand] for ip in valid]
-        color = candidate_colors[mod1(icand, length(candidate_colors))]
-
-        push!(traces, scatter(
-            x=consensus_result.periods,
-            y=vels,
-            mode="lines+markers",
-            connectgaps=false,
-            line=attr(color=color, width=icand == 1 ? 3.0 : 2.2, dash=icand == 1 ? "solid" : "dash"),
-            marker=attr(
-                size=[isfinite(vels[ip]) && vels[ip] > 0.0 ? 8 + 3 * consensus_result.candidate_support[ip, icand] : 0 for ip in 1:nperiods],
-                color=consensus_result.candidate_confidence[:, icand],
-                colorscale="Viridis",
-                cmin=0.0,
-                cmax=1.0,
-                colorbar=icand == 1 ? attr(title="Confidence") : nothing,
-                symbol=icand == 1 ? "diamond" : "circle",
-                line=attr(color="white", width=1.0)
-            ),
-            name="Consensus candidate $(icand)",
-            hovertemplate="Consensus candidate %{customdata[2]}<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Confidence: %{customdata[0]:.3f}<br>Support: %{customdata[1]} states<extra></extra>",
-            customdata=[[consensus_result.candidate_confidence[ip, icand],
-                         consensus_result.candidate_support[ip, icand],
-                         icand] for ip in 1:nperiods]
-        ))
-    end
-
-    if length(traces) == 1 || isempty(all_vels)
-        @warn "No source-state consensus candidates available"
-        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No consensus candidates"]))
-    end
-
-    y_min = 0.9 * minimum(all_vels)
-    y_max = 1.1 * maximum(all_vels)
-
-    layout = Layout(
-        title=attr(text=title, font=attr(size=font_size + 2, family=font_family)),
-        xaxis=attr(title="Period (s)", type="linear", range=[minimum(consensus_result.periods), maximum(consensus_result.periods)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        yaxis=attr(title="Group Velocity (km/s)", range=[y_min, y_max], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        width=width,
-        height=height,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        margin=attr(l=80, r=120, t=80, b=80),
-        showlegend=true,
-        legend=attr(x=1.02, y=1.0, font=attr(size=font_size - 2), bgcolor="rgba(255,255,255,0.8)", borderwidth=1)
-    )
-
-    return PlutoPlotly.plot(traces, layout)
-end
-
-# ╔═╡ 6e91e0bb-ef16-48bc-a9c9-f5b2d691ee1a
-"""
-    ReceiverPairGeometry
-
-Endpoint and ray-path summary for one receiver pair.
-"""
-struct ReceiverPairGeometry
-    station1::String
-    station2::String
-    lat1::Float64
-    lon1::Float64
-    lat2::Float64
-    lon2::Float64
-    midpoint_lat::Float64
-    midpoint_lon::Float64
-    distance_km::Float64
-    azimuth_deg::Float64
-end
-
-# ╔═╡ 19ac99e3-f2b0-4d78-af7d-b688d548724b
-"""
-    PairConsensusForTomography
-
-Geometry plus source-state consensus candidates for one receiver pair.
-"""
-struct PairConsensusForTomography
-    label::String
-    pair::Tuple{String,String}
-    geometry::ReceiverPairGeometry
-    consensus::SourceStateConsensusPick
-end
-
-# ╔═╡ c50a86d5-7f3e-4d03-9583-0a33a238e227
-"""
-    TomographyCandidateMix
-
-One candidate curve for tomography. `candidate_indices` may contain several
-non-overlapping consensus candidate columns from the same receiver pair.
-"""
-struct TomographyCandidateMix
-    pair_index::Int
-    label::String
-    candidate_indices::Vector{Int}
-    group_velocities::Vector{Float64}
-    confidence::Vector{Float64}
-    support::Vector{Int}
-    coverage_count::Int
-    mean_confidence::Float64
-    neighbor_agreement::Float64
-    total_score::Float64
-end
-
-# ╔═╡ b2460f88-a89c-4402-a3ee-6f9190624932
-function _haversine_km(lat1::Real, lon1::Real, lat2::Real, lon2::Real)
-    r = 6371.0
-    φ1, φ2 = deg2rad(Float64(lat1)), deg2rad(Float64(lat2))
-    dφ = deg2rad(Float64(lat2 - lat1))
-    dλ = deg2rad(Float64(lon2 - lon1))
-    a = sin(dφ / 2)^2 + cos(φ1) * cos(φ2) * sin(dλ / 2)^2
-    return 2.0 * r * asin(min(1.0, sqrt(a)))
-end
-
-# ╔═╡ 9da0699a-8146-44b7-8eef-89f3e7cf6882
-function _azimuth_deg(lat1::Real, lon1::Real, lat2::Real, lon2::Real)
-    φ1, φ2 = deg2rad(Float64(lat1)), deg2rad(Float64(lat2))
-    dλ = deg2rad(Float64(lon2 - lon1))
-    y = sin(dλ) * cos(φ2)
-    x = cos(φ1) * sin(φ2) - sin(φ1) * cos(φ2) * cos(dλ)
-    return mod(rad2deg(atan(y, x)) + 360.0, 360.0)
-end
-
-# ╔═╡ b67deee3-1244-4f49-81bd-05c86b0c9084
-function _axial_angle_difference_deg(a::Real, b::Real)
-    d = abs(mod(Float64(a - b) + 180.0, 360.0) - 180.0)
-    return min(d, 180.0 - d)
-end
-
-# ╔═╡ 40e5fc55-8f4e-43fa-8ac7-eaa9608a18c7
-function receiver_pair_geometry(pair::Tuple{<:AbstractString,<:AbstractString},
-                                latitudes::AbstractVector{<:Real},
-                                longitudes::AbstractVector{<:Real};
-                                distance::Union{Nothing,Real}=nothing)
-    length(latitudes) >= 2 || throw(ArgumentError("latitudes must contain two endpoints"))
-    length(longitudes) >= 2 || throw(ArgumentError("longitudes must contain two endpoints"))
-
-    lat1, lat2 = Float64(latitudes[1]), Float64(latitudes[2])
-    lon1, lon2 = Float64(longitudes[1]), Float64(longitudes[2])
-    midpoint_lat = 0.5 * (lat1 + lat2)
-    midpoint_lon = 0.5 * (lon1 + lon2)
-    dist = isnothing(distance) ? _haversine_km(lat1, lon1, lat2, lon2) : Float64(distance)
-    az = _azimuth_deg(lat1, lon1, lat2, lon2)
-
-    return ReceiverPairGeometry(String(pair[1]), String(pair[2]),
-                                lat1, lon1, lat2, lon2,
-                                midpoint_lat, midpoint_lon, dist, az)
-end
-
-# ╔═╡ f203a997-875b-42df-a0af-196d11e7c0af
-function tomography_pair_consensus(pair::Tuple{<:AbstractString,<:AbstractString},
-                                   consensus::SourceStateConsensusPick;
-                                   latitudes,
-                                   longitudes,
-                                   distance=nothing,
-                                   label::Union{Nothing,String}=nothing)
-    geom = receiver_pair_geometry(pair, latitudes, longitudes; distance=distance)
-    lbl = isnothing(label) ? "$(pair[1])-$(pair[2])" : label
-    return PairConsensusForTomography(lbl, (String(pair[1]), String(pair[2])), geom, consensus)
-end
-
-# ╔═╡ a05f6476-568b-4c82-9512-f74ae6d6c8f3
-function similar_ray_paths(a::ReceiverPairGeometry, b::ReceiverPairGeometry;
-                           midpoint_radius_km::Float64=75.0,
-                           azimuth_tolerance_deg::Float64=25.0,
-                           distance_tolerance_fraction::Float64=0.35)
-    mid_dist = _haversine_km(a.midpoint_lat, a.midpoint_lon, b.midpoint_lat, b.midpoint_lon)
-    az_diff = _axial_angle_difference_deg(a.azimuth_deg, b.azimuth_deg)
-    dist_rel = abs(a.distance_km - b.distance_km) / max((a.distance_km + b.distance_km) / 2.0, eps(Float64))
-    return mid_dist <= midpoint_radius_km &&
-           az_diff <= azimuth_tolerance_deg &&
-           dist_rel <= distance_tolerance_fraction
-end
-
-# ╔═╡ 730cd90e-9afe-413a-ae31-fe624a919bb8
-function _nonoverlapping_candidate_sets(consensus::SourceStateConsensusPick;
-                                        max_mix_parts::Int=3,
-                                        min_candidate_periods::Int=2)
-    ncandidates = size(consensus.candidate_group_velocities, 2)
-    valid_masks = [isfinite.(consensus.candidate_group_velocities[:, i]) .&
-                   (consensus.candidate_group_velocities[:, i] .> 0.0)
-                   for i in 1:ncandidates]
-    valid_indices = [i for i in 1:ncandidates if count(valid_masks[i]) >= min_candidate_periods]
-    mixes = Vector{Vector{Int}}()
-
-    function extend!(current::Vector{Int}, start_pos::Int, used_mask::BitVector)
-        !isempty(current) && push!(mixes, copy(current))
-        length(current) >= max_mix_parts && return
-        for pos in start_pos:length(valid_indices)
-            idx = valid_indices[pos]
-            any(used_mask .& valid_masks[idx]) && continue
-            push!(current, idx)
-            extend!(current, pos + 1, used_mask .| valid_masks[idx])
-            pop!(current)
-        end
-    end
-
-    extend!(Int[], 1, falses(length(consensus.periods)))
-    return mixes
-end
-
-# ╔═╡ eab08182-daca-4206-882b-e4fb24ae17a2
-function _build_mix_curve(consensus::SourceStateConsensusPick, candidate_indices::Vector{Int})
-    nperiods = length(consensus.periods)
-    velocities = fill(NaN, nperiods)
-    confidence = fill(0.0, nperiods)
-    support = zeros(Int, nperiods)
-
-    for idx in candidate_indices
-        vals = consensus.candidate_group_velocities[:, idx]
-        mask = isfinite.(vals) .& (vals .> 0.0)
-        velocities[mask] .= vals[mask]
-        confidence[mask] .= consensus.candidate_confidence[mask, idx]
-        support[mask] .= consensus.candidate_support[mask, idx]
-    end
-
-    return velocities, confidence, support
-end
-
-# ╔═╡ c6331917-8167-4dfa-9a50-6fe0888d16d5
-function _neighbor_agreement(mix::TomographyCandidateMix,
-                             all_mixes::Vector{TomographyCandidateMix},
-                             pairs::Vector{PairConsensusForTomography};
-                             midpoint_radius_km::Float64=75.0,
-                             azimuth_tolerance_deg::Float64=25.0,
-                             distance_tolerance_fraction::Float64=0.35,
-                             velocity_tolerance_fraction::Float64=0.10)
-    geom = pairs[mix.pair_index].geometry
-    total = 0
-    agree = 0
-
-    for ip in eachindex(mix.group_velocities)
-        v = mix.group_velocities[ip]
-        isfinite(v) && v > 0.0 || continue
-        total += 1
-        period_agrees = false
-
-        for other in all_mixes
-            other.pair_index == mix.pair_index && continue
-            similar_ray_paths(geom, pairs[other.pair_index].geometry;
-                              midpoint_radius_km=midpoint_radius_km,
-                              azimuth_tolerance_deg=azimuth_tolerance_deg,
-                              distance_tolerance_fraction=distance_tolerance_fraction) || continue
-            vo = other.group_velocities[ip]
-            isfinite(vo) && vo > 0.0 || continue
-            if _relative_difference(v, vo) <= velocity_tolerance_fraction
-                period_agrees = true
-                break
-            end
-        end
-
-        period_agrees && (agree += 1)
-    end
-
-    total == 0 && return 0.0
-    return agree / total
-end
-
-# ╔═╡ 3626d6ca-38f2-4b38-9398-9cd052f43950
-"""
-    tomography_candidate_mixes(pairs; kwargs...) -> Vector{TomographyCandidateMix}
-
-Create and score tomography-ready candidate curves from per-pair consensus
-results. Each output can be one consensus candidate or a non-overlapping mix of
-candidate columns from the same receiver pair. Scores prefer period coverage,
-confidence/support, and agreement with geometrically similar ray paths.
-"""
-function tomography_candidate_mixes(pairs::Vector{PairConsensusForTomography};
-                                    max_mix_parts::Int=3,
-                                    min_candidate_periods::Int=2,
-                                    midpoint_radius_km::Float64=75.0,
-                                    azimuth_tolerance_deg::Float64=25.0,
-                                    distance_tolerance_fraction::Float64=0.35,
-                                    velocity_tolerance_fraction::Float64=0.10,
-                                    coverage_weight::Float64=1.0,
-                                    confidence_weight::Float64=0.5,
-                                    support_weight::Float64=0.25,
-                                    neighbor_weight::Float64=1.0)
-    mixes = TomographyCandidateMix[]
-
-    for (pair_index, item) in enumerate(pairs)
-        candidate_sets = _nonoverlapping_candidate_sets(item.consensus;
-                                                        max_mix_parts=max_mix_parts,
-                                                        min_candidate_periods=min_candidate_periods)
-        for candidate_indices in candidate_sets
-            velocities, confidence, support = _build_mix_curve(item.consensus, candidate_indices)
-            coverage = count(v -> isfinite(v) && v > 0.0, velocities)
-            coverage >= min_candidate_periods || continue
-            mean_conf = _mean_finite([c for c in confidence if c > 0.0])
-            isfinite(mean_conf) || (mean_conf = 0.0)
-            label = "$(item.label) | candidates $(join(candidate_indices, "+"))"
-            push!(mixes, TomographyCandidateMix(pair_index, label, candidate_indices,
-                                                velocities, confidence, support,
-                                                coverage, mean_conf, 0.0, 0.0))
-        end
-    end
-
-    scored = TomographyCandidateMix[]
-    max_coverage = maximum([m.coverage_count for m in mixes]; init=1)
-    max_support = maximum([maximum(m.support; init=0) for m in mixes]; init=1)
-
-    for mix in mixes
-        neighbor = _neighbor_agreement(mix, mixes, pairs;
-                                       midpoint_radius_km=midpoint_radius_km,
-                                       azimuth_tolerance_deg=azimuth_tolerance_deg,
-                                       distance_tolerance_fraction=distance_tolerance_fraction,
-                                       velocity_tolerance_fraction=velocity_tolerance_fraction)
-        support_score = _mean_finite([s / max_support for s in mix.support if s > 0])
-        isfinite(support_score) || (support_score = 0.0)
-        total = coverage_weight * (mix.coverage_count / max_coverage) +
-                confidence_weight * mix.mean_confidence +
-                support_weight * support_score +
-                neighbor_weight * neighbor
-
-        push!(scored, TomographyCandidateMix(mix.pair_index, mix.label, mix.candidate_indices,
-                                             mix.group_velocities, mix.confidence, mix.support,
-                                             mix.coverage_count, mix.mean_confidence, neighbor, total))
-    end
-
-    sort!(scored, by=m -> -m.total_score)
-    return scored
 end
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
@@ -4689,7 +3825,6 @@ version = "17.7.0+0"
 # ╠═fcf48627-0b80-4c6b-b204-f40da981aaa5
 # ╠═d5ca213a-b085-4d65-88fa-d221bf5826e1
 # ╠═4192fcef-4662-4944-b354-71e8e00285b1
-# ╠═2c1a711e-261e-4e82-ade2-2fb6bc0e6b93
 # ╠═e9bfb21b-f29d-410f-827f-e66d1117020f
 # ╠═f71ee0c9-1e34-49c2-9385-4589c561f4e4
 # ╠═aae31a73-fef6-48dc-a2b8-fb9b12c03099
@@ -4751,31 +3886,5 @@ version = "17.7.0+0"
 # ╠═d10d4b32-4e4e-4198-b08d-084dffeb3694
 # ╠═95f715de-a6aa-4ec5-a2ce-4f7bb241ce34
 # ╠═c9597868-5ae3-4629-b96d-d25f9a7d316d
-# ╠═a079a952-8252-4f56-a4c7-2a9ae58e0f11
-# ╠═f2c83612-d161-4fef-a728-c2dcbfa48b1c
-# ╠═1c36878c-f684-46a8-a2ab-4203a01d0169
-# ╠═7f9cbf19-46b3-403b-90f8-a4591fd5ef4f
-# ╠═f7f4e17f-0784-43db-9a6b-c2b07a963f94
-# ╠═c17d7f26-3d82-44b8-860c-b12df0bf9293
-# ╠═1a7d4cbb-a1ea-4319-a404-2293faf72069
-# ╠═c7600895-0b53-477d-aaca-19925dec0d91
-# ╠═07914f7d-70fb-477d-bb05-dfa2a68d03ff
-# ╠═2e76ea52-ad8e-4f32-9b01-b88d7d1163f9
-# ╠═bdccfc35-4436-4716-a868-bec5a18317d3
-# ╠═0eed3963-d6e2-4c6d-938b-7e233811364c
-# ╠═a669a82b-b147-45d8-bf4e-c2e4d97c1bd3
-# ╠═6e91e0bb-ef16-48bc-a9c9-f5b2d691ee1a
-# ╠═19ac99e3-f2b0-4d78-af7d-b688d548724b
-# ╠═c50a86d5-7f3e-4d03-9583-0a33a238e227
-# ╠═b2460f88-a89c-4402-a3ee-6f9190624932
-# ╠═9da0699a-8146-44b7-8eef-89f3e7cf6882
-# ╠═b67deee3-1244-4f49-81bd-05c86b0c9084
-# ╠═40e5fc55-8f4e-43fa-8ac7-eaa9608a18c7
-# ╠═f203a997-875b-42df-a0af-196d11e7c0af
-# ╠═a05f6476-568b-4c82-9512-f74ae6d6c8f3
-# ╠═730cd90e-9afe-413a-ae31-fe624a919bb8
-# ╠═eab08182-daca-4206-882b-e4fb24ae17a2
-# ╠═c6331917-8167-4dfa-9a50-6fe0888d16d5
-# ╠═3626d6ca-38f2-4b38-9398-9cd052f43950
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002

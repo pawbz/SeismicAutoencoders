@@ -30,6 +30,12 @@ end
 # ╔═╡ 96817feb-6aa9-4f35-9277-9a4560e9a2a7
 using FFTW, Peaks, ColorSchemes, Colors, InlineStrings
 
+# ╔═╡ b30b5f82-cbeb-41aa-9a4f-212d6aafa760
+using Zygote
+
+# ╔═╡ e0c79630-dbe0-4110-b880-a9ee9e4e1186
+using Distances
+
 # ╔═╡ bdeb2eb2-6b5d-4677-837c-7072e3588430
 begin
     using ConcreteStructs,
@@ -57,10 +63,12 @@ trained source states to MFT.
 """
 
 # ╔═╡ 10000003-0000-0000-0000-000000000001
-begin
+
     vqvae = @ingredients("/mnt/NAS/EQData/SeismicAutoencoders/VQVAE_architecture_v7.jl")
-    mft = @ingredients("/mnt/NAS/EQData/SeismicAutoencoders/MFT.jl")
-end
+
+
+# ╔═╡ 22ef4df8-9962-4443-aa48-cbc4bd5ddb59
+ mft = @ingredients("/mnt/NAS/EQData/SeismicAutoencoders/MFT.jl")
 
 # ╔═╡ 10000004-0000-0000-0000-000000000001
 md"## Data and Pair Selection"
@@ -69,29 +77,8 @@ md"## Data and Pair Selection"
 begin
     data_filepath = "/mnt/NAS2/Sanket_data/California_TO_with_latlong/"
     dt = 1.0
-    period_min = 10
-    period_max = 50
-end
-
-# ╔═╡ 10000006-0000-0000-0000-000000000001
-available_pairs = vqvae.list_station_pairs(data_filepath)
-
-# ╔═╡ 10000007-0000-0000-0000-000000000001
-begin
-    isempty(available_pairs) && error("No station pairs found in $(data_filepath)")
-    pair_options = ["$(p[1])-$(p[2])" for p in available_pairs]
-    default_pair_names = pair_options[1:min(end, 1)]
-    @bind selected_pair_names confirm(MultiCheckBox(pair_options; default=default_pair_names))
-end
-
-# ╔═╡ 10000008-0000-0000-0000-000000000001
-selected_pairs = begin
-    isempty(selected_pair_names) && error("Select at least one station pair.")
-    [begin
-        parts = split(name, "-", limit=2)
-        length(parts) == 2 || error("Invalid pair name $(name).")
-        (String(parts[1]), String(parts[2]))
-    end for name in selected_pair_names]
+    period_min = 3
+    period_max = 6
 end
 
 # ╔═╡ 10000009-0000-0000-0000-000000000001
@@ -99,31 +86,30 @@ md"## Hyperparameters"
 
 # ╔═╡ 1000000a-0000-0000-0000-000000000001
 vqvae_parameters = (;
-    d=20,
+    d=24,
     beta_commit=0.25f0,
-    K=[5],
-    ema_decay=0.999f0,
+    K=[5, 64],
+    ema_decay=0.99f0,
     enc_kernels=[64, 32, 16, 8],
-    enc_strides=[1, 2, 1, 2],
+    enc_strides=[1, 2, 5, 2],
+    use_bn=true,
     dead_threshold=50,
     entropy_weight=0.1f0,
     reconstruction_loss=:l2,
     velocity_range=(1.0, 8.0),
-    envelope_floor=1.0f0,
 )
 
 # ╔═╡ 1000000b-0000-0000-0000-000000000001
 training_para = vqvae.VQVAE_Training_Para(
     batchsize=512,
     nepoch=100,
-    initial_learning_rate=0.01,
+    initial_learning_rate=0.001,
     weight_decay=0.0,
-    Mnn_schedule=[(1, 10, :median), (6, 10, :mean), (26, 10, :mean)],
-    warmup_epochs=1,
-    index_refresh_every=1,
-    latent_index_batch_size=256,
-    latent_index_space=:z_e,
-    compile_reactant=false,
+    Mnn_schedule=[(1, 20), (6, 20), (26, 20)],
+    warmup_epochs=0,
+	verbose = true,
+	knn_search_chunk_size_fraction = 0.25,
+    index_refresh_every=2,
 )
 
 # ╔═╡ 1000000c-0000-0000-0000-000000000002
@@ -134,6 +120,59 @@ md"## Train"
 
 # ╔═╡ 1000000d-0000-0000-0000-000000000001
 @bind train_button CounterButton("Train selected pairs")
+
+# ╔═╡ 1000000f-0000-0000-0000-000000000001
+md"## Inspect One Result"
+
+# ╔═╡ 10000015-0000-0000-0000-000000000001
+md"## Source-State Averages and MFT"
+
+# ╔═╡ b00b61c7-81c6-467a-b8bd-9f9e2ebd4d0c
+result_title_context(result) = begin
+    pair = result.pair
+    distance_label = isnothing(result.data_bundle.distance) ?
+        "distance unavailable" : "$(round(Int, result.data_bundle.distance))km"
+    "$(pair[1])-$(pair[2]) $(distance_label) $(period_min)-$(period_max)s"
+end
+
+# ╔═╡ 9c18f181-8d76-46a4-836d-c4fe2cad19c8
+function list_station_pairs(filepath::String)
+    files = readdir(filepath)
+    pairs = Set{Tuple{String,String}}()
+    for f in files
+        m = match(r"^([A-Za-z0-9]+)_([A-Za-z0-9]+)", basename(f))
+        m === nothing && continue
+        push!(pairs, (m.captures[1], m.captures[2]))
+    end
+    return sort!(collect(pairs), by=x -> (x[1], x[2]))
+end
+
+# ╔═╡ 10000006-0000-0000-0000-000000000001
+available_pairs = list_station_pairs(data_filepath)
+
+# ╔═╡ 10000007-0000-0000-0000-000000000001
+begin
+    isempty(available_pairs) && error("No station pairs found in $(data_filepath)")
+    pair_options = ["$(p[1])-$(p[2])" for p in available_pairs]
+    default_pair_names = pair_options[1:min(end, 1)]
+    
+end
+
+# ╔═╡ 0bf6c416-bf64-4b2a-b55e-623a4f9daae2
+@bind selected_pair_names confirm(MultiCheckBox(pair_options; default=default_pair_names))
+
+# ╔═╡ 272932ae-4c54-41a2-8c9a-e1cd4834150a
+selected_pair_names
+
+# ╔═╡ 10000008-0000-0000-0000-000000000001
+selected_pairs = begin
+    isempty(selected_pair_names) && error("Select at least one station pair.")
+    [begin
+        parts = split(name, "-", limit=2)
+        length(parts) == 2 || error("Invalid pair name $(name).")
+        (String(parts[1]), String(parts[2]))
+    end for name in selected_pair_names]
+end
 
 # ╔═╡ 1000000e-0000-0000-0000-000000000001
 train_results = let
@@ -155,32 +194,47 @@ train_results = let
     end
 end
 
-# ╔═╡ 1000000f-0000-0000-0000-000000000001
-md"## Inspect One Result"
+# ╔═╡ df5f4bce-e77e-4a8a-9446-c1d3d14b92b0
+train_results
 
 # ╔═╡ 10000010-0000-0000-0000-000000000001
-selected_result = isnothing(train_results) ? nothing : first(train_results)
+selected_result_options = if isnothing(train_results)
+    String[]
+else
+    ["$(i). $(result_title_context(result))" for (i, result) in enumerate(train_results)]
+end
+
+# ╔═╡ 3c23d4cb-4bf9-4b4b-a57f-fefdc8f29cf1
+selected_result_label_ui = @bind selected_result_label Select(
+    isempty(selected_result_options) ? ["No training results"] : selected_result_options
+)
+
+# ╔═╡ 928d4238-216b-4f62-a4d7-62075275252b
+selected_result_label_ui
+
+# ╔═╡ 3ef20afc-4c62-4aab-b96f-4e170f8d96dc
+selected_result_label_ui
+
+# ╔═╡ f41c2e62-efbf-47c8-8b7e-adf828ffde4f
+selected_result = begin
+    idx = findfirst(==(selected_result_label), selected_result_options)
+    isnothing(train_results) || isnothing(idx) ? nothing : train_results[idx]
+end
 
 # ╔═╡ 10000011-0000-0000-0000-000000000001
 if isnothing(selected_result)
     md"Press **Train selected pairs** to create v7 runs."
 else
     WideCell(vqvae.plot_training_dashboard(selected_result.loss_history;
-        title="VQ-VAE v7 $(selected_result.pair[1])-$(selected_result.pair[2])"))
-end
-
-# ╔═╡ 10000012-0000-0000-0000-000000000001
-if isnothing(selected_result)
-    md""
-else
-    WideCell(vqvae.plot_envelope(selected_result.para))
+        title="VQ-VAE v7 Training Dashboard ($(result_title_context(selected_result)))"))
 end
 
 # ╔═╡ 10000013-0000-0000-0000-000000000001
 if isnothing(selected_result)
     md""
 else
-    WideCell(vqvae.plot_codebook_heatmap(selected_result.st; stage=1))
+    WideCell(vqvae.plot_codebook_heatmap(selected_result.st; stage=1,
+        title="RVQ Stage 1 Codebook ($(result_title_context(selected_result)))"))
 end
 
 # ╔═╡ 10000014-0000-0000-0000-000000000001
@@ -195,12 +249,9 @@ else
         nsamples=8,
         dt=dt,
         device=training_device,
-        title="Acausal reconstructions $(selected_result.pair[1])-$(selected_result.pair[2])",
+        title="Acausal Reconstruction Examples ($(result_title_context(selected_result)))",
     ))
 end
-
-# ╔═╡ 10000015-0000-0000-0000-000000000001
-md"## Source-State Averages and MFT"
 
 # ╔═╡ 10000016-0000-0000-0000-000000000001
 state_averages = if isnothing(selected_result)
@@ -219,19 +270,172 @@ end
 if isnothing(state_averages)
     md""
 else
-    vqvae.plot_state_average_matrix(state_averages.acausal;
-        title="Acausal source-state averages", dt=dt, reverse_time=false)
+    WideCell(vqvae.plot_state_average_matrix(state_averages.acausal;
+        title="Acausal Source-State Averages ($(result_title_context(selected_result)))",
+        dt=dt, reverse_time=false))
 end
 
 # ╔═╡ 10000018-0000-0000-0000-000000000001
 if isnothing(state_averages)
     md""
 else
-    vqvae.plot_state_average_matrix(state_averages.causal;
-        title="Causal source-state averages", dt=dt, reverse_time=false)
+    WideCell(vqvae.plot_state_average_matrix(state_averages.causal;
+        title="Causal Source-State Averages ($(result_title_context(selected_result)))",
+        dt=dt, reverse_time=false))
+end
+
+# ╔═╡ b11c9e24-6593-497c-a706-146619251e36
+if isnothing(selected_result) || isnothing(state_averages)
+    md""
+else
+    let
+        cluster_avg_ac = state_averages.acausal
+        cluster_avg_c = state_averages.causal
+        nth = size(cluster_avg_ac, 1)
+        t_neg = [-(nth - i + 1) * dt for i in 1:nth]
+        t_pos = [i * dt for i in 1:nth]
+        t_full = [t_neg; t_pos]
+
+        global_avg_ac = vec(mean(selected_result.data.D_ac_all; dims=2))
+        global_avg_c = vec(mean(selected_result.data.D_c_all; dims=2))
+        global_full = [reverse(global_avg_ac); global_avg_c]
+        global_ac0 = global_avg_ac .- mean(global_avg_ac)
+        global_c0 = global_avg_c .- mean(global_avg_c)
+        global_ncc = dot(global_ac0, global_c0) / ((norm(global_ac0) * norm(global_c0)) + 1f-8)
+
+        combo_labels_local = string.(1:size(cluster_avg_ac, 2))
+        ncomb = length(combo_labels_local)
+        traces = AbstractTrace[]
+        colors = begin
+            nc = max(ncomb, 1)
+            cs = ColorSchemes.rainbow
+            [Colors.hex(get(cs, (i - 1) / max(1, nc - 1))) for i in 1:nc]
+        end
+
+        total_ac = size(selected_result.data.D_ac_all, 2)
+        total_c = size(selected_result.data.D_c_all, 2)
+        amp_peak = maximum(abs.(vcat(vec(cluster_avg_ac), vec(cluster_avg_c), global_full)))
+        vertical_spacing = amp_peak * 2.5 + 1f-3
+
+        for combo_idx in 1:ncomb
+            c = colors[mod1(combo_idx, length(colors))]
+            a = cluster_avg_ac[:, combo_idx]
+            b = cluster_avg_c[:, combo_idx]
+            full_k = [reverse(a); b]
+            a0 = a .- mean(a)
+            b0 = b .- mean(b)
+            ncc = dot(a0, b0) / ((norm(a0) * norm(b0)) + 1f-8)
+            pct_ac = 100 * state_averages.counts_ac[combo_idx] / max(total_ac, 1)
+            pct_c = 100 * state_averages.counts_c[combo_idx] / max(total_c, 1)
+            legend_label = "State $(combo_labels_local[combo_idx]) (ac: $(round(pct_ac; digits=1))%, c: $(round(pct_c; digits=1))%, corr=$(round(ncc; digits=3)))"
+            offset = (combo_idx - 1) * vertical_spacing
+            push!(traces, PlutoPlotly.scatter(x=t_full, y=full_k .+ offset, mode="lines",
+                name=legend_label, line=attr(color=c, width=2)))
+            push!(traces, PlutoPlotly.scatter(x=t_full, y=global_full .+ offset, mode="lines",
+                name=combo_idx == 1 ? "Global mean (corr=$(round(global_ncc; digits=3)))" : "Global mean",
+                showlegend=combo_idx == 1,
+                line=attr(color="black", width=3)))
+        end
+
+        shapes = let distance = selected_result.data_bundle.distance
+            if isnothing(distance)
+                []
+            else
+                vmin, vmax = selected_result.para.velocity_range
+                t_fast = distance / vmax
+                t_slow = distance / vmin
+                vcat([
+                    attr(type="line", x0=t, x1=t, y0=0, y1=1, yref="paper",
+                        line=attr(color="rgba(0,0,0,0.25)", width=1, dash="dash"))
+                    for t in (-t_slow, -t_fast, t_fast, t_slow)
+                ])
+            end
+        end
+
+        layout = Layout(
+            title=attr(text="Source State Average Waveforms ($(result_title_context(selected_result)))",
+                font=attr(size=18, family="Computer Modern, serif")),
+            height=500, width=900,
+            xaxis=attr(title="Lag (s)", zeroline=true, zerolinecolor="rgba(0,0,0,0.3)"),
+            yaxis=attr(title="Amplitude"),
+            plot_bgcolor="white", paper_bgcolor="white",
+            legend=attr(x=0.5, xanchor="center", y=-0.2, orientation="h",
+                font=attr(size=12, family="Computer Modern, serif")),
+            shapes=shapes,
+        )
+        WideCell(PlutoPlotly.plot(traces, layout))
+    end
+end
+
+# ╔═╡ 86843302-bb3b-494c-afe4-b9a43fcc0e7c
+if isnothing(selected_result) || isnothing(state_averages)
+    md""
+else
+    let
+    cluster_avg_ac = state_averages.acausal
+	    cluster_avg_c = state_averages.causal
+	    combo_labels = string.(1:size(cluster_avg_ac, 2))
+    labels = string.(combo_labels)
+    n = length(labels)
+
+    function norm_corr_matrix(A)
+        # A: (nt, n); returns (n, n) normalized correlation matrix
+        C = Matrix{Float32}(undef, n, n)
+        cols = [begin v = vec(A[:, i]); v .- mean(v) end for i in 1:n]
+        norms = [norm(c) + 1f-8 for c in cols]
+        for i in 1:n, j in 1:n
+            C[i, j] = dot(cols[i], cols[j]) / (norms[i] * norms[j])
+        end
+        C
+    end
+
+    C_ac = norm_corr_matrix(cluster_avg_ac)
+    C_c  = norm_corr_matrix(cluster_avg_c)
+    trace_ac = PlutoPlotly.heatmap(
+        z=C_ac, x=labels, y=labels,
+        colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
+        colorbar=attr(title="Corr", len=0.9, x=0.46),
+        xaxis="x1", yaxis="y1",
+    )
+    trace_c = PlutoPlotly.heatmap(
+        z=C_c, x=labels, y=labels,
+        colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
+        colorbar=attr(title="Corr", len=0.9, x=1.01),
+        xaxis="x2", yaxis="y2",
+    )
+
+    sz = max(350, n * 40)
+    layout = Layout(
+        title=attr(text="State-State Normalised Correlation ($(result_title_context(selected_result)))",
+            font=attr(size=16)),
+        grid=attr(rows=1, columns=2, pattern="independent"),
+        annotations=[
+            attr(text="Acausal", x=0.22, xref="paper", y=1.05, yref="paper",
+                 showarrow=false, font=attr(size=14)),
+            attr(text="Causal",  x=0.78, xref="paper", y=1.05, yref="paper",
+                 showarrow=false, font=attr(size=14)),
+        ],
+        xaxis=attr(title="State", tickangle=-45),
+        yaxis=attr(title="State"),
+        xaxis2=attr(title="State", tickangle=-45),
+        yaxis2=attr(title="State"),
+        width=900, height=sz + 80,
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=attr(t=80, b=80, l=80, r=80),
+    )
+    WideCell(PlutoPlotly.plot([trace_ac, trace_c], layout))
+    end
 end
 
 # ╔═╡ 10000019-0000-0000-0000-000000000001
+if isnothing(state_averages)
+    md""
+else
+    WideCell(vqvae.plot_cluster_histogram(state_averages.counts_ac, state_averages.counts_c;
+        title="Source State Usage ($(result_title_context(selected_result)))"))
+end
+
+# ╔═╡ fd286392-4902-11f1-964f-65a304aae057
 mft_analysis = if isnothing(state_averages)
     nothing
 else
@@ -257,7 +461,8 @@ else
         ac_traces,
         c_traces;
         state_labels=labels,
-        period_max=80.0,
+		period_min=Float64(period_min),
+        period_max=Float64(period_max),
         velocity_range=(1.0, 8.0),
         bandwidth_factor=0.15,
         zero_pad_factor=4,
@@ -268,33 +473,39 @@ end
 if isnothing(mft_analysis)
     md""
 else
-    @bind ui_period Slider(mft_analysis.periods; default=10, show_value=true)
+    @bind ui_period Slider(mft_analysis.periods; default=mean(mft_analysis.periods), show_value=true)
 end
 
 # ╔═╡ 1000001b-0000-0000-0000-000000000001
 if isnothing(mft_analysis)
     md""
 else
-    mft.plot_filtered_traces_by_period(
+    WideCell(mft.plot_filtered_traces_by_period(
         mft_analysis;
         period=ui_period,
         correlation_threshold=nothing,
         normalize_each=true,
         scale=0.7,
         spacing=2.2,
-        title="$(selected_result.pair[1])-$(selected_result.pair[2]) filtered source-state traces",
-    )
+        title="MFT Filtered Source-State Traces ($(result_title_context(selected_result)); period=$(ui_period)s)",
+    ))
 end
 
 # ╔═╡ 1000001c-0000-0000-0000-000000000001
 if isnothing(mft_analysis)
     md""
 else
-    mft.plot_branch_correlation(
+    WideCell(mft.plot_branch_correlation(
         mft_analysis;
-        title="$(selected_result.pair[1])-$(selected_result.pair[2]) branch correlation",
-    )
+        title="MFT Branch Correlation ($(result_title_context(selected_result)))",
+    ))
 end
+
+# ╔═╡ 52edc77f-d951-40a2-bae7-ed04e2c778ce
+WideCell(mft.plot_all_highcorr_groupvelocity_picks(mft_analysis; correlation_threshold=0.1, pair_and_average=true, title=string("Group Velocity Picks ", result_title_context(selected_result))))
+
+# ╔═╡ b48757f3-a9f1-4ff4-b714-de58221a1660
+WideCell(mft.plot_all_highcorr_groupvelocity_picks(mft_analysis; correlation_threshold=0.9, title=string("Group Velocity Picks ", result_title_context(selected_result))))
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
@@ -304,6 +515,7 @@ Colors = "5ae59095-9a9b-59fe-a467-6f913c188581"
 ConcreteStructs = "2569d6c7-a4a2-43d3-a901-331e8e4be471"
 DSP = "717857b8-e6f2-59f4-9121-6e50c889abd2"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+Distances = "b4f34e82-e78d-54a5-968a-f98e89d6e8f7"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
@@ -329,6 +541,7 @@ ColorSchemes = "~3.31.0"
 Colors = "~0.13.1"
 ConcreteStructs = "~0.2.3"
 DSP = "~0.8.4"
+Distances = "~0.10.12"
 Enzyme = "~0.13.140"
 EnzymeCore = "~0.8.20"
 FFTW = "~1.10.0"
@@ -344,6 +557,7 @@ PlutoPlotly = "~0.6.5"
 PlutoUI = "~0.7.80"
 Reactant = "~0.2.254"
 StatsBase = "~0.34.10"
+Zygote = "~0.7.10"
 """
 
 # ╔═╡ 00000000-0000-0000-0000-000000000002
@@ -352,7 +566,7 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.12.4"
 manifest_format = "2.0"
-project_hash = "f4c0181ba5aa09cc6df988290009d5e4876d737f"
+project_hash = "fa58630a7f7151dcba97209669e3813006cd2840"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "bbc22a9a08a0ef6460041086d8a7b27940ed4ffd"
@@ -779,6 +993,17 @@ weakdeps = ["ChainRulesCore", "EnzymeCore"]
     [deps.DispatchDoctor.extensions]
     DispatchDoctorChainRulesCoreExt = "ChainRulesCore"
     DispatchDoctorEnzymeCoreExt = "EnzymeCore"
+
+[[deps.Distances]]
+deps = ["LinearAlgebra", "Statistics", "StatsAPI"]
+git-tree-sha1 = "c7e3a542b999843086e2f29dac96a618c105be1d"
+uuid = "b4f34e82-e78d-54a5-968a-f98e89d6e8f7"
+version = "0.10.12"
+weakdeps = ["ChainRulesCore", "SparseArrays"]
+
+    [deps.Distances.extensions]
+    DistancesChainRulesCoreExt = "ChainRulesCore"
+    DistancesSparseArraysExt = "SparseArrays"
 
 [[deps.Distributed]]
 deps = ["Random", "Serialization", "Sockets"]
@@ -2165,13 +2390,18 @@ version = "17.7.0+0"
 # ╔═╡ Cell order:
 # ╠═10000001-0000-0000-0000-000000000001
 # ╠═96817feb-6aa9-4f35-9277-9a4560e9a2a7
+# ╠═b30b5f82-cbeb-41aa-9a4f-212d6aafa760
+# ╠═e0c79630-dbe0-4110-b880-a9ee9e4e1186
 # ╠═bdeb2eb2-6b5d-4677-837c-7072e3588430
 # ╟─10000002-0000-0000-0000-000000000001
 # ╠═10000003-0000-0000-0000-000000000001
+# ╠═22ef4df8-9962-4443-aa48-cbc4bd5ddb59
 # ╟─10000004-0000-0000-0000-000000000001
 # ╠═10000005-0000-0000-0000-000000000001
 # ╠═10000006-0000-0000-0000-000000000001
 # ╠═10000007-0000-0000-0000-000000000001
+# ╠═0bf6c416-bf64-4b2a-b55e-623a4f9daae2
+# ╠═272932ae-4c54-41a2-8c9a-e1cd4834150a
 # ╠═10000008-0000-0000-0000-000000000001
 # ╟─10000009-0000-0000-0000-000000000001
 # ╠═1000000a-0000-0000-0000-000000000001
@@ -2180,19 +2410,30 @@ version = "17.7.0+0"
 # ╟─1000000c-0000-0000-0000-000000000001
 # ╠═1000000d-0000-0000-0000-000000000001
 # ╠═1000000e-0000-0000-0000-000000000001
+# ╠═df5f4bce-e77e-4a8a-9446-c1d3d14b92b0
 # ╟─1000000f-0000-0000-0000-000000000001
-# ╠═10000010-0000-0000-0000-000000000001
+# ╠═928d4238-216b-4f62-a4d7-62075275252b
+# ╟─10000010-0000-0000-0000-000000000001
 # ╠═10000011-0000-0000-0000-000000000001
-# ╠═10000012-0000-0000-0000-000000000001
 # ╠═10000013-0000-0000-0000-000000000001
 # ╠═10000014-0000-0000-0000-000000000001
 # ╟─10000015-0000-0000-0000-000000000001
 # ╠═10000016-0000-0000-0000-000000000001
 # ╠═10000017-0000-0000-0000-000000000001
 # ╠═10000018-0000-0000-0000-000000000001
-# ╠═10000019-0000-0000-0000-000000000001
+# ╟─b11c9e24-6593-497c-a706-146619251e36
+# ╟─86843302-bb3b-494c-afe4-b9a43fcc0e7c
+# ╟─10000019-0000-0000-0000-000000000001
 # ╠═1000001a-0000-0000-0000-000000000001
 # ╠═1000001b-0000-0000-0000-000000000001
 # ╠═1000001c-0000-0000-0000-000000000001
+# ╠═3ef20afc-4c62-4aab-b96f-4e170f8d96dc
+# ╠═52edc77f-d951-40a2-bae7-ed04e2c778ce
+# ╠═b48757f3-a9f1-4ff4-b714-de58221a1660
+# ╠═b00b61c7-81c6-467a-b8bd-9f9e2ebd4d0c
+# ╠═9c18f181-8d76-46a4-836d-c4fe2cad19c8
+# ╠═3c23d4cb-4bf9-4b4b-a57f-fefdc8f29cf1
+# ╠═f41c2e62-efbf-47c8-8b7e-adf828ffde4f
+# ╠═fd286392-4902-11f1-964f-65a304aae057
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002

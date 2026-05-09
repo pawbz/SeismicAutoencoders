@@ -498,29 +498,6 @@ md"## MFT"
 # ╔═╡ 10000034-0000-0000-0000-000000000001
 md"## Saving"
 
-# ╔═╡ 10000035-0000-0000-0000-000000000001
-# ╠═╡ disabled = true
-#=╠═╡
-begin
-	using Dates
-	timestamp = now()
-	run_tag = Dates.format(timestamp, "yyyymmdd_HHMMSS")
-	run_name = "vqvae_v6_run_" * run_tag
-	run_dir = joinpath(data_filepath, run_name)
-    mkpath(run_dir)
-	jldsave(joinpath(run_dir, "model_state.jld2"),
-		model_state = Flux.state(cpu(model)))
-	jldsave(joinpath(run_dir, "vqvae_parameters.jld2");
-		vqvae_parameters=vqvae_parameters,
-        selected_pairs=selected_pairs,
-        selected_pair_id=selected_pair_id)
-	jldsave(joinpath(run_dir, "loss_history.jld2");
-		loss_history)
-    jldsave(joinpath(run_dir, "analysis_cache.jld2");
-        analysis_cache=analysis_cache_for_disk)
-end
-  ╠═╡ =#
-
 # ╔═╡ db4ddb38-2938-11f1-b8e3-e5227df9322c
 md"## Appendix"
 
@@ -743,6 +720,348 @@ begin
     nothing
 end
 
+# ╔═╡ 0d061de8-14f2-49c9-8d43-1e6b87e9d785
+
+
+# ╔═╡ 0d061de8-14f2-49c9-8d43-1e6b87e9d786
+
+
+# ╔═╡ 0d061de8-14f2-49c9-8d43-1e6b87e9d787
+using_geometry_conditioning = conditioning_mode === :geometry
+
+# ╔═╡ 0d061de8-14f2-49c9-8d43-1e6b87e9d788
+using_pair_id_conditioning = conditioning_mode === :pair_id
+
+# ╔═╡ c669f1d3-26c0-4028-b3d4-5a87bd696925
+geometry_raw = using_geometry_conditioning ?
+    hcat([order_invariant_pair_geometry(bundle) for bundle in pair_bundles]...) :
+    zeros(Float32, 5, length(pair_bundles))
+
+# ╔═╡ c669f1d3-26c0-4028-b3d4-5a87bd696926
+geometry_standardization = standardize_geometry_features(geometry_raw)
+
+# ╔═╡ c669f1d3-26c0-4028-b3d4-5a87bd696927
+geometry_features = geometry_standardization.standardized
+
+# ╔═╡ 1000001b-0000-0000-0000-000000000001
+vqvae_parameters = (;
+    nt=nth,
+    d=24,
+    beta_commit=0.25f0,
+    # enc_strides=[1, 1, 1, 1],
+    # enc_kernels=[5, 5, 3, 3],
+    dead_threshold=50,
+    entropy_weight=0.1,
+    reconstruction_loss=:l2,
+    interstation_distance=nothing,
+    dt=dt,
+    velocity_range=(2, 6),
+    arrival_mse_weight=10.0,
+
+    # multiscale RVQ: pair-specific coherent codebooks + shared nuisance residuals
+    use_multiscale_rvq=true,
+    Kcoherent=5,
+    Knuisance=256,
+    detail_stages=0,
+    ema_decay_small=0.999f0,
+    ema_decay_large=0.99f0,
+    num_pairs=length(selected_pairs),
+    pair_codebook_mode=:pair_specific_coarse_shared_detail,
+    pair_names=collect(selected_training_pair_names),
+
+    # order-invariant receiver-geometry conditioning
+    use_geometry_conditioning=using_geometry_conditioning,
+    use_pair_id_conditioning=using_pair_id_conditioning,
+    geometry_dim=using_geometry_conditioning ? size(geometry_features, 1) : 0,
+    condition_dim=16,
+    geometry_features=using_geometry_conditioning ? geometry_features : nothing,
+)
+
+# ╔═╡ 1000001c-0000-0000-0000-000000000001
+vqvae_para = vqvae.VQVAE_Para(; vqvae_parameters...)
+
+# ╔═╡ f2369548-2d88-11f1-a737-85bad04c89cb
+model, loss_history = @use_memo([reload_network, vqvae_parameters]) do
+    reload_network
+    model, loss_history = vqvae.get_vqvae(vqvae_para)
+    model, loss_history
+end
+
+# ╔═╡ 1a623368-a2fc-4b7f-8d01-68e36d04a891
+model.pre_vq
+
+# ╔═╡ 83946706-1d00-4794-af60-8c65979236fa
+selected_pair_forward(x; training=false, beta_commit=0.25f0) =
+    model(x, selected_pair_ids(size(x, 2)); training=training, beta_commit=beta_commit)
+
+# ╔═╡ 83946706-1d00-4794-af60-8c65979236fb
+selected_pair_encode(x; training=false, beta_commit=0.25f0) =
+    vqvae.encode(model, x, selected_pair_ids(size(x, 2)); training=training, beta_commit=beta_commit)
+
+# ╔═╡ a0000101-0000-0000-0000-000000000001
+# Velocity-range travel times for vertical lines on all lag-time plots
+begin
+    _vmin, _vmax = vqvae_para.velocity_range
+    _dist = data_bundle.distance
+    t_vmin = _dist / _vmin   # slowest velocity → latest arrival (s)
+    t_vmax = _dist / _vmax   # fastest velocity → earliest arrival (s)
+
+    """Return PlutoPlotly shape attrs for vertical lines at vmin/vmax arrivals.
+    Pass `symmetric=true` for joined acausal+causal plots (adds negative-lag lines)."""
+    function velocity_vlines(t_vmin, t_vmax; symmetric=false)
+        lines = [
+            attr(type="line", x0=t_vmax, x1=t_vmax, y0=0, y1=1, yref="paper",
+                 line=attr(color="steelblue", dash="dash", width=1.5)),
+            attr(type="line", x0=t_vmin, x1=t_vmin, y0=0, y1=1, yref="paper",
+                 line=attr(color="tomato", dash="dash", width=1.5)),
+        ]
+        if symmetric
+            append!(lines, [
+                attr(type="line", x0=-t_vmax, x1=-t_vmax, y0=0, y1=1, yref="paper",
+                     line=attr(color="steelblue", dash="dash", width=1.5)),
+                attr(type="line", x0=-t_vmin, x1=-t_vmin, y0=0, y1=1, yref="paper",
+                     line=attr(color="tomato", dash="dash", width=1.5)),
+            ])
+        end
+        lines
+    end
+end
+
+# ╔═╡ 10000021-0000-0000-0000-000000000002
+trained = @use_memo([]) do
+
+    vqvae.update(model, loss_history,
+        combined_data.train, combined_data.test,
+        vqvae_para, training_para)
+
+	   # vqvae.update(model, loss_history,
+    #     data.D_train[:, :], data.D_test,
+    #     vqvae_para, training_para)
+
+    randn(), loss_history
+end
+
+# ╔═╡ 1ddfb196-7d6a-44bf-82fc-793a9a30fb9c
+all_pair_encoded_cache = @use_memo([trained, cache_pairs_per_batch, selected_training_pair_names]) do
+    trained
+
+    build_all_pair_encoded_cache(model, pair_splits;
+        pairs_per_batch=cache_pairs_per_batch)
+end
+
+# ╔═╡ 964da977-5394-4369-9185-60797ad764e3
+begin
+    trained
+    WideCell(vqvae.plot_training_dashboard(loss_history;
+        title="VQ-VAE: $(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km $(period_min)-$(period_max)s"))
+end
+
+# ╔═╡ a6000003-0000-0000-0000-000000000001
+v6_diagnostic_index = @use_memo([trained, reload_network, training_para.Mnn_schedule, selected_training_pair_names]) do
+    trained
+    diagnostic_Mnn = vqvae.max_Mnn(training_para)
+    idx = vqvae.LatentIndex(diagnostic_Mnn)
+    vqvae.rebuild_latent_index!(idx, model, combined_data.train.x, combined_data.train.pair_ids;
+        Mnn=diagnostic_Mnn,
+        batch_size=training_para.latent_index_batch_size,
+        latent_index_space=training_para.latent_index_space)
+    idx
+end
+
+# ╔═╡ a6000004-0000-0000-0000-000000000001
+WideCell(vqvae.plot_ensemble_target_examples(combined_data.train.x, v6_diagnostic_index;
+    nsamples=5))
+
+# ╔═╡ a6000005-0000-0000-0000-000000000001
+WideCell(vqvae.plot_neighbor_examples(combined_data.train.x, v6_diagnostic_index;
+    nsamples=5, nneighbors=min(5, vqvae.max_Mnn(training_para))))
+
+# ╔═╡ 699d2c90-4a52-44de-a58e-215f07fa6028
+begin
+    trained
+    WideCell(vqvae.plot_cluster_histogram(cross.pct_ac, cross.pct_c;
+        title="$(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km $(period_min)-$(period_max)s Source State Usage",
+        labels=cross.labels))
+end
+
+# ╔═╡ c7a6235f-c023-4149-92a1-837902763836
+let
+    trained
+    # Get codebook matrix
+    E = vqvae.get_codebook(model)
+    if ndims(E) == 3
+        E = E[:, :, 1]
+    end
+
+    E = Array(E)  # ensure CPU Array
+
+    K = size(E, 2)
+    kmax = min(K, 20)
+    Esel = E[:, 1:kmax]
+
+    # axis labels
+    xlabels = string.(1:kmax)
+    ylabels = string.(1:size(Esel, 1))
+
+    # Choose colormap; `Viridis` is readable
+    cm = ColorSchemes.viridis
+
+    # Build heatmap
+    trace = PlutoPlotly.heatmap(
+        z=Esel,
+        x=xlabels,
+        y=ylabels,
+        # colorscale = [ [i, colorant"$(RGB(cm[i]))"] for i in range(0, stop=1, length=256) ],
+        colorbar=attr(title="Embedding\nvalue", titleside="right"),
+        zmid=0
+    )
+
+    layout = Layout(
+        title=attr(text="Codebook Embedding Heatmap (first $kmax codes) — $(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km $(period_min)-$(period_max)s", font=attr(size=16)),
+        xaxis=attr(title="Code index"),
+        yaxis=attr(title="Embedding dimension"),
+        width=900,
+        height=600,
+        margin=attr(t=70, b=60, l=80, r=140)
+	)
+
+
+    WideCell(PlutoPlotly.plot([trace], layout))
+end
+
+# ╔═╡ 10000033-0000-0000-0000-000000000001
+let
+    trained
+    resample
+    nshow = 10
+    x_sample = randobs(data.D_ac_all, nshow)
+    result = selected_pair_forward(x_sample; training=false)
+    x_orig = cpu(x_sample)
+
+    x_recon = cpu(result.xhat) * 2.5
+
+    t = collect(1:nth) .* dt
+
+    traces = AbstractTrace[]
+    for i in 1:nshow
+        offset = (i - 1) * 4
+        push!(traces, PlutoPlotly.scatter(x=t, y=x_orig[:, i] .+ offset,
+            mode="lines", line=attr(color="black", width=1), opacity=0.5,
+            showlegend=i == 1, name="Original"))
+        push!(traces, PlutoPlotly.scatter(x=t, y=x_recon[:, i, 1] .+ offset,
+            mode="lines", line=attr(color="red", width=2),
+            showlegend=i == 1, name="Reconstructed"))
+    end
+
+    layout = Layout(
+        title=attr(text="$(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km Reconstruction Examples (Acausal) $(period_min)-$(period_max)s",
+            font=attr(size=18, family="Computer Modern, serif")),
+        height=750, width=900,
+        xaxis=attr(title="Time Lag (s)"),
+        legend=attr(orientation="h", x=0.5, xanchor="center", y=-0.15, font=attr(size=10)),
+        plot_bgcolor="white", paper_bgcolor="white",
+        shapes=velocity_vlines(t_vmin, t_vmax),
+    )
+    WideCell(PlutoPlotly.plot(traces, layout))
+end
+
+# ╔═╡ b6000001-0000-0000-0000-000000000001
+let
+    trained
+    resample
+    nshow = 8
+    target_Mnn = vqvae.max_Mnn(training_para)
+    X = data.D_all
+    idx = vqvae.LatentIndex(target_Mnn)
+    vqvae.rebuild_latent_index!(idx, model, X, data.pair_ids_all;
+        Mnn=target_Mnn,
+        batch_size=training_para.latent_index_batch_size,
+        latent_index_space=training_para.latent_index_space)
+
+    sample_ids = sort(Random.randperm(size(X, 2))[1:min(nshow, size(X, 2))])
+    targets = vqvae.build_ensemble_targets(X, idx, sample_ids;
+        Mnn=target_Mnn,
+        aggregation=:mean)
+    x_orig = cpu(X[:, sample_ids])
+    t = collect(1:nth) .* dt
+
+    traces = AbstractTrace[]
+    for (j, sample_id) in enumerate(sample_ids)
+        offset = (j - 1) * 4
+        push!(traces, PlutoPlotly.scatter(x=t, y=x_orig[:, j] .+ offset,
+            mode="lines", line=attr(color="black", width=1), opacity=0.45,
+            showlegend=j == 1, name="Input waveform"))
+        push!(traces, PlutoPlotly.scatter(x=t, y=targets[:, j] .+ offset,
+            mode="lines", line=attr(color="#1f77b4", width=2),
+            showlegend=j == 1, name="Ensemble target = mean(neighbors)"))
+    end
+
+    layout = Layout(
+        title=attr(text="$(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km Direct Ensemble Targets (Mnn=$target_Mnn, mean) $(period_min)-$(period_max)s",
+            font=attr(size=18, family="Computer Modern, serif")),
+        height=700, width=900,
+        xaxis=attr(title="Time Lag (s)"),
+        yaxis=attr(title="Amplitude + offset"),
+        legend=attr(orientation="h", x=0.5, xanchor="center", y=-0.15, font=attr(size=10)),
+        plot_bgcolor="white", paper_bgcolor="white",
+        shapes=velocity_vlines(t_vmin, t_vmax),
+    )
+    WideCell(PlutoPlotly.plot(traces, layout))
+end
+
+# ╔═╡ 41391781-fa8e-4479-a1a8-7132053026bf
+let
+    trained
+    resample
+    nshow = 10
+    x_sample = randobs(data.D_c_all, nshow)
+    result = selected_pair_forward(x_sample; training=false)
+    x_orig = cpu(x_sample)
+
+    x_recon = cpu(result.xhat) * 2.5
+
+    t = collect(1:nth) .* dt
+
+    traces = AbstractTrace[]
+    for i in 1:nshow
+        offset = (i - 1) * 4
+        push!(traces, PlutoPlotly.scatter(x=t, y=x_orig[:, i] .+ offset,
+            mode="lines", line=attr(color="black", width=1), opacity=0.5,
+            showlegend=i == 1, name="Original"))
+        push!(traces, PlutoPlotly.scatter(x=t, y=x_recon[:, i, 1] .+ offset,
+            mode="lines", line=attr(color="red", width=2),
+            showlegend=i == 1, name="Reconstructed"))
+    end
+
+    layout = Layout(
+        title=attr(text="$(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km Reconstruction Examples (Causal) $(period_min)-$(period_max)s",
+            font=attr(size=18, family="Computer Modern, serif")),
+        height=750, width=900,
+        xaxis=attr(title="Time Lag (s)"),
+        legend=attr(orientation="h", x=0.5, xanchor="center", y=-0.15, font=attr(size=10)),
+        plot_bgcolor="white", paper_bgcolor="white",
+        shapes=velocity_vlines(t_vmin, t_vmax),
+    )
+    WideCell(PlutoPlotly.plot(traces, layout))
+end
+
+# ╔═╡ a2000001-0000-0000-0000-000000000001
+per_position_diag = let
+    trained
+    nothing
+end
+
+# ╔═╡ a2000002-0000-0000-0000-000000000001
+let
+    trained
+    if isnothing(per_position_diag)
+        md"Per-position diagnostics are disabled for the single-code v6 architecture."
+    else
+        WideCell(vqvae.plot_per_position_snr_heatmap(per_position_diag.snr_db;
+            title="Per-position Prototype SNR (dB) $(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km"))
+    end
+end
+
 # ╔═╡ a2000010-0000-0000-0000-000000000001
 # ╠═╡ disabled = true
 #=╠═╡
@@ -809,163 +1128,12 @@ let
 end
   ╠═╡ =#
 
-# ╔═╡ 0d061de8-14f2-49c9-8d43-1e6b87e9d785
-
-
-# ╔═╡ 0d061de8-14f2-49c9-8d43-1e6b87e9d786
-
-
-# ╔═╡ 0d061de8-14f2-49c9-8d43-1e6b87e9d787
-using_geometry_conditioning = conditioning_mode === :geometry
-
-# ╔═╡ 0d061de8-14f2-49c9-8d43-1e6b87e9d788
-using_pair_id_conditioning = conditioning_mode === :pair_id
-
-# ╔═╡ c669f1d3-26c0-4028-b3d4-5a87bd696925
-geometry_raw = using_geometry_conditioning ?
-    hcat([order_invariant_pair_geometry(bundle) for bundle in pair_bundles]...) :
-    zeros(Float32, 5, length(pair_bundles))
-
-# ╔═╡ c669f1d3-26c0-4028-b3d4-5a87bd696926
-geometry_standardization = standardize_geometry_features(geometry_raw)
-
-# ╔═╡ c669f1d3-26c0-4028-b3d4-5a87bd696927
-geometry_features = geometry_standardization.standardized
-
-# ╔═╡ 1000001b-0000-0000-0000-000000000001
-vqvae_parameters = (;
-    nt=nth,
-    d=24,
-    beta_commit=0.25f0,
-    # enc_strides=[1, 1, 1, 1],
-    # enc_kernels=[5, 5, 3, 3],
-    dead_threshold=50,
-    entropy_weight=0.1,
-    reconstruction_loss=:l2,
-    interstation_distance=nothing,
-    dt=dt,
-    velocity_range=(2, 6),
-    arrival_mse_weight=10.0,
-
-    # multiscale RVQ: pair-specific coherent codebooks + shared nuisance residuals
-    use_multiscale_rvq=true,
-    Kcoherent=5,
-    Knuisance=256,
-    detail_stages=0,
-    ema_decay_small=0.999f0,
-    ema_decay_large=0.99f0,
-    num_pairs=length(selected_pairs),
-    pair_codebook_mode=:pair_specific_coarse_shared_detail,
-    pair_names=collect(selected_training_pair_names),
-
-    # order-invariant receiver-geometry conditioning
-    use_geometry_conditioning=using_geometry_conditioning,
-    use_pair_id_conditioning=using_pair_id_conditioning,
-    geometry_dim=using_geometry_conditioning ? size(geometry_features, 1) : 0,
-    condition_dim=16,
-    geometry_features=using_geometry_conditioning ? geometry_features : nothing,
-)
-
-# ╔═╡ 1000001c-0000-0000-0000-000000000001
-vqvae_para = vqvae.VQVAE_Para(; vqvae_parameters...)
-
-# ╔═╡ a0000101-0000-0000-0000-000000000001
-# Velocity-range travel times for vertical lines on all lag-time plots
-begin
-    _vmin, _vmax = vqvae_para.velocity_range
-    _dist = data_bundle.distance
-    t_vmin = _dist / _vmin   # slowest velocity → latest arrival (s)
-    t_vmax = _dist / _vmax   # fastest velocity → earliest arrival (s)
-
-    """Return PlutoPlotly shape attrs for vertical lines at vmin/vmax arrivals.
-    Pass `symmetric=true` for joined acausal+causal plots (adds negative-lag lines)."""
-    function velocity_vlines(t_vmin, t_vmax; symmetric=false)
-        lines = [
-            attr(type="line", x0=t_vmax, x1=t_vmax, y0=0, y1=1, yref="paper",
-                 line=attr(color="steelblue", dash="dash", width=1.5)),
-            attr(type="line", x0=t_vmin, x1=t_vmin, y0=0, y1=1, yref="paper",
-                 line=attr(color="tomato", dash="dash", width=1.5)),
-        ]
-        if symmetric
-            append!(lines, [
-                attr(type="line", x0=-t_vmax, x1=-t_vmax, y0=0, y1=1, yref="paper",
-                     line=attr(color="steelblue", dash="dash", width=1.5)),
-                attr(type="line", x0=-t_vmin, x1=-t_vmin, y0=0, y1=1, yref="paper",
-                     line=attr(color="tomato", dash="dash", width=1.5)),
-            ])
-        end
-        lines
-    end
-end
-
-# ╔═╡ a2000004-0000-0000-0000-000000000001
-begin
-    @bind selected_code_for_decode Slider(1:vqvae_para.Kcoherent, show_value=true)
-end
-
-# ╔═╡ f2369548-2d88-11f1-a737-85bad04c89cb
-model, loss_history = @use_memo([reload_network, vqvae_parameters]) do
-    reload_network
-    model, loss_history = vqvae.get_vqvae(vqvae_para)
-    model, loss_history
-end
-
-# ╔═╡ 1a623368-a2fc-4b7f-8d01-68e36d04a891
-model.pre_vq
-
-# ╔═╡ 10000021-0000-0000-0000-000000000002
-trained = @use_memo([]) do
-
-    vqvae.update(model, loss_history,
-        combined_data.train, combined_data.test,
-        vqvae_para, training_para)
-
-	   # vqvae.update(model, loss_history,
-    #     data.D_train[:, :], data.D_test,
-    #     vqvae_para, training_para)
-
-    randn(), loss_history
-end
-
 # ╔═╡ 1000001d-0000-0000-0000-000000000001
  combo_count = let
     trained
     combo_labels = string.(1:vqvae_para.Kcoherent)
    length(combo_labels)
 end;
-
-# ╔═╡ 699d2c90-4a52-44de-a58e-215f07fa6028
-begin
-    trained
-    WideCell(vqvae.plot_cluster_histogram(cross.pct_ac, cross.pct_c;
-        title="$(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km $(period_min)-$(period_max)s Source State Usage",
-        labels=cross.labels))
-end
-
-# ╔═╡ a2000001-0000-0000-0000-000000000001
-per_position_diag = let
-    trained
-    nothing
-end
-
-# ╔═╡ a2000002-0000-0000-0000-000000000001
-let
-    trained
-    if isnothing(per_position_diag)
-        md"Per-position diagnostics are disabled for the single-code v6 architecture."
-    else
-        WideCell(vqvae.plot_per_position_snr_heatmap(per_position_diag.snr_db;
-            title="Per-position Prototype SNR (dB) $(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km"))
-    end
-end
-
-# ╔═╡ 1ddfb196-7d6a-44bf-82fc-793a9a30fb9c
-all_pair_encoded_cache = @use_memo([trained, cache_pairs_per_batch, selected_training_pair_names]) do
-    trained
-
-    build_all_pair_encoded_cache(model, pair_splits;
-        pairs_per_batch=cache_pairs_per_batch)
-end
 
 # ╔═╡ 1ddfb196-7d6a-44bf-82fc-793a9a30fb9d
 begin
@@ -1106,82 +1274,178 @@ begin
     end
 end
 
-# ╔═╡ 1000002e-0000-0000-0000-000000000001
+# ╔═╡ 1ce2fb4a-ff49-4873-9f93-6decbf9b8e80
 let
-	trained
-    K = vqvae_para.Kcoherent
-    # Time axes: acausal → negative lags (reversed), causal → positive lags
-    t_neg = [-(nth - i + 1) * dt for i in 1:nth]  # -nth*dt … -dt
-    t_pos = [i * dt for i in 1:nth]                # dt … nth*dt
-    t_full = [t_neg; t_pos]
+    trained
+    resample
+    nshow = 10
+    combo_idx = selected_combo isa Integer ? selected_combo : findfirst(x -> x == selected_combo, combo_labels)
+    if combo_idx === nothing
+        md"### Could not resolve the selected source state."
+    else
+        selected_ac = selected_indices_ac(combo_idx)
+        selected_c = selected_indices_c(combo_idx)
+        ac_ids = collect(selected_ac)
+        c_ids = collect(selected_c)
+        ac_count = min(nshow, length(ac_ids))
+        c_count = min(nshow, length(c_ids))
+        if ac_count == 0 || c_count == 0
+            missing = String[]
+            if ac_count == 0
+                push!(missing, "acausal")
+            end
+            if c_count == 0
+                push!(missing, "causal")
+            end
+            md"""### Selected state $(combo_labels[combo_idx]) has no $(join(missing, " and ")) windows to display."""
+        else
+            function random_sample(ids, count)
+                if count >= length(ids)
+                    collect(ids)
+                else
+                    perm = randperm(length(ids))
+                    ids[perm[1:count]]
+                end
+            end
+            ac_indices = random_sample(ac_ids, ac_count)
+            c_indices = random_sample(c_ids, c_count)
+            plot_n = min(length(ac_indices), length(c_indices))
+            ac_indices = ac_indices[1:plot_n]
+            c_indices = c_indices[1:plot_n]
+            if plot_n == 0
+                md"### Not enough windows to pair causal and acausal samples for plotting."
+            else
+                x_ac_input = xpu(data.D_ac_all[:, ac_indices])
+                x_c_input = xpu(data.D_c_all[:, c_indices])
+                r_ac = selected_pair_forward(x_ac_input; training=false)
+                r_c = selected_pair_forward(x_c_input; training=false)
+                x_ac_recon = cpu(r_ac.xhat)
+                x_c_recon = cpu(r_c.xhat)
+                x_ac_raw = cpu(data.D_ac_all[:, ac_indices])
+                x_c_raw = cpu(data.D_c_all[:, c_indices])
+                t_neg = [-(nth - i + 1) * dt for i in 1:nth]
+                t_pos = [i * dt for i in 1:nth]
+                t_full = [t_neg; t_pos]
+                amplitude_pool = vcat(vec(mean(x_ac_raw; dims=2)), vec(mean(x_c_raw; dims=2)),
+                    vec(mean(x_ac_recon[:, :, 1]; dims=2)), vec(mean(x_c_recon[:, :, 1]; dims=2)))
+                vertical_spacing = maximum(abs.(amplitude_pool)) * 2.5 + 1e-3
+                cs = ColorSchemes.rainbow
+                colors = [Colors.hex(get(cs, (i - 1) / max(1, plot_n - 1))) for i in 1:plot_n]
+                traces = AbstractTrace[]
+                for i in 1:plot_n
+                    raw_ac = x_ac_raw[:, i]
+                    raw_c = x_c_raw[:, i]
+                    recon_ac = x_ac_recon[:, i, 1]
+                    recon_c = x_c_recon[:, i, 1]
+                    raw_combo = [reverse(raw_ac); raw_c]
+                    recon_combo = [reverse(recon_ac); recon_c]
+                    offset = (i - 1) * vertical_spacing
+                    push!(traces, PlutoPlotly.scatter(x=t_full, y=raw_combo .+ offset,
+                        mode="lines", opacity=0.5, line=attr(color="black", width=1.),
+                        name="Raw", showlegend=i == 1))
+                    push!(traces, PlutoPlotly.scatter(x=t_full, y=recon_combo * 2 .+ offset,
+                        mode="lines", line=attr(color="red", width=2,),
+                        name="Recon", showlegend=i == 1))
+                end
+                layout = Layout(
+                    title=attr(text="($(period_min)-$(period_max)s) Filtered $(combo_labels[combo_idx]): joined acausal+causal reconstructions $(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km",
+                        font=attr(size=18, family="Computer Modern, serif")),
+                    height=max(750, plot_n * 40), width=950,
+                    xaxis=attr(title="Time Lag (s)"),
+                    yaxis=attr(title="Trace + offset"),
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    legend=attr(orientation="h", x=0.5, xanchor="center", y=-0.2, font=attr(size=10)),
+                    shapes=velocity_vlines(t_vmin, t_vmax; symmetric=true))
+                WideCell(PlutoPlotly.plot(traces, layout))
+            end
+        end
+    end
+end
 
-    # Global averages across all waveforms
-    global_avg_ac = vec(mean(cpu(data.D_ac_all); dims=2))
-    global_avg_c = vec(mean(cpu(data.D_c_all); dims=2))
-    global_full = [reverse(global_avg_ac); global_avg_c]
-    global_ac0 = global_avg_ac .- mean(global_avg_ac)
-    global_c0 = global_avg_c .- mean(global_avg_c)
-    global_ncc = dot(global_ac0, global_c0) / ((norm(global_ac0) * norm(global_c0)) + 1e-8)
+# ╔═╡ 10000031-0000-0000-0000-000000000001
+# ╠═╡ disabled = true
+#=╠═╡
+let
+    trained
+    t_neg = [-(nth - i + 1) * dt for i in 1:nth]
+    t_pos = [i * dt for i in 1:nth]
+    t = [t_neg; t_pos]
 
-    combo_labels_local = string.(1:size(cluster_avg_ac, 2))
-    ncomb = length(combo_labels_local)
+
+    averaged_combinations = map(combo_labels) do selected_combo
+
+        ks_tuple = state_tuple_for_model(findall(x -> x == selected_combo, combo_labels)[1])
+
+        # Get indices for selected cluster (acausal)
+        _, selected_ac = vqvae.filter_cluster(model, data.D_ac_all, data.pair_ids_ac, ks_tuple; cluster_filter_kwargs()...)
+        # Get indices for selected cluster (causal)
+        _, selected_c = vqvae.filter_cluster(model, data.D_c_all, data.pair_ids_c, ks_tuple; cluster_filter_kwargs()...)
+
+        if (selected_ac == [] || selected_c == [])
+            @info "No waveforms assigned to state $(selected_combo)"
+            return (; raw=nothing, recon=nothing)
+        else
+            # Get the actual waveforms for these indices
+            x_ac_sel = xpu(data.D_ac_all[:, selected_ac])
+            x_c_sel = xpu(data.D_c_all[:, selected_c])
+
+            # Reconstruct all selected waveforms and get per-component contributions
+            r_ac = selected_pair_forward(x_ac_sel; training=false)
+            r_c = selected_pair_forward(x_c_sel; training=false)
+
+            # x_ac_recon = cpu(r_ac.xhat_per_slot[:, 2, :])
+            # x_c_recon = cpu(r_c.xhat_per_slot[:, 2, :])
+
+            r_ac = normalise(cpu(vec(mean(r_ac.xhat, dims=2))), dims=1)
+            r_c = normalise(cpu(vec(mean(r_c.xhat, dims=2))), dims=1)
+
+            ac = normalise(cpu(vec(mean(x_ac_sel; dims=2))), dims=1)
+            c = normalise(cpu(vec(mean(x_c_sel; dims=2))), dims=1)
+            return (; raw=[reverse(ac); c], recon=[reverse(r_ac); r_c])
+        end
+
+
+    end
+
+
     traces = AbstractTrace[]
-    begin
-        nc = max(ncomb, 1)
-        cs = ColorSchemes.rainbow
-        colors = [Colors.hex(get(cs, (i - 1) / max(1, nc - 1))) for i in 1:nc]
+
+    cs = ColorSchemes.rainbow
+    nc = length(combo_labels)
+    colors = [Colors.hex(get(cs, (i - 1) / max(1, nc - 1))) for i in 1:nc]
+
+    j = 1
+    for i in 1:length(combo_labels)
+        if(isnothing(averaged_combinations[i].raw))
+             @info "Skipping state $(combo_labels[i]) due to no assigned waveforms."
+            continue
+        end
+        j += 1
+        offset = (j - 1) * 3.0
+        c = colors[i]
+        push!(traces, PlutoPlotly.scatter(x=t, y=averaged_combinations[i].raw .* 0.25 .+ offset, mode="lines", line=attr(color="black", width=2), opacity=0.5,
+            showlegend=(i == 1), name="Raw $(combo_labels[i])"))
+
+        push!(traces, PlutoPlotly.scatter(x=t, y=averaged_combinations[i].recon .* 0.25 .+ offset,
+            mode="lines", line=attr(color=c, width=1),
+            showlegend=(i == 1), name="Recon. $(combo_labels[i])"))
     end
 
-    # Per-cluster joined CCF: acausal (negative lags) + causal (positive lags)
-    total_ac = size(data.D_ac_all, 2)
-    total_c = size(data.D_c_all, 2)
-    # compute vertical spacing from typical amplitude
-    mean_ac = vec(mean(cluster_avg_ac; dims=1))
-    mean_c = vec(mean(cluster_avg_c; dims=1))
-    amp_peak = maximum(abs.(vcat(mean_ac, mean_c)))
-    vertical_spacing = amp_peak * 2.5 + 1e-3
-
-    for combo_idx in 1:ncomb
-        c = colors[mod1(combo_idx, length(colors))]
-        # Build per-state joined CCF (acausal reversed to align with causal)
-        a = cluster_avg_ac[:, combo_idx]
-        a_rev = reverse(cluster_avg_ac[:, combo_idx])
-        b = cluster_avg_c[:, combo_idx]
-        full_k = [a_rev; b]
-        # normalized cross-correlation (zero-mean cosine-like similarity)
-        a0 = a .- mean(a)
-        b0 = b .- mean(b)
-        ncc = dot(a0, b0) / ((norm(a0) * norm(b0)) + 1e-8)
-        # Get percentage of windows used for averaging in each cluster
-        sel_ac = selected_indices_ac(combo_idx)
-        sel_c = selected_indices_c(combo_idx)
-        pct_ac = 100 * length(sel_ac) / max(total_ac, 1)
-        pct_c = 100 * length(sel_c) / max(total_c, 1)
-        legend_label = "State $(combo_labels_local[combo_idx]) (ac: $(round(pct_ac; digits=1))%, c: $(round(pct_c; digits=1))%, corr=$(round(ncc; digits=3)))"
-        offset = (combo_idx - 1) * vertical_spacing
-        push!(traces, PlutoPlotly.scatter(x=t_full, y=full_k .+ offset, mode="lines",
-            name=legend_label,
-            line=attr(color=c, width=2)))
-    end
-
-    # Global mean overlay
-    push!(traces, PlutoPlotly.scatter(x=t_full, y=global_full, mode="lines",
-        name="Global mean (corr=$(round(global_ncc; digits=3)))",
-        line=attr(color="black", width=2, dash="dot")))
 
     layout = Layout(
-        title=attr(text="Source State Average Waveforms ($(selected_pair[1])-$(selected_pair[2])) $(round(Int, data_bundle.distance))km $(period_min)-$(period_max)s",
+        title=attr(text="Source States ($(selected_pair[1])-$(selected_pair[2])) $(round(Int, data_bundle.distance))km $(period_min)-$(period_max)s",
             font=attr(size=18, family="Computer Modern, serif")),
-        height=500, width=900,
-        xaxis=attr(title="Lag (s)", zeroline=true, zerolinecolor="rgba(0,0,0,0.3)"),
-        yaxis=attr(title="Amplitude"),
+        height=900, width=900,
+        xaxis=attr(title="Lag Time (s)"),
+        yaxis=attr(title="Source State"),
+        legend=attr(orientation="h", x=0.5, xanchor="center", y=-0.15, font=attr(size=10)),
         plot_bgcolor="white", paper_bgcolor="white",
-        legend=attr(x=0.5, xanchor="center", y=-0.2, orientation="h",
-            font=attr(size=12, family="Computer Modern, serif")),
         shapes=velocity_vlines(t_vmin, t_vmax; symmetric=true),
     )
     WideCell(PlutoPlotly.plot(traces, layout))
+
 end
+  ╠═╡ =#
 
 # ╔═╡ e1f9f9d6-8d55-41a7-9f84-7b49ebf69f2e
 let
@@ -1411,95 +1675,6 @@ let
     end
 end
 
-# ╔═╡ 7d3aa945-56f2-4444-aeea-dac1734da1a0
-let
-    trained
-
-    if isnothing(encoded_cache.detail_ac) || isnothing(encoded_cache.detail_c)
-        md"Detail indices are unavailable. This plot requires multiscale RVQ."
-    else
-        Kcoherent = vqvae_para.Kcoherent
-        Knuisance = vqvae_para.Knuisance
-        denom = max(log(Float32(Knuisance)), 1f-8)
-
-        coarse_mat_ac = isnothing(encoded_cache.coarse_ac) ? encoded_cache.ci_ac : encoded_cache.coarse_ac
-        coarse_mat_c  = isnothing(encoded_cache.coarse_c)  ? encoded_cache.ci_c  : encoded_cache.coarse_c
-
-        # Whole-waveform mode uses row 1; per-position users can switch to selected_latent_pos.
-        row_ac = 1
-        row_c = 1
-
-        coarse_vec_ac = vec(coarse_mat_ac[row_ac, :])
-        coarse_vec_c  = vec(coarse_mat_c[row_c, :])
-
-        detail_ac = encoded_cache.detail_ac
-        detail_c  = encoded_cache.detail_c
-
-        function cond_entropy_ratio_by_coarse(coarse_vec, detail_mat, Kcoherent, denom)
-            y = fill(NaN32, Kcoherent)
-            for k in 1:Kcoherent
-                sel = findall(coarse_vec .== k)
-                if isempty(sel)
-                    continue
-                end
-
-                counts = Dict{String, Int}()
-                for j in sel
-                    key = join(detail_mat[:, j], "-")
-                    counts[key] = get(counts, key, 0) + 1
-                end
-
-                probs = Float32.(collect(values(counts)))
-                probs ./= max(sum(probs), 1f-8)
-                H = -sum(probs .* log.(probs .+ 1f-8))
-                y[k] = H / denom
-            end
-            y
-        end
-
-        y_ac = cond_entropy_ratio_by_coarse(coarse_vec_ac, detail_ac, Kcoherent, denom)
-        y_c  = cond_entropy_ratio_by_coarse(coarse_vec_c,  detail_c,  Kcoherent, denom)
-
-        coarse_vec_pool = vcat(coarse_vec_ac, coarse_vec_c)
-        detail_pool = hcat(detail_ac, detail_c)
-        y_pool = cond_entropy_ratio_by_coarse(coarse_vec_pool, detail_pool, Kcoherent, denom)
-
-        xk = collect(1:Kcoherent)
-
-        tr_ac = PlutoPlotly.scatter(
-            x=xk, y=y_ac,
-            mode="lines+markers", name="Acausal",
-            line=attr(color="#1f77b4", width=2),
-            marker=attr(size=7)
-        )
-        tr_c = PlutoPlotly.scatter(
-            x=xk, y=y_c,
-            mode="lines+markers", name="Causal",
-            line=attr(color="#d62728", width=2),
-            marker=attr(size=7)
-        )
-        tr_pool = PlutoPlotly.scatter(
-            x=xk, y=y_pool,
-            mode="lines+markers", name="Pooled",
-            line=attr(color="#2ca02c", width=2, dash="dot"),
-            marker=attr(size=7)
-        )
-
-        layout = Layout(
-            title=attr(text="H(nuisance | coherent=k) / log(Knuisance) vs coherent code — $(selected_pair[1])-$(selected_pair[2])"),
-            xaxis=attr(title="k_coherent", dtick=1),
-            yaxis=attr(title="Entropy ratio", rangemode="tozero"),
-            width=950,
-            height=430,
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            legend=attr(orientation="h", x=0.5, xanchor="center", y=-0.2)
-        )
-
-        WideCell(PlutoPlotly.plot([tr_ac, tr_c, tr_pool], layout))
-    end
-end
-
 # ╔═╡ 976a3916-41e8-11f1-a0d8-61b7d62f95de
 let
     trained
@@ -1599,6 +1774,172 @@ let
         plot_mi = PlutoPlotly.plot([tr_test, tr_null], layout)
         
         vcat(summary, WideCell(plot_mi))
+    end
+end
+
+# ╔═╡ 1000002e-0000-0000-0000-000000000001
+let
+	trained
+    K = vqvae_para.Kcoherent
+    # Time axes: acausal → negative lags (reversed), causal → positive lags
+    t_neg = [-(nth - i + 1) * dt for i in 1:nth]  # -nth*dt … -dt
+    t_pos = [i * dt for i in 1:nth]                # dt … nth*dt
+    t_full = [t_neg; t_pos]
+
+    # Global averages across all waveforms
+    global_avg_ac = vec(mean(cpu(data.D_ac_all); dims=2))
+    global_avg_c = vec(mean(cpu(data.D_c_all); dims=2))
+    global_full = [reverse(global_avg_ac); global_avg_c]
+    global_ac0 = global_avg_ac .- mean(global_avg_ac)
+    global_c0 = global_avg_c .- mean(global_avg_c)
+    global_ncc = dot(global_ac0, global_c0) / ((norm(global_ac0) * norm(global_c0)) + 1e-8)
+
+    combo_labels_local = string.(1:size(cluster_avg_ac, 2))
+    ncomb = length(combo_labels_local)
+    traces = AbstractTrace[]
+    begin
+        nc = max(ncomb, 1)
+        cs = ColorSchemes.rainbow
+        colors = [Colors.hex(get(cs, (i - 1) / max(1, nc - 1))) for i in 1:nc]
+    end
+
+    # Per-cluster joined CCF: acausal (negative lags) + causal (positive lags)
+    total_ac = size(data.D_ac_all, 2)
+    total_c = size(data.D_c_all, 2)
+    # compute vertical spacing from typical amplitude
+    mean_ac = vec(mean(cluster_avg_ac; dims=1))
+    mean_c = vec(mean(cluster_avg_c; dims=1))
+    amp_peak = maximum(abs.(vcat(mean_ac, mean_c)))
+    vertical_spacing = amp_peak * 2.5 + 1e-3
+
+    for combo_idx in 1:ncomb
+        c = colors[mod1(combo_idx, length(colors))]
+        # Build per-state joined CCF (acausal reversed to align with causal)
+        a = cluster_avg_ac[:, combo_idx]
+        a_rev = reverse(cluster_avg_ac[:, combo_idx])
+        b = cluster_avg_c[:, combo_idx]
+        full_k = [a_rev; b]
+        # normalized cross-correlation (zero-mean cosine-like similarity)
+        a0 = a .- mean(a)
+        b0 = b .- mean(b)
+        ncc = dot(a0, b0) / ((norm(a0) * norm(b0)) + 1e-8)
+        # Get percentage of windows used for averaging in each cluster
+        sel_ac = selected_indices_ac(combo_idx)
+        sel_c = selected_indices_c(combo_idx)
+        pct_ac = 100 * length(sel_ac) / max(total_ac, 1)
+        pct_c = 100 * length(sel_c) / max(total_c, 1)
+        legend_label = "State $(combo_labels_local[combo_idx]) (ac: $(round(pct_ac; digits=1))%, c: $(round(pct_c; digits=1))%, corr=$(round(ncc; digits=3)))"
+        offset = (combo_idx - 1) * vertical_spacing
+        push!(traces, PlutoPlotly.scatter(x=t_full, y=full_k .+ offset, mode="lines",
+            name=legend_label,
+            line=attr(color=c, width=2)))
+    end
+
+    # Global mean overlay
+    push!(traces, PlutoPlotly.scatter(x=t_full, y=global_full, mode="lines",
+        name="Global mean (corr=$(round(global_ncc; digits=3)))",
+        line=attr(color="black", width=2, dash="dot")))
+
+    layout = Layout(
+        title=attr(text="Source State Average Waveforms ($(selected_pair[1])-$(selected_pair[2])) $(round(Int, data_bundle.distance))km $(period_min)-$(period_max)s",
+            font=attr(size=18, family="Computer Modern, serif")),
+        height=500, width=900,
+        xaxis=attr(title="Lag (s)", zeroline=true, zerolinecolor="rgba(0,0,0,0.3)"),
+        yaxis=attr(title="Amplitude"),
+        plot_bgcolor="white", paper_bgcolor="white",
+        legend=attr(x=0.5, xanchor="center", y=-0.2, orientation="h",
+            font=attr(size=12, family="Computer Modern, serif")),
+        shapes=velocity_vlines(t_vmin, t_vmax; symmetric=true),
+    )
+    WideCell(PlutoPlotly.plot(traces, layout))
+end
+
+# ╔═╡ 7d3aa945-56f2-4444-aeea-dac1734da1a0
+let
+    trained
+
+    if isnothing(encoded_cache.detail_ac) || isnothing(encoded_cache.detail_c)
+        md"Detail indices are unavailable. This plot requires multiscale RVQ."
+    else
+        Kcoherent = vqvae_para.Kcoherent
+        Knuisance = vqvae_para.Knuisance
+        denom = max(log(Float32(Knuisance)), 1f-8)
+
+        coarse_mat_ac = isnothing(encoded_cache.coarse_ac) ? encoded_cache.ci_ac : encoded_cache.coarse_ac
+        coarse_mat_c  = isnothing(encoded_cache.coarse_c)  ? encoded_cache.ci_c  : encoded_cache.coarse_c
+
+        # Whole-waveform mode uses row 1; per-position users can switch to selected_latent_pos.
+        row_ac = 1
+        row_c = 1
+
+        coarse_vec_ac = vec(coarse_mat_ac[row_ac, :])
+        coarse_vec_c  = vec(coarse_mat_c[row_c, :])
+
+        detail_ac = encoded_cache.detail_ac
+        detail_c  = encoded_cache.detail_c
+
+        function cond_entropy_ratio_by_coarse(coarse_vec, detail_mat, Kcoherent, denom)
+            y = fill(NaN32, Kcoherent)
+            for k in 1:Kcoherent
+                sel = findall(coarse_vec .== k)
+                if isempty(sel)
+                    continue
+                end
+
+                counts = Dict{String, Int}()
+                for j in sel
+                    key = join(detail_mat[:, j], "-")
+                    counts[key] = get(counts, key, 0) + 1
+                end
+
+                probs = Float32.(collect(values(counts)))
+                probs ./= max(sum(probs), 1f-8)
+                H = -sum(probs .* log.(probs .+ 1f-8))
+                y[k] = H / denom
+            end
+            y
+        end
+
+        y_ac = cond_entropy_ratio_by_coarse(coarse_vec_ac, detail_ac, Kcoherent, denom)
+        y_c  = cond_entropy_ratio_by_coarse(coarse_vec_c,  detail_c,  Kcoherent, denom)
+
+        coarse_vec_pool = vcat(coarse_vec_ac, coarse_vec_c)
+        detail_pool = hcat(detail_ac, detail_c)
+        y_pool = cond_entropy_ratio_by_coarse(coarse_vec_pool, detail_pool, Kcoherent, denom)
+
+        xk = collect(1:Kcoherent)
+
+        tr_ac = PlutoPlotly.scatter(
+            x=xk, y=y_ac,
+            mode="lines+markers", name="Acausal",
+            line=attr(color="#1f77b4", width=2),
+            marker=attr(size=7)
+        )
+        tr_c = PlutoPlotly.scatter(
+            x=xk, y=y_c,
+            mode="lines+markers", name="Causal",
+            line=attr(color="#d62728", width=2),
+            marker=attr(size=7)
+        )
+        tr_pool = PlutoPlotly.scatter(
+            x=xk, y=y_pool,
+            mode="lines+markers", name="Pooled",
+            line=attr(color="#2ca02c", width=2, dash="dot"),
+            marker=attr(size=7)
+        )
+
+        layout = Layout(
+            title=attr(text="H(nuisance | coherent=k) / log(Knuisance) vs coherent code — $(selected_pair[1])-$(selected_pair[2])"),
+            xaxis=attr(title="k_coherent", dtick=1),
+            yaxis=attr(title="Entropy ratio", rangemode="tozero"),
+            width=950,
+            height=430,
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            legend=attr(orientation="h", x=0.5, xanchor="center", y=-0.2)
+        )
+
+        WideCell(PlutoPlotly.plot([tr_ac, tr_c, tr_pool], layout))
     end
 end
 
@@ -1944,374 +2285,10 @@ WideCell(mft.plot_all_highcorr_groupvelocity_picks(mft_analysis_all_states; corr
 # ╔═╡ 240393ec-e1d5-4086-b8d8-a2b9e72078d8
 WideCell(mft.plot_all_highcorr_groupvelocity_picks(mft_analysis_all_states; correlation_threshold=0.85, pair_and_average=true, title="Group Velocity Picks $(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km $(period_min)-$(period_max)s"))
 
-# ╔═╡ 964da977-5394-4369-9185-60797ad764e3
+# ╔═╡ a2000004-0000-0000-0000-000000000001
 begin
-    trained
-    WideCell(vqvae.plot_training_dashboard(loss_history;
-        title="VQ-VAE: $(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km $(period_min)-$(period_max)s"))
+    @bind selected_code_for_decode Slider(1:vqvae_para.Kcoherent, show_value=true)
 end
-
-# ╔═╡ a6000003-0000-0000-0000-000000000001
-v6_diagnostic_index = @use_memo([trained, reload_network, training_para.Mnn_schedule, selected_training_pair_names]) do
-    trained
-    diagnostic_Mnn = vqvae.max_Mnn(training_para)
-    idx = vqvae.LatentIndex(diagnostic_Mnn)
-    vqvae.rebuild_latent_index!(idx, model, combined_data.train.x, combined_data.train.pair_ids;
-        Mnn=diagnostic_Mnn,
-        batch_size=training_para.latent_index_batch_size,
-        latent_index_space=training_para.latent_index_space)
-    idx
-end
-
-# ╔═╡ a6000004-0000-0000-0000-000000000001
-WideCell(vqvae.plot_ensemble_target_examples(combined_data.train.x, v6_diagnostic_index;
-    nsamples=5))
-
-# ╔═╡ a6000005-0000-0000-0000-000000000001
-WideCell(vqvae.plot_neighbor_examples(combined_data.train.x, v6_diagnostic_index;
-    nsamples=5, nneighbors=min(5, vqvae.max_Mnn(training_para))))
-
-# ╔═╡ c7a6235f-c023-4149-92a1-837902763836
-let
-    trained
-    # Get codebook matrix
-    E = vqvae.get_codebook(model)
-    if ndims(E) == 3
-        E = E[:, :, 1]
-    end
-
-    E = Array(E)  # ensure CPU Array
-
-    K = size(E, 2)
-    kmax = min(K, 20)
-    Esel = E[:, 1:kmax]
-
-    # axis labels
-    xlabels = string.(1:kmax)
-    ylabels = string.(1:size(Esel, 1))
-
-    # Choose colormap; `Viridis` is readable
-    cm = ColorSchemes.viridis
-
-    # Build heatmap
-    trace = PlutoPlotly.heatmap(
-        z=Esel,
-        x=xlabels,
-        y=ylabels,
-        # colorscale = [ [i, colorant"$(RGB(cm[i]))"] for i in range(0, stop=1, length=256) ],
-        colorbar=attr(title="Embedding\nvalue", titleside="right"),
-        zmid=0
-    )
-
-    layout = Layout(
-        title=attr(text="Codebook Embedding Heatmap (first $kmax codes) — $(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km $(period_min)-$(period_max)s", font=attr(size=16)),
-        xaxis=attr(title="Code index"),
-        yaxis=attr(title="Embedding dimension"),
-        width=900,
-        height=600,
-        margin=attr(t=70, b=60, l=80, r=140)
-	)
-
-
-    WideCell(PlutoPlotly.plot([trace], layout))
-end
-
-# ╔═╡ b6000001-0000-0000-0000-000000000001
-let
-    trained
-    resample
-    nshow = 8
-    target_Mnn = vqvae.max_Mnn(training_para)
-    X = data.D_all
-    idx = vqvae.LatentIndex(target_Mnn)
-    vqvae.rebuild_latent_index!(idx, model, X, data.pair_ids_all;
-        Mnn=target_Mnn,
-        batch_size=training_para.latent_index_batch_size,
-        latent_index_space=training_para.latent_index_space)
-
-    sample_ids = sort(Random.randperm(size(X, 2))[1:min(nshow, size(X, 2))])
-    targets = vqvae.build_ensemble_targets(X, idx, sample_ids;
-        Mnn=target_Mnn,
-        aggregation=:mean)
-    x_orig = cpu(X[:, sample_ids])
-    t = collect(1:nth) .* dt
-
-    traces = AbstractTrace[]
-    for (j, sample_id) in enumerate(sample_ids)
-        offset = (j - 1) * 4
-        push!(traces, PlutoPlotly.scatter(x=t, y=x_orig[:, j] .+ offset,
-            mode="lines", line=attr(color="black", width=1), opacity=0.45,
-            showlegend=j == 1, name="Input waveform"))
-        push!(traces, PlutoPlotly.scatter(x=t, y=targets[:, j] .+ offset,
-            mode="lines", line=attr(color="#1f77b4", width=2),
-            showlegend=j == 1, name="Ensemble target = mean(neighbors)"))
-    end
-
-    layout = Layout(
-        title=attr(text="$(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km Direct Ensemble Targets (Mnn=$target_Mnn, mean) $(period_min)-$(period_max)s",
-            font=attr(size=18, family="Computer Modern, serif")),
-        height=700, width=900,
-        xaxis=attr(title="Time Lag (s)"),
-        yaxis=attr(title="Amplitude + offset"),
-        legend=attr(orientation="h", x=0.5, xanchor="center", y=-0.15, font=attr(size=10)),
-        plot_bgcolor="white", paper_bgcolor="white",
-        shapes=velocity_vlines(t_vmin, t_vmax),
-    )
-    WideCell(PlutoPlotly.plot(traces, layout))
-end
-
-# ╔═╡ 83946706-1d00-4794-af60-8c65979236fa
-selected_pair_forward(x; training=false, beta_commit=0.25f0) =
-    model(x, selected_pair_ids(size(x, 2)); training=training, beta_commit=beta_commit)
-
-# ╔═╡ 1ce2fb4a-ff49-4873-9f93-6decbf9b8e80
-let
-    trained
-    resample
-    nshow = 10
-    combo_idx = selected_combo isa Integer ? selected_combo : findfirst(x -> x == selected_combo, combo_labels)
-    if combo_idx === nothing
-        md"### Could not resolve the selected source state."
-    else
-        selected_ac = selected_indices_ac(combo_idx)
-        selected_c = selected_indices_c(combo_idx)
-        ac_ids = collect(selected_ac)
-        c_ids = collect(selected_c)
-        ac_count = min(nshow, length(ac_ids))
-        c_count = min(nshow, length(c_ids))
-        if ac_count == 0 || c_count == 0
-            missing = String[]
-            if ac_count == 0
-                push!(missing, "acausal")
-            end
-            if c_count == 0
-                push!(missing, "causal")
-            end
-            md"""### Selected state $(combo_labels[combo_idx]) has no $(join(missing, " and ")) windows to display."""
-        else
-            function random_sample(ids, count)
-                if count >= length(ids)
-                    collect(ids)
-                else
-                    perm = randperm(length(ids))
-                    ids[perm[1:count]]
-                end
-            end
-            ac_indices = random_sample(ac_ids, ac_count)
-            c_indices = random_sample(c_ids, c_count)
-            plot_n = min(length(ac_indices), length(c_indices))
-            ac_indices = ac_indices[1:plot_n]
-            c_indices = c_indices[1:plot_n]
-            if plot_n == 0
-                md"### Not enough windows to pair causal and acausal samples for plotting."
-            else
-                x_ac_input = xpu(data.D_ac_all[:, ac_indices])
-                x_c_input = xpu(data.D_c_all[:, c_indices])
-                r_ac = selected_pair_forward(x_ac_input; training=false)
-                r_c = selected_pair_forward(x_c_input; training=false)
-                x_ac_recon = cpu(r_ac.xhat)
-                x_c_recon = cpu(r_c.xhat)
-                x_ac_raw = cpu(data.D_ac_all[:, ac_indices])
-                x_c_raw = cpu(data.D_c_all[:, c_indices])
-                t_neg = [-(nth - i + 1) * dt for i in 1:nth]
-                t_pos = [i * dt for i in 1:nth]
-                t_full = [t_neg; t_pos]
-                amplitude_pool = vcat(vec(mean(x_ac_raw; dims=2)), vec(mean(x_c_raw; dims=2)),
-                    vec(mean(x_ac_recon[:, :, 1]; dims=2)), vec(mean(x_c_recon[:, :, 1]; dims=2)))
-                vertical_spacing = maximum(abs.(amplitude_pool)) * 2.5 + 1e-3
-                cs = ColorSchemes.rainbow
-                colors = [Colors.hex(get(cs, (i - 1) / max(1, plot_n - 1))) for i in 1:plot_n]
-                traces = AbstractTrace[]
-                for i in 1:plot_n
-                    raw_ac = x_ac_raw[:, i]
-                    raw_c = x_c_raw[:, i]
-                    recon_ac = x_ac_recon[:, i, 1]
-                    recon_c = x_c_recon[:, i, 1]
-                    raw_combo = [reverse(raw_ac); raw_c]
-                    recon_combo = [reverse(recon_ac); recon_c]
-                    offset = (i - 1) * vertical_spacing
-                    push!(traces, PlutoPlotly.scatter(x=t_full, y=raw_combo .+ offset,
-                        mode="lines", opacity=0.5, line=attr(color="black", width=1.),
-                        name="Raw", showlegend=i == 1))
-                    push!(traces, PlutoPlotly.scatter(x=t_full, y=recon_combo * 2 .+ offset,
-                        mode="lines", line=attr(color="red", width=2,),
-                        name="Recon", showlegend=i == 1))
-                end
-                layout = Layout(
-                    title=attr(text="($(period_min)-$(period_max)s) Filtered $(combo_labels[combo_idx]): joined acausal+causal reconstructions $(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km",
-                        font=attr(size=18, family="Computer Modern, serif")),
-                    height=max(750, plot_n * 40), width=950,
-                    xaxis=attr(title="Time Lag (s)"),
-                    yaxis=attr(title="Trace + offset"),
-                    plot_bgcolor="white", paper_bgcolor="white",
-                    legend=attr(orientation="h", x=0.5, xanchor="center", y=-0.2, font=attr(size=10)),
-                    shapes=velocity_vlines(t_vmin, t_vmax; symmetric=true))
-                WideCell(PlutoPlotly.plot(traces, layout))
-            end
-        end
-    end
-end
-
-# ╔═╡ 10000033-0000-0000-0000-000000000001
-let
-    trained
-    resample
-    nshow = 10
-    x_sample = randobs(data.D_ac_all, nshow)
-    result = selected_pair_forward(x_sample; training=false)
-    x_orig = cpu(x_sample)
-
-    x_recon = cpu(result.xhat) * 2.5
-
-    t = collect(1:nth) .* dt
-
-    traces = AbstractTrace[]
-    for i in 1:nshow
-        offset = (i - 1) * 4
-        push!(traces, PlutoPlotly.scatter(x=t, y=x_orig[:, i] .+ offset,
-            mode="lines", line=attr(color="black", width=1), opacity=0.5,
-            showlegend=i == 1, name="Original"))
-        push!(traces, PlutoPlotly.scatter(x=t, y=x_recon[:, i, 1] .+ offset,
-            mode="lines", line=attr(color="red", width=2),
-            showlegend=i == 1, name="Reconstructed"))
-    end
-
-    layout = Layout(
-        title=attr(text="$(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km Reconstruction Examples (Acausal) $(period_min)-$(period_max)s",
-            font=attr(size=18, family="Computer Modern, serif")),
-        height=750, width=900,
-        xaxis=attr(title="Time Lag (s)"),
-        legend=attr(orientation="h", x=0.5, xanchor="center", y=-0.15, font=attr(size=10)),
-        plot_bgcolor="white", paper_bgcolor="white",
-        shapes=velocity_vlines(t_vmin, t_vmax),
-    )
-    WideCell(PlutoPlotly.plot(traces, layout))
-end
-
-# ╔═╡ 41391781-fa8e-4479-a1a8-7132053026bf
-let
-    trained
-    resample
-    nshow = 10
-    x_sample = randobs(data.D_c_all, nshow)
-    result = selected_pair_forward(x_sample; training=false)
-    x_orig = cpu(x_sample)
-
-    x_recon = cpu(result.xhat) * 2.5
-
-    t = collect(1:nth) .* dt
-
-    traces = AbstractTrace[]
-    for i in 1:nshow
-        offset = (i - 1) * 4
-        push!(traces, PlutoPlotly.scatter(x=t, y=x_orig[:, i] .+ offset,
-            mode="lines", line=attr(color="black", width=1), opacity=0.5,
-            showlegend=i == 1, name="Original"))
-        push!(traces, PlutoPlotly.scatter(x=t, y=x_recon[:, i, 1] .+ offset,
-            mode="lines", line=attr(color="red", width=2),
-            showlegend=i == 1, name="Reconstructed"))
-    end
-
-    layout = Layout(
-        title=attr(text="$(selected_pair[1])-$(selected_pair[2]) $(round(Int, data_bundle.distance))km Reconstruction Examples (Causal) $(period_min)-$(period_max)s",
-            font=attr(size=18, family="Computer Modern, serif")),
-        height=750, width=900,
-        xaxis=attr(title="Time Lag (s)"),
-        legend=attr(orientation="h", x=0.5, xanchor="center", y=-0.15, font=attr(size=10)),
-        plot_bgcolor="white", paper_bgcolor="white",
-        shapes=velocity_vlines(t_vmin, t_vmax),
-    )
-    WideCell(PlutoPlotly.plot(traces, layout))
-end
-
-# ╔═╡ 83946706-1d00-4794-af60-8c65979236fb
-selected_pair_encode(x; training=false, beta_commit=0.25f0) =
-    vqvae.encode(model, x, selected_pair_ids(size(x, 2)); training=training, beta_commit=beta_commit)
-
-# ╔═╡ 10000031-0000-0000-0000-000000000001
-# ╠═╡ disabled = true
-#=╠═╡
-let
-    trained
-    t_neg = [-(nth - i + 1) * dt for i in 1:nth]
-    t_pos = [i * dt for i in 1:nth]
-    t = [t_neg; t_pos]
-
-
-    averaged_combinations = map(combo_labels) do selected_combo
-
-        ks_tuple = state_tuple_for_model(findall(x -> x == selected_combo, combo_labels)[1])
-
-        # Get indices for selected cluster (acausal)
-        _, selected_ac = vqvae.filter_cluster(model, data.D_ac_all, data.pair_ids_ac, ks_tuple; cluster_filter_kwargs()...)
-        # Get indices for selected cluster (causal)
-        _, selected_c = vqvae.filter_cluster(model, data.D_c_all, data.pair_ids_c, ks_tuple; cluster_filter_kwargs()...)
-
-        if (selected_ac == [] || selected_c == [])
-            @info "No waveforms assigned to state $(selected_combo)"
-            return (; raw=nothing, recon=nothing)
-        else
-            # Get the actual waveforms for these indices
-            x_ac_sel = xpu(data.D_ac_all[:, selected_ac])
-            x_c_sel = xpu(data.D_c_all[:, selected_c])
-
-            # Reconstruct all selected waveforms and get per-component contributions
-            r_ac = selected_pair_forward(x_ac_sel; training=false)
-            r_c = selected_pair_forward(x_c_sel; training=false)
-
-            # x_ac_recon = cpu(r_ac.xhat_per_slot[:, 2, :])
-            # x_c_recon = cpu(r_c.xhat_per_slot[:, 2, :])
-
-            r_ac = normalise(cpu(vec(mean(r_ac.xhat, dims=2))), dims=1)
-            r_c = normalise(cpu(vec(mean(r_c.xhat, dims=2))), dims=1)
-
-            ac = normalise(cpu(vec(mean(x_ac_sel; dims=2))), dims=1)
-            c = normalise(cpu(vec(mean(x_c_sel; dims=2))), dims=1)
-            return (; raw=[reverse(ac); c], recon=[reverse(r_ac); r_c])
-        end
-
-
-    end
-
-
-    traces = AbstractTrace[]
-
-    cs = ColorSchemes.rainbow
-    nc = length(combo_labels)
-    colors = [Colors.hex(get(cs, (i - 1) / max(1, nc - 1))) for i in 1:nc]
-
-    j = 1
-    for i in 1:length(combo_labels)
-        if(isnothing(averaged_combinations[i].raw))
-             @info "Skipping state $(combo_labels[i]) due to no assigned waveforms."
-            continue
-        end
-        j += 1
-        offset = (j - 1) * 3.0
-        c = colors[i]
-        push!(traces, PlutoPlotly.scatter(x=t, y=averaged_combinations[i].raw .* 0.25 .+ offset, mode="lines", line=attr(color="black", width=2), opacity=0.5,
-            showlegend=(i == 1), name="Raw $(combo_labels[i])"))
-
-        push!(traces, PlutoPlotly.scatter(x=t, y=averaged_combinations[i].recon .* 0.25 .+ offset,
-            mode="lines", line=attr(color=c, width=1),
-            showlegend=(i == 1), name="Recon. $(combo_labels[i])"))
-    end
-
-
-    layout = Layout(
-        title=attr(text="Source States ($(selected_pair[1])-$(selected_pair[2])) $(round(Int, data_bundle.distance))km $(period_min)-$(period_max)s",
-            font=attr(size=18, family="Computer Modern, serif")),
-        height=900, width=900,
-        xaxis=attr(title="Lag Time (s)"),
-        yaxis=attr(title="Source State"),
-        legend=attr(orientation="h", x=0.5, xanchor="center", y=-0.15, font=attr(size=10)),
-        plot_bgcolor="white", paper_bgcolor="white",
-        shapes=velocity_vlines(t_vmin, t_vmax; symmetric=true),
-    )
-    WideCell(PlutoPlotly.plot(traces, layout))
-
-end
-  ╠═╡ =#
 
 # ╔═╡ a2000005-0000-0000-0000-000000000001
 let
@@ -2379,6 +2356,29 @@ analysis_cache_for_disk = @use_memo([trained, cache_pairs_per_batch, selected_tr
         all_pair_encoded_cache,
     )
 end
+
+# ╔═╡ 10000035-0000-0000-0000-000000000001
+# ╠═╡ disabled = true
+#=╠═╡
+begin
+	using Dates
+	timestamp = now()
+	run_tag = Dates.format(timestamp, "yyyymmdd_HHMMSS")
+	run_name = "vqvae_v6_run_" * run_tag
+	run_dir = joinpath(data_filepath, run_name)
+    mkpath(run_dir)
+	jldsave(joinpath(run_dir, "model_state.jld2"),
+		model_state = Flux.state(cpu(model)))
+	jldsave(joinpath(run_dir, "vqvae_parameters.jld2");
+		vqvae_parameters=vqvae_parameters,
+        selected_pairs=selected_pairs,
+        selected_pair_id=selected_pair_id)
+	jldsave(joinpath(run_dir, "loss_history.jld2");
+		loss_history)
+    jldsave(joinpath(run_dir, "analysis_cache.jld2");
+        analysis_cache=analysis_cache_for_disk)
+end
+  ╠═╡ =#
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """

@@ -167,8 +167,8 @@ function narrow_band_filter(data::AbstractArray, dt::Float64, center_freq::Float
 end
 
 # ╔═╡ 4192fcef-4662-4944-b354-71e8e00285b1
-md"""
-narrow_band_filter_analytic(data, dt, center_freq, bandwidth_factor=sqrt(2/25)) -> Vector{ComplexF64}
+"""
+    narrow_band_filter_analytic(data, dt, center_freq, bandwidth_factor=sqrt(2/25)) -> Vector{ComplexF64}
 
 Apply a one-sided Gaussian narrowband filter and return the **complex analytic signal**.
 
@@ -201,9 +201,6 @@ two-sided envelope (Hilbert-transform convention).
 - `Vector{ComplexF64}` — complex analytic signal;
   `abs.(z)` = envelope,  `angle.(z)` = instantaneous phase
 """
-
-
-# ╔═╡ 2c1a711e-261e-4e82-ade2-2fb6bc0e6b93
 function narrow_band_filter_analytic(data::AbstractVector{<:Real}, dt::Float64,
                                      center_freq::Float64,
                                      bandwidth_factor::Float64=sqrt(2.0 / 25.0))
@@ -2807,319 +2804,6 @@ function _matched_peak_average_velocities(causal_peaks::Vector{Tuple{Float64,Flo
     return matched_avg
 end
 
-# ╔═╡ 07f578f5-f269-45f1-a6e6-c90f4d0f5c2f
-"""
-    plot_all_highcorr_groupvelocity_picks(result::BranchAnalysisResult;
-                                          correlation_threshold=0.85,
-                                          width=1000,
-                                          height=600,
-                                          font_family="Arial, sans-serif",
-                                          font_size=14,
-                                          title="All High-Correlation Group-Velocity Picks")
-
-Plot all causal and acausal envelope-peak group-velocity picks, restricted to periods
-where branch correlation is above `correlation_threshold`.
-"""
-function plot_all_highcorr_groupvelocity_picks(result::BranchAnalysisResult;
-                                               correlation_threshold::Float64=0.85,
-                                               pair_and_average::Bool=false,
-                                               velocity_tolerance_fraction::Float64=0.10,
-                                               width::Int=1000,
-                                               height::Int=600,
-                                               font_family::String="Arial, sans-serif",
-                                               font_size::Int=14,
-                                               title::String="All High-Correlation Group-Velocity Picks")
-    hi_idx = high_correlation_indices(result; correlation_threshold=correlation_threshold)
-    if isempty(hi_idx)
-        @warn "No periods satisfy the correlation threshold $(correlation_threshold)"
-        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No high-correlation periods"]))
-    end
-
-    traces = [scatter()]
-    all_vels = Float64[]
-
-    if pair_and_average
-        matched_by_period = Dict{Int,Vector{Float64}}()
-        max_matched = 0
-
-        for ip in hi_idx
-            causal_peaks = result.causal_result.all_peaks[ip]
-            acausal_peaks = result.acausal_result.all_peaks[ip]
-            vavg = _matched_peak_average_velocities(causal_peaks, acausal_peaks, result.distance;
-                                                    velocity_tolerance_fraction=velocity_tolerance_fraction)
-            isempty(vavg) && continue
-            matched_by_period[ip] = vavg
-            max_matched = max(max_matched, length(vavg))
-            append!(all_vels, vavg)
-        end
-
-        for pidx in 1:max_matched
-            xp = Float64[]
-            yp = Float64[]
-            cp = Float64[]
-
-            for ip in hi_idx
-                if haskey(matched_by_period, ip)
-                    vals = matched_by_period[ip]
-                    if pidx <= length(vals)
-                        push!(xp, result.periods[ip])
-                        push!(yp, vals[pidx])
-                        push!(cp, result.branch_correlation[ip])
-                    end
-                end
-            end
-
-            isempty(xp) && continue
-            push!(traces, scatter(
-                x=xp,
-                y=yp,
-                mode="markers+lines",
-                marker=attr(size=8, color="#2ca02c", symbol="circle", line=attr(color="white", width=0.8)),
-                line=attr(color="#2ca02c", width=1.8),
-                name="Avg matched peak $(pidx)",
-                hovertemplate="Matched Avg<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
-                customdata=cp
-            ))
-        end
-    else
-        branches = [
-            ("Causal", result.causal_result, "#1f77b4", "circle"),
-            ("Acausal", result.acausal_result, "#d62728", "diamond"),
-        ]
-
-        for (branch_name, mft_res, color, marker_symbol) in branches
-            max_peaks = maximum(length.(mft_res.all_peaks); init=0)
-            max_peaks == 0 && continue
-
-            for pidx in 1:max_peaks
-                xp = Float64[]
-                yp = Float64[]
-                cp = Float64[]
-
-                for ip in hi_idx
-                    peaks = mft_res.all_peaks[ip]
-                    if pidx <= length(peaks)
-                        tpk, _ = peaks[pidx]
-                        if isfinite(tpk) && tpk > 0.0
-                            vpk = result.distance / tpk
-                            if isfinite(vpk) && vpk > 0.0
-                                push!(xp, mft_res.periods[ip])
-                                push!(yp, vpk)
-                                push!(cp, result.branch_correlation[ip])
-                                push!(all_vels, vpk)
-                            end
-                        end
-                    end
-                end
-
-                isempty(xp) && continue
-
-                push!(traces, scatter(
-                    x=xp,
-                    y=yp,
-                    mode="markers+lines",
-                    marker=attr(size=8, color=color, symbol=marker_symbol, line=attr(color="white", width=0.8)),
-                    line=attr(color=color, width=1.8),
-                    name="$(branch_name) peak $(pidx)",
-                    hovertemplate="$(branch_name)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
-                    customdata=cp
-                ))
-            end
-        end
-    end
-
-    if length(traces) == 1 || isempty(all_vels)
-        @warn "No valid peak-derived group-velocity picks found in high-correlation periods"
-        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No valid high-correlation picks"]))
-    end
-
-    y_min = 0.9 * minimum(all_vels)
-    y_max = 1.1 * maximum(all_vels)
-    n_hi = length(hi_idx)
-
-    layout = Layout(
-        title=attr(text="$(title) (N=$(n_hi), threshold=$(correlation_threshold))", font=attr(size=font_size + 2, family=font_family)),
-        xaxis=attr(title="Period (s)", type="linear", range=[minimum(result.periods), maximum(result.periods)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        yaxis=attr(title="Group Velocity (km/s)", range=[y_min, y_max], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        width=width,
-        height=height,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        margin=attr(l=80, r=80, t=80, b=80),
-        showlegend=true,
-        legend=attr(x=1.02, y=1.0, font=attr(size=font_size - 2), bgcolor="rgba(255,255,255,0.8)", borderwidth=1)
-    )
-
-    return PlutoPlotly.plot(traces, layout)
-end
-
-# ╔═╡ 58d6ecb6-2c42-4a53-9cbc-b72ebf48356c
-"""
-    plot_all_highcorr_groupvelocity_picks(result::BranchBatchAnalysisResult;
-                                          correlation_threshold=0.85,
-                                          colorscale="Viridis",
-                                          width=1200,
-                                          height=700,
-                                          font_family="Arial, sans-serif",
-                                          font_size=13,
-                                          title="All High-Correlation Group-Velocity Picks Across Source States")
-
-Plot all envelope-peak group-velocity picks for every source state, restricted to
-periods where that state's branch correlation is above `correlation_threshold`.
-"""
-function plot_all_highcorr_groupvelocity_picks(result::BranchBatchAnalysisResult;
-                                               correlation_threshold::Float64=0.85,
-                                               pair_and_average::Bool=false,
-                                               velocity_tolerance_fraction::Float64=0.10,
-                                               colorscale::String="Viridis",
-                                               width::Int=1200,
-                                               height::Int=700,
-                                               font_family::String="Arial, sans-serif",
-                                               font_size::Int=13,
-                                               title::String="All High-Correlation Group-Velocity Picks Across Source States")
-    nstates = length(result.state_results)
-    nstates == 0 && return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No source states"]))
-
-    state_colors = _sample_scheme_colors(colorscale, max(nstates, 2))
-    traces = [scatter()]
-    all_vels = Float64[]
-    total_hi = 0
-
-    for i in 1:nstates
-        st = result.state_results[i]
-        label = result.state_labels[i]
-        hi_idx = high_correlation_indices(st; correlation_threshold=correlation_threshold)
-        total_hi += length(hi_idx)
-        isempty(hi_idx) && continue
-
-        if pair_and_average
-            matched_by_period = Dict{Int,Vector{Float64}}()
-            max_matched = 0
-
-            for ip in hi_idx
-                causal_peaks = st.causal_result.all_peaks[ip]
-                acausal_peaks = st.acausal_result.all_peaks[ip]
-                vavg = _matched_peak_average_velocities(causal_peaks, acausal_peaks, st.distance;
-                                                        velocity_tolerance_fraction=velocity_tolerance_fraction)
-                isempty(vavg) && continue
-                matched_by_period[ip] = vavg
-                max_matched = max(max_matched, length(vavg))
-            end
-
-            for pidx in 1:max_matched
-                xp = Float64[]
-                yp = Float64[]
-                cp = Float64[]
-
-                for ip in hi_idx
-                    if haskey(matched_by_period, ip)
-                        vals = matched_by_period[ip]
-                        if pidx <= length(vals)
-                            push!(xp, st.periods[ip])
-                            push!(yp, vals[pidx])
-                            push!(cp, st.branch_correlation[ip])
-                            push!(all_vels, vals[pidx])
-                        end
-                    end
-                end
-
-                isempty(xp) && continue
-
-                push!(traces, scatter(
-                    x=xp,
-                    y=yp,
-                    mode="markers",
-                    marker=attr(
-                        size=7,
-                        color=state_colors[i],
-                        opacity=0.82,
-                        symbol="circle",
-                        line=attr(color="white", width=0.7)
-                    ),
-                    name="$(label) | Avg matched p$(pidx)",
-                    hovertemplate="State: $(label)<br>Type: Avg matched<br>Peak: $(pidx)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
-                    customdata=cp
-                ))
-            end
-
-            continue
-        end
-
-        branch_defs = [
-            ("Causal", st.causal_result, "circle"),
-            ("Acausal", st.acausal_result, "diamond"),
-        ]
-
-        for (branch_name, mft_res, marker_symbol) in branch_defs
-            max_peaks = maximum(length.(mft_res.all_peaks); init=0)
-            max_peaks == 0 && continue
-
-            for pidx in 1:max_peaks
-                xp = Float64[]
-                yp = Float64[]
-                cp = Float64[]
-
-                for ip in hi_idx
-                    peaks = mft_res.all_peaks[ip]
-                    if pidx <= length(peaks)
-                        tpk, _ = peaks[pidx]
-                        if isfinite(tpk) && tpk > 0.0
-                            vpk = st.distance / tpk
-                            if isfinite(vpk) && vpk > 0.0
-                                push!(xp, mft_res.periods[ip])
-                                push!(yp, vpk)
-                                push!(cp, st.branch_correlation[ip])
-                                push!(all_vels, vpk)
-                            end
-                        end
-                    end
-                end
-
-                isempty(xp) && continue
-
-                push!(traces, scatter(
-                    x=xp,
-                    y=yp,
-                    mode="markers",
-                    marker=attr(
-                        size=7,
-                        color=state_colors[i],
-                        opacity=0.78,
-                        symbol=marker_symbol,
-                        line=attr(color="white", width=0.7)
-                    ),
-                    name="$(label) | $(branch_name) p$(pidx)",
-                    hovertemplate="State: $(label)<br>Branch: $(branch_name)<br>Peak: $(pidx)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
-                    customdata=cp
-                ))
-            end
-        end
-    end
-
-    if length(traces) == 1 || isempty(all_vels)
-        @warn "No valid high-correlation picks across source states"
-        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No valid high-correlation picks"]))
-    end
-
-    y_min = 0.9 * minimum(all_vels)
-    y_max = 1.1 * maximum(all_vels)
-
-    layout = Layout(
-        title=attr(text="$(title) (threshold=$(correlation_threshold), high-corr samples=$(total_hi))", font=attr(size=font_size + 2, family=font_family)),
-        xaxis=attr(title="Period (s)", type="linear", range=[minimum(result.periods), maximum(result.periods)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        yaxis=attr(title="Group Velocity (km/s)", range=[y_min, y_max], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
-        width=width,
-        height=height,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        margin=attr(l=80, r=120, t=80, b=80),
-        showlegend=true,
-        legend=attr(x=1.02, y=1.0, font=attr(size=font_size - 2), bgcolor="rgba(255,255,255,0.8)", borderwidth=1)
-    )
-
-    return PlutoPlotly.plot(traces, layout)
-end
-
 # ╔═╡ a079a952-8252-4f56-a4c7-2a9ae58e0f11
 """
     SourceStateConsensusPick
@@ -3702,6 +3386,319 @@ function plot_consensus_groupvelocity_picks(batch_result::BranchBatchAnalysisRes
     return PlutoPlotly.plot(traces, layout)
 end
 
+# ╔═╡ 07f578f5-f269-45f1-a6e6-c90f4d0f5c2f
+"""
+    plot_all_highcorr_groupvelocity_picks(result::BranchAnalysisResult;
+                                          correlation_threshold=0.85,
+                                          width=1000,
+                                          height=600,
+                                          font_family="Arial, sans-serif",
+                                          font_size=14,
+                                          title="All High-Correlation Group-Velocity Picks")
+
+Plot all causal and acausal envelope-peak group-velocity picks, restricted to periods
+where branch correlation is above `correlation_threshold`.
+"""
+function plot_all_highcorr_groupvelocity_picks(result::BranchAnalysisResult;
+                                               correlation_threshold::Float64=0.85,
+                                               pair_and_average::Bool=false,
+                                               velocity_tolerance_fraction::Float64=0.10,
+                                               width::Int=1000,
+                                               height::Int=600,
+                                               font_family::String="Arial, sans-serif",
+                                               font_size::Int=14,
+                                               title::String="All High-Correlation Group-Velocity Picks")
+    hi_idx = high_correlation_indices(result; correlation_threshold=correlation_threshold)
+    if isempty(hi_idx)
+        @warn "No periods satisfy the correlation threshold $(correlation_threshold)"
+        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No high-correlation periods"]))
+    end
+
+    traces = [scatter()]
+    all_vels = Float64[]
+
+    if pair_and_average
+        matched_by_period = Dict{Int,Vector{Float64}}()
+        max_matched = 0
+
+        for ip in hi_idx
+            causal_peaks = result.causal_result.all_peaks[ip]
+            acausal_peaks = result.acausal_result.all_peaks[ip]
+            vavg = _matched_peak_average_velocities(causal_peaks, acausal_peaks, result.distance;
+                                                    velocity_tolerance_fraction=velocity_tolerance_fraction)
+            isempty(vavg) && continue
+            matched_by_period[ip] = vavg
+            max_matched = max(max_matched, length(vavg))
+            append!(all_vels, vavg)
+        end
+
+        for pidx in 1:max_matched
+            xp = Float64[]
+            yp = Float64[]
+            cp = Float64[]
+
+            for ip in hi_idx
+                if haskey(matched_by_period, ip)
+                    vals = matched_by_period[ip]
+                    if pidx <= length(vals)
+                        push!(xp, result.periods[ip])
+                        push!(yp, vals[pidx])
+                        push!(cp, result.branch_correlation[ip])
+                    end
+                end
+            end
+
+            isempty(xp) && continue
+            push!(traces, scatter(
+                x=xp,
+                y=yp,
+                mode="markers+lines",
+                marker=attr(size=8, color="#2ca02c", symbol="circle", line=attr(color="white", width=0.8)),
+                line=attr(color="#2ca02c", width=1.8),
+                name="Avg matched peak $(pidx)",
+                hovertemplate="Matched Avg<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
+                customdata=cp
+            ))
+        end
+    else
+        branches = [
+            ("Causal", result.causal_result, "#1f77b4", "circle"),
+            ("Acausal", result.acausal_result, "#d62728", "diamond"),
+        ]
+
+        for (branch_name, mft_res, color, marker_symbol) in branches
+            max_peaks = maximum(length.(mft_res.all_peaks); init=0)
+            max_peaks == 0 && continue
+
+            for pidx in 1:max_peaks
+                xp = Float64[]
+                yp = Float64[]
+                cp = Float64[]
+
+                for ip in hi_idx
+                    peaks = mft_res.all_peaks[ip]
+                    if pidx <= length(peaks)
+                        tpk, _ = peaks[pidx]
+                        if isfinite(tpk) && tpk > 0.0
+                            vpk = result.distance / tpk
+                            if isfinite(vpk) && vpk > 0.0
+                                push!(xp, mft_res.periods[ip])
+                                push!(yp, vpk)
+                                push!(cp, result.branch_correlation[ip])
+                                push!(all_vels, vpk)
+                            end
+                        end
+                    end
+                end
+
+                isempty(xp) && continue
+
+                push!(traces, scatter(
+                    x=xp,
+                    y=yp,
+                    mode="markers+lines",
+                    marker=attr(size=8, color=color, symbol=marker_symbol, line=attr(color="white", width=0.8)),
+                    line=attr(color=color, width=1.8),
+                    name="$(branch_name) peak $(pidx)",
+                    hovertemplate="$(branch_name)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
+                    customdata=cp
+                ))
+            end
+        end
+    end
+
+    if length(traces) == 1 || isempty(all_vels)
+        @warn "No valid peak-derived group-velocity picks found in high-correlation periods"
+        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No valid high-correlation picks"]))
+    end
+
+    y_min = 0.9 * minimum(all_vels)
+    y_max = 1.1 * maximum(all_vels)
+    n_hi = length(hi_idx)
+
+    layout = Layout(
+        title=attr(text="$(title) (N=$(n_hi), threshold=$(correlation_threshold))", font=attr(size=font_size + 2, family=font_family)),
+        xaxis=attr(title="Period (s)", type="linear", range=[minimum(result.periods), maximum(result.periods)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        yaxis=attr(title="Group Velocity (km/s)", range=[y_min, y_max], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        width=width,
+        height=height,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        margin=attr(l=80, r=80, t=80, b=80),
+        showlegend=true,
+        legend=attr(x=1.02, y=1.0, font=attr(size=font_size - 2), bgcolor="rgba(255,255,255,0.8)", borderwidth=1)
+    )
+
+    return PlutoPlotly.plot(traces, layout)
+end
+
+# ╔═╡ 58d6ecb6-2c42-4a53-9cbc-b72ebf48356c
+"""
+    plot_all_highcorr_groupvelocity_picks(result::BranchBatchAnalysisResult;
+                                          correlation_threshold=0.85,
+                                          colorscale="Viridis",
+                                          width=1200,
+                                          height=700,
+                                          font_family="Arial, sans-serif",
+                                          font_size=13,
+                                          title="All High-Correlation Group-Velocity Picks Across Source States")
+
+Plot all envelope-peak group-velocity picks for every source state, restricted to
+periods where that state's branch correlation is above `correlation_threshold`.
+"""
+function plot_all_highcorr_groupvelocity_picks(result::BranchBatchAnalysisResult;
+                                               correlation_threshold::Float64=0.85,
+                                               pair_and_average::Bool=false,
+                                               velocity_tolerance_fraction::Float64=0.10,
+                                               colorscale::String="Viridis",
+                                               width::Int=1200,
+                                               height::Int=700,
+                                               font_family::String="Arial, sans-serif",
+                                               font_size::Int=13,
+                                               title::String="All High-Correlation Group-Velocity Picks Across Source States")
+    nstates = length(result.state_results)
+    nstates == 0 && return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No source states"]))
+
+    state_colors = _sample_scheme_colors(colorscale, max(nstates, 2))
+    traces = [scatter()]
+    all_vels = Float64[]
+    total_hi = 0
+
+    for i in 1:nstates
+        st = result.state_results[i]
+        label = result.state_labels[i]
+        hi_idx = high_correlation_indices(st; correlation_threshold=correlation_threshold)
+        total_hi += length(hi_idx)
+        isempty(hi_idx) && continue
+
+        if pair_and_average
+            matched_by_period = Dict{Int,Vector{Float64}}()
+            max_matched = 0
+
+            for ip in hi_idx
+                causal_peaks = st.causal_result.all_peaks[ip]
+                acausal_peaks = st.acausal_result.all_peaks[ip]
+                vavg = _matched_peak_average_velocities(causal_peaks, acausal_peaks, st.distance;
+                                                        velocity_tolerance_fraction=velocity_tolerance_fraction)
+                isempty(vavg) && continue
+                matched_by_period[ip] = vavg
+                max_matched = max(max_matched, length(vavg))
+            end
+
+            for pidx in 1:max_matched
+                xp = Float64[]
+                yp = Float64[]
+                cp = Float64[]
+
+                for ip in hi_idx
+                    if haskey(matched_by_period, ip)
+                        vals = matched_by_period[ip]
+                        if pidx <= length(vals)
+                            push!(xp, st.periods[ip])
+                            push!(yp, vals[pidx])
+                            push!(cp, st.branch_correlation[ip])
+                            push!(all_vels, vals[pidx])
+                        end
+                    end
+                end
+
+                isempty(xp) && continue
+
+                push!(traces, scatter(
+                    x=xp,
+                    y=yp,
+                    mode="markers",
+                    marker=attr(
+                        size=7,
+                        color=state_colors[i],
+                        opacity=0.82,
+                        symbol="circle",
+                        line=attr(color="white", width=0.7)
+                    ),
+                    name="$(label) | Avg matched p$(pidx)",
+                    hovertemplate="State: $(label)<br>Type: Avg matched<br>Peak: $(pidx)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
+                    customdata=cp
+                ))
+            end
+
+            continue
+        end
+
+        branch_defs = [
+            ("Causal", st.causal_result, "circle"),
+            ("Acausal", st.acausal_result, "diamond"),
+        ]
+
+        for (branch_name, mft_res, marker_symbol) in branch_defs
+            max_peaks = maximum(length.(mft_res.all_peaks); init=0)
+            max_peaks == 0 && continue
+
+            for pidx in 1:max_peaks
+                xp = Float64[]
+                yp = Float64[]
+                cp = Float64[]
+
+                for ip in hi_idx
+                    peaks = mft_res.all_peaks[ip]
+                    if pidx <= length(peaks)
+                        tpk, _ = peaks[pidx]
+                        if isfinite(tpk) && tpk > 0.0
+                            vpk = st.distance / tpk
+                            if isfinite(vpk) && vpk > 0.0
+                                push!(xp, mft_res.periods[ip])
+                                push!(yp, vpk)
+                                push!(cp, st.branch_correlation[ip])
+                                push!(all_vels, vpk)
+                            end
+                        end
+                    end
+                end
+
+                isempty(xp) && continue
+
+                push!(traces, scatter(
+                    x=xp,
+                    y=yp,
+                    mode="markers",
+                    marker=attr(
+                        size=7,
+                        color=state_colors[i],
+                        opacity=0.78,
+                        symbol=marker_symbol,
+                        line=attr(color="white", width=0.7)
+                    ),
+                    name="$(label) | $(branch_name) p$(pidx)",
+                    hovertemplate="State: $(label)<br>Branch: $(branch_name)<br>Peak: $(pidx)<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Corr: %{customdata:.3f}<extra></extra>",
+                    customdata=cp
+                ))
+            end
+        end
+    end
+
+    if length(traces) == 1 || isempty(all_vels)
+        @warn "No valid high-correlation picks across source states"
+        return PlutoPlotly.plot(scatter(x=[0.0], y=[0.0], text=["No valid high-correlation picks"]))
+    end
+
+    y_min = 0.9 * minimum(all_vels)
+    y_max = 1.1 * maximum(all_vels)
+
+    layout = Layout(
+        title=attr(text="$(title) (threshold=$(correlation_threshold), high-corr samples=$(total_hi))", font=attr(size=font_size + 2, family=font_family)),
+        xaxis=attr(title="Period (s)", type="linear", range=[minimum(result.periods), maximum(result.periods)], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        yaxis=attr(title="Group Velocity (km/s)", range=[y_min, y_max], showgrid=true, gridcolor="rgba(128,128,128,0.2)"),
+        width=width,
+        height=height,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        margin=attr(l=80, r=120, t=80, b=80),
+        showlegend=true,
+        legend=attr(x=1.02, y=1.0, font=attr(size=font_size - 2), bgcolor="rgba(255,255,255,0.8)", borderwidth=1)
+    )
+
+    return PlutoPlotly.plot(traces, layout)
+end
+
 # ╔═╡ 6e91e0bb-ef16-48bc-a9c9-f5b2d691ee1a
 """
     ReceiverPairGeometry
@@ -3824,7 +3821,7 @@ function similar_ray_paths(a::ReceiverPairGeometry, b::ReceiverPairGeometry;
            dist_rel <= distance_tolerance_fraction
 end
 
-# ╔═╡ 730cd90e-9afe-413a-ae31-fe624a919bb8
+# ╔═╡ 730cd90e-9afe-413a-ae31-1fe624a919bb8
 function _nonoverlapping_candidate_sets(consensus::SourceStateConsensusPick;
                                         max_mix_parts::Int=3,
                                         min_candidate_periods::Int=2)
@@ -3940,7 +3937,7 @@ function tomography_candidate_mixes(pairs::Vector{PairConsensusForTomography};
             coverage >= min_candidate_periods || continue
             mean_conf = _mean_finite([c for c in confidence if c > 0.0])
             isfinite(mean_conf) || (mean_conf = 0.0)
-            label = "$(item.label) | candidates $(join(candidate_indices, "+"))"
+            label = "$(item.label) | candidates $(join(candidate_indices, \"+\"))"
             push!(mixes, TomographyCandidateMix(pair_index, label, candidate_indices,
                                                 velocities, confidence, support,
                                                 coverage, mean_conf, 0.0, 0.0))
@@ -4689,7 +4686,6 @@ version = "17.7.0+0"
 # ╠═fcf48627-0b80-4c6b-b204-f40da981aaa5
 # ╠═d5ca213a-b085-4d65-88fa-d221bf5826e1
 # ╠═4192fcef-4662-4944-b354-71e8e00285b1
-# ╠═2c1a711e-261e-4e82-ade2-2fb6bc0e6b93
 # ╠═e9bfb21b-f29d-410f-827f-e66d1117020f
 # ╠═f71ee0c9-1e34-49c2-9385-4589c561f4e4
 # ╠═aae31a73-fef6-48dc-a2b8-fb9b12c03099
@@ -4773,7 +4769,7 @@ version = "17.7.0+0"
 # ╠═40e5fc55-8f4e-43fa-8ac7-eaa9608a18c7
 # ╠═f203a997-875b-42df-a0af-196d11e7c0af
 # ╠═a05f6476-568b-4c82-9512-f74ae6d6c8f3
-# ╠═730cd90e-9afe-413a-ae31-fe624a919bb8
+# ╠═730cd90e-9afe-413a-ae31-1fe624a919bb8
 # ╠═eab08182-daca-4206-882b-e4fb24ae17a2
 # ╠═c6331917-8167-4dfa-9a50-6fe0888d16d5
 # ╠═3626d6ca-38f2-4b38-9398-9cd052f43950

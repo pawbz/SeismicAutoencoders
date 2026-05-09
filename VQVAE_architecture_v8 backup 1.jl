@@ -9,6 +9,7 @@ begin
     using ConcreteStructs,
         Dates,
         DSP,
+        FFTW,
         Enzyme,
         EnzymeCore,
         JLD2,
@@ -31,11 +32,11 @@ using Distances
 
 # ╔═╡ 10000002-0000-0000-0000-000000000001
 md"""
-# VQ-VAE v7 Architecture
+# VQ-VAE v8 Architecture
 
-Lux/Reactant single-pair RVQ VQ-VAE.  Each station pair trains an independent
-model, so there are no pair ids, pair-specific codebooks, or receiver-geometry
-conditioners in this version.
+Lux/Reactant single-pair RVQ VQ-VAE with SEANet-style encoder/decoder.
+Each station pair trains an independent model, so there are no pair ids,
+pair-specific codebooks, or receiver-geometry conditioners in this version.
 """
 
 # ╔═╡ 10000003-0000-0000-0000-000000000001
@@ -63,21 +64,21 @@ Base.@kwdef struct VQVAE_Para
     nt::Int
     d::Int = 64
     beta_commit::Float32 = 0.25f0
-    enc_kernels::Vector{Int} = [32, 16, 8, 4]
-    enc_filters::Vector{Int} = [8, 16, 32, 64]
-    enc_strides::Vector{Int} = [1, 1, 1, 1]
-    dec_kernels::Vector{Int} = [4, 8, 16]
-    dec_filters::Vector{Int} = [64, 48, 16, 1]
+    n_filters::Int = 32
+    ratios::Vector{Int} = [4, 2]
+    n_residual_layers::Int = 1
+    dilation_base::Int = 2
+    residual_kernel_size::Int = 3
+    enc_kernel_size::Int = 7
+    dec_kernel_size::Int = 7
     use_bn::Bool = false
     K::Vector{Int} = [5]
     ema_decay::Float32 = 0.99f0
     epsilon::Float32 = 1f-5
     dead_threshold::Int = 50
+    p_stage2_shuffle::Float32 = 0.25f0
     entropy_weight::Float32 = 0.01f0
     reconstruction_loss::Symbol = :l2
-    interstation_distance::Union{Nothing,Float64} = nothing
-    velocity_range::Tuple{Float64,Float64} = (2.0, 4.0)
-    dt::Float64 = 1.0
     seed::Int = 1234
 end
 
@@ -126,81 +127,70 @@ begin
         return ntuple(j -> j == i ? x : t[j], length(t))
     end
 
-    function compute_latent_window(para::VQVAE_Para)
-        isnothing(para.interstation_distance) && return (nothing, 1)
-        total_stride = prod(para.enc_strides)
-        total_stride > 0 || error("enc_strides must have positive product.")
-        vmin, vmax = para.velocity_range
-        0 < vmin < vmax || error("velocity_range must be (vmin, vmax) with 0 < vmin < vmax.")
-        para.dt > 0 || error("dt must be positive.")
-        distance = para.interstation_distance
-        t_fast = distance / vmax / para.dt
-        t_slow = distance / vmin / para.dt
-        lstart = round(Int, t_fast / total_stride) + 1
-        lend = round(Int, t_slow / total_stride) + 1
-        return (lstart, lend)
-    end
 end
 
 # ╔═╡ 1000000a-0000-0000-0000-000000000001
 md"## Lux Encoder and Decoder"
 
 # ╔═╡ ef07d7ea-9aaa-4fed-b3f3-a6a2acc85650
-function make_encoder(para::VQVAE_Para)
-    length(para.enc_kernels) == length(para.enc_filters) ||
-        error("enc_kernels and enc_filters must have the same length.")
+function make_seanet_residual_block(dim, n_residual_layers, dilation_base, residual_kernel_size)
     layers = Any[]
-    nin = 1
-    for (i, k) in enumerate(para.enc_kernels)
-        nout = para.enc_filters[i]
-        stride = i <= length(para.enc_strides) ? para.enc_strides[i] : 1
-        push!(layers, Conv((k,), nin => nout, activation; pad=SamePad(), stride=stride))
-        if para.use_bn && i < length(para.enc_kernels)
-            push!(layers, BatchNorm(nout))
-        end
-        nin = nout
+    hidden = max(1, dim ÷ 2)
+    for j in 0:n_residual_layers-1
+        d = dilation_base ^ j
+        block = Chain(
+            activation,
+            Conv((residual_kernel_size,), dim => hidden, activation; pad=SamePad(), dilation=d),
+            Conv((1,), hidden => dim; pad=SamePad()),
+        )
+        push!(layers, @compact(; block) do x
+            @return x + block(x)
+        end)
     end
     return Chain(layers...)
 end
 
-# ╔═╡ 0e5e3563-8738-4831-a9b5-16c6803743f7
-function infer_dec_upstrides(enc_strides::AbstractVector{<:Integer}, n_dec_layers::Int)
-    vals = Int.(reverse(collect(enc_strides)))
-    while length(vals) > n_dec_layers
-        vals[2] *= vals[1]
-        deleteat!(vals, 1)
+function make_encoder(para)
+    ratios = reverse(para.ratios)
+    mult = 1
+    layers = Any[]
+    push!(layers, Conv((para.enc_kernel_size,), 1 => mult * para.n_filters; pad=SamePad()))
+    for ratio in ratios
+        push!(layers, make_seanet_residual_block(
+            mult * para.n_filters, para.n_residual_layers, para.dilation_base, para.residual_kernel_size))
+        push!(layers, activation)
+        push!(layers, Conv((ratio * 2,), mult * para.n_filters => mult * para.n_filters * 2;
+            stride=ratio, pad=SamePad()))
+        mult *= 2
     end
-    while length(vals) < n_dec_layers
-        push!(vals, 1)
-    end
-    return vals
+    push!(layers, activation)
+    push!(layers, Conv((para.enc_kernel_size,), mult * para.n_filters => mult * para.n_filters; pad=SamePad()))
+    return Chain(layers...)
 end
 
 # ╔═╡ a0416f71-242a-44a7-b8f6-186726318611
-function make_decoder(para::VQVAE_Para, latent_len::Int)
-    length(para.dec_kernels) == length(para.dec_filters) - 1 ||
-        error("dec_kernels length must be dec_filters length - 1.")
-    upstrides = infer_dec_upstrides(para.enc_strides, length(para.dec_kernels))
+function make_decoder(para, latent_len::Int)
+    ratios = para.ratios
+    mult = 2 ^ length(ratios)
+
     bottleneck_len = para.nt
-    for stride in upstrides
-        bottleneck_len = cld(bottleneck_len, stride)
-    end
-    bottleneck_channels = para.dec_filters[1]
+    for r in ratios; bottleneck_len = cld(bottleneck_len, r); end
+    bottleneck_channels = para.n_filters * mult
 
     layers = Any[]
-    nin = bottleneck_channels
-    for (i, k) in enumerate(para.dec_kernels)
-        nout = para.dec_filters[i + 1]
-        stride = upstrides[i]
-        if i < length(para.dec_kernels)
-            push!(layers, ConvTranspose((k,), nin => nout, activation; stride, pad=SamePad()))
-            para.use_bn && push!(layers, BatchNorm(nout))
-        else
-            push!(layers, ConvTranspose((k,), nin => nout; stride, pad=SamePad()))
-        end
-        nin = nout
+    push!(layers, Conv((para.dec_kernel_size,), bottleneck_channels => mult * para.n_filters; pad=SamePad()))
+    for ratio in ratios
+        push!(layers, activation)
+        push!(layers, ConvTranspose((ratio * 2,), mult * para.n_filters => mult * para.n_filters ÷ 2;
+            stride=ratio, pad=SamePad()))
+        mult ÷= 2
+        push!(layers, make_seanet_residual_block(
+            mult * para.n_filters, para.n_residual_layers, para.dilation_base, para.residual_kernel_size))
     end
+    push!(layers, activation)
+    push!(layers, Conv((para.dec_kernel_size,), para.n_filters => 1; pad=SamePad()))
     upchain = Chain(layers...)
+
     linear = Dense(para.d, bottleneck_len * bottleneck_channels, activation)
     return @compact(; linear, upchain, bottleneck_len, bottleneck_channels) do z
         y = linear(z)
@@ -311,7 +301,7 @@ end
 # ╔═╡ 66ddf04d-ee60-4a0b-9444-d09af23685ea
 begin
 	function rvq_quantize(z_e, rvq_state, K::Tuple; beta_commit::Float32, ema_decay::Float32,
-	    epsilon::Float32, dead_threshold::Int, training::Bool)
+	    epsilon::Float32, dead_threshold::Int, p_stage2_shuffle::Float32=0f0, training::Bool)
 	    residual = z_e
 	    z_q_total = zero(z_e)
 	    stages = rvq_state.stages
@@ -321,14 +311,23 @@ begin
 	    entropy_loss = 0f0
 	    perplexity_total = 0f0
 	    stage_perplexities = ()
-	
+
 	    for s in eachindex(K)
 	        stage = stages[s]
-	        z_q_detached, indices = EnzymeCore.ignore_derivatives(vq_lookup(stage.embedding, residual))
+	        _, indices = EnzymeCore.ignore_derivatives(vq_lookup(stage.embedding, residual))
+	        # randomly permute stage-2+ assignments during training to discourage inter-stage correlation
+	        indices = if training && s > 1 && p_stage2_shuffle > 0f0
+	            rng_local = Lux.replicate(stage.rng)
+	            rand(rng_local, Float32) < p_stage2_shuffle ?
+	                indices[randperm(rng_local, length(indices))] : indices
+	        else
+	            indices
+	        end
+	        z_q_detached = EnzymeCore.ignore_derivatives(stage.embedding[:, indices])
 	        if !training
 	            all_indices = (all_indices..., reshape(indices, 1, :))
 	        end
-	
+
 	        counts = if training
 	            new_stage, counts_local = update_rvq_stage_state(stage, residual, indices,
 	                ema_decay, epsilon, dead_threshold)
@@ -337,7 +336,7 @@ begin
 	        else
 	            counts_and_sums(EnzymeCore.ignore_derivatives(residual), indices, K[s])[1]
 	        end
-	
+
 	        z_q = residual .+ EnzymeCore.ignore_derivatives(z_q_detached .- residual)
 	        z_q_total = z_q_total .+ z_q
 	        residual = residual .- EnzymeCore.ignore_derivatives(z_q_detached)
@@ -364,7 +363,7 @@ begin
 	end
 	
 	function prepare_rvq_payload(z_e, rvq_state, K::Tuple; ema_decay::Float32,
-	    epsilon::Float32, dead_threshold::Int, training::Bool)
+	    epsilon::Float32, dead_threshold::Int, p_stage2_shuffle::Float32=0f0, training::Bool)
 	    residual = z_e
 	    stages = rvq_state.stages
 	    new_stages = stages
@@ -372,12 +371,21 @@ begin
 	    counts_stages = ()
 	    entropy_loss = 0f0
 	    perplexity_total = 0f0
-	
+
 	    for s in eachindex(K)
 	        stage = stages[s]
-	        z_q_detached, indices = vq_lookup(stage.embedding, residual)
+	        _, indices = vq_lookup(stage.embedding, residual)
+	        # randomly permute stage-2+ assignments during training to discourage inter-stage correlation
+	        indices = if training && s > 1 && p_stage2_shuffle > 0f0
+	            rng_local = Lux.replicate(stage.rng)
+	            rand(rng_local, Float32) < p_stage2_shuffle ?
+	                indices[randperm(rng_local, length(indices))] : indices
+	        else
+	            indices
+	        end
+	        z_q_detached = stage.embedding[:, indices]
 	        z_q_stages = (z_q_stages..., Float32.(z_q_detached))
-	
+
 	        counts = if training
 	            new_stage, counts_local = update_rvq_stage_state(stage, residual, indices,
 	                ema_decay, epsilon, dead_threshold)
@@ -386,7 +394,7 @@ begin
 	        else
 	            counts_and_sums(residual, indices, K[s])[1]
 	        end
-	
+
 	        counts_stages = (counts_stages..., Float32.(counts))
 	        residual = residual .- z_q_detached
 	        perplexity, stage_entropy_loss, _ = probs_entropy(counts)
@@ -440,8 +448,6 @@ begin
 	    K::Tuple
 	    d::Int
 	    latent_len::Int
-	    latent_time_start::Union{Nothing,Int}
-	    latent_time_end::Int
 	    beta_commit::Float32
 	    ema_decay::Float32
 	    epsilon::Float32
@@ -455,7 +461,7 @@ begin
 	        decoder=Lux.initialparameters(rng, m.decoder),
 	    )
 	end
-	
+
 	function Lux.initialstates(rng::AbstractRNG, m::VQVAE)
 	    return (;
 	        encoder=Lux.initialstates(rng, m.encoder),
@@ -465,39 +471,37 @@ begin
 	    )
 	end
 	
-	function encoder_latents(m::VQVAE, x, ps, st)
+	function encoder_latents(m, x, ps, st)
 	    feat, st_enc = m.encoder(waveform_to_conv3(x), ps.encoder, st.encoder)
 	    L, C, B = size(feat)
-	    L == m.latent_len || error("Expected latent_len=$(m.latent_len), got $L.")
-	    feat_selected = isnothing(m.latent_time_start) ? feat :
-	        feat[m.latent_time_start:m.latent_time_end, :, :]
-	    Lsel = size(feat_selected, 1)
-	    feat_flat = reshape(permutedims(feat_selected, (2, 1, 3)), C * Lsel, B)
+	    feat_flat = reshape(permutedims(feat, (2, 1, 3)), C * L, B)
 	    z_e, st_pre = m.pre_vq(feat_flat, ps.pre_vq, st.pre_vq)
 	    return (; feat, feat_flat, z_e), (; encoder=st_enc, pre_vq=st_pre)
 	end
 	
-	function encode(m::VQVAE, ps, st, x; beta_commit::Float32=m.beta_commit, training::Bool=false)
+	function encode(m, ps, st, x; beta_commit::Float32=m.beta_commit, training::Bool=false)
 	    lat, st_lat = encoder_latents(m, x, ps, st)
+	    # pass 0 during inference so rvq_quantize never touches the RNG — safe for @compile
+	    _p_shuffle = training ? m.p_stage2_shuffle : 0f0
 	    q, st_rvq = rvq_quantize(lat.z_e, st.rvq, m.K; beta_commit,
 	        ema_decay=m.ema_decay, epsilon=m.epsilon,
-	        dead_threshold=m.dead_threshold, training)
+	        dead_threshold=m.dead_threshold, p_stage2_shuffle=_p_shuffle, training)
 	    st_new = (; encoder=st_lat.encoder, pre_vq=st_lat.pre_vq, decoder=st.decoder, rvq=st_rvq)
 	    return merge(lat, q), st_new
 	end
 
-	function encode_z_e_inference(m::VQVAE, ps, st, x)
+	function encode_z_e_inference(m, ps, st, x)
 	    st = Lux.testmode(st)
 	    enc, _ = encode(m, ps, st, x; training=false)
 	    return enc.z_e
 	end
 
-    function encode_z_e_training(m::VQVAE, ps, st, x)
+    function encode_z_e_training(m, ps, st, x)
         lat, _ = encoder_latents(m, x, ps, st)
         return lat.z_e
     end
 
-	function decode_from_latents(m::VQVAE, ps, st, result)
+	function decode_from_latents(m, ps, st, result)
 	    xhat, st_dec = m.decoder(result.z_q, ps.decoder, st.decoder)
 	    return merge(result, (; xhat)), merge(st, (; decoder=st_dec))
 	end
@@ -507,7 +511,7 @@ begin
 	    return decode_from_latents(m, ps, st_enc, enc)
 	end
 
-    function forward_with_precomputed_vq(m::VQVAE, x, ps, st, payload;
+    function forward_with_precomputed_vq(m, x, ps, st, payload;
         beta_commit::Float32=m.beta_commit)
         lat, st_lat = encoder_latents(m, x, ps, st)
         q = rvq_quantize_precomputed(lat.z_e, payload, m.K; beta_commit)
@@ -516,14 +520,14 @@ begin
         return decode_from_latents(m, ps, st_mid, merge(lat, q))
     end
 	
-	codebook_size(m::VQVAE) = m.K[1]
-	num_rvq_stages(m::VQVAE) = length(m.K)
+	codebook_size(m) = m.K[1]
+	num_rvq_stages(m) = length(m.K)
 	get_codebook(st, stage::Int=1) = Array(st.rvq.stages[stage].embedding)
 	get_codebooks(st) = [Array(stage.embedding) for stage in st.rvq.stages]
 end
 
 # ╔═╡ 10000010-0000-0000-0000-000000000001
-function get_vqvae(para::VQVAE_Para; rng=Random.default_rng(), device=identity)
+function get_vqvae(para; rng=Random.default_rng(), device=identity)
     isempty(para.K) && error("K must contain at least one RVQ stage size.")
     all(>(1), para.K) || error("All K entries must be > 1.")
     Random.seed!(rng, para.seed)
@@ -534,18 +538,7 @@ function get_vqvae(para::VQVAE_Para; rng=Random.default_rng(), device=identity)
     enc_dummy, _ = encoder(waveform_to_conv3(dummy), ps_enc, Lux.testmode(st_enc))
     latent_len, enc_channels, _ = size(enc_dummy)
 
-    latent_time_start, latent_time_end = compute_latent_window(para)
-    if isnothing(latent_time_start)
-        latent_time_end = latent_len
-        pre_vq_in = latent_len * enc_channels
-    else
-        latent_time_start <= latent_time_end ||
-            error("latent_time_start=$(latent_time_start) must be <= latent_time_end=$(latent_time_end).")
-        latent_time_start >= 1 && latent_time_end <= latent_len ||
-            error("latent-time interval [$latent_time_start, $latent_time_end] is out of latent length $latent_len.")
-        pre_vq_in = (latent_time_end - latent_time_start + 1) * enc_channels
-    end
-
+    pre_vq_in = latent_len * enc_channels
     pre_vq = Dense(pre_vq_in, para.d)
     decoder = make_decoder(para, latent_len)
     ps_dec, st_dec = Lux.setup(rng, decoder)
@@ -553,23 +546,14 @@ function get_vqvae(para::VQVAE_Para; rng=Random.default_rng(), device=identity)
     size(dec_dummy, 1) == para.nt ||
         error("Decoder geometry mismatch: output length $(size(dec_dummy, 1)) != nt $(para.nt). Adjust decoder strides/kernels.")
     model = VQVAE(encoder, pre_vq, decoder, Tuple(Int.(para.K)),
-        para.d, latent_len, latent_time_start, latent_time_end,
+        para.d, latent_len,
         para.beta_commit, para.ema_decay,
         para.epsilon, para.dead_threshold)
     ps, st = Lux.setup(rng, model)
     ps, st = (ps, st) |> device
 
-    loss_history = (;
-        train_objective=Float32[],
-        train_target_mse=Float32[],
-        train_commit=Float32[],
-        train_entropy=Float32[],
-        train_perplexity=Float32[],
-        test_recon_mse=Float32[],
-        epoch_time_s=Float32[],
-        throughput=Float32[],
-    )
-    @info "VQ-VAE v7 geometry" nt=para.nt d=para.d latent_len K=para.K enc_channels interstation_distance=para.interstation_distance latent_time_start latent_time_end
+    loss_history = fresh_loss_history()
+    @info "VQ-VAE v8 geometry" nt=para.nt d=para.d latent_len K=para.K enc_channels
     return model, ps, st, loss_history
 end
 
@@ -578,7 +562,7 @@ md"## Losses and kNN Targets"
 
 # ╔═╡ 13634a6c-abda-4084-9b5b-f6761fd728ad
 begin
-	function vqvae_loss(model, ps, st, x, target, para::VQVAE_Para; training::Bool)
+	function vqvae_loss(model, ps, st, x, target, para; training::Bool)
 	    result, st_new = model(x, ps, st; beta_commit=para.beta_commit, training)
 	    recon_loss = mse_loss(result.xhat, target)
 	    total = recon_loss + result.commit_loss + para.entropy_weight * result.entropy_loss
@@ -587,7 +571,7 @@ begin
 	        perplexity=result.perplexity, stage_perplexities=result.stage_perplexities)
 	end
 	
-	function vqvae_precomputed_loss(model, ps, st, batch, para::VQVAE_Para)
+	function vqvae_precomputed_loss(model, ps, st, batch, para)
 	    result, st_new = forward_with_precomputed_vq(
 	        model, batch.x, ps, st, batch.vq_payload; beta_commit=para.beta_commit
 	    )
@@ -636,9 +620,17 @@ end
 # ╔═╡ b1e8b57a-0fa3-492a-a3a1-036423f41373
 function rebuild_latent_index!(idx::LatentIndex, model, ps, st, X;
     Mnn::Int=idx.Mnn, device=identity, cdev=default_cdev(), encode_compiled=nothing,
-    knn_search_chunk_size_fraction::Float64=1.0)
+    knn_search_chunk_size_fraction::Float64=1.0, n_compiled::Union{Nothing,Int}=nothing)
     X_cpu = Float32.(cdev(flatten_batch(X)))
-    _, N = size(X_cpu)
+    _, N_full = size(X_cpu)
+    # truncate to compiled size if needed
+    N = if !isnothing(n_compiled) && N_full > n_compiled
+        @info "Latent index: truncating pair to compiled size" N_full n_compiled ignored=N_full - n_compiled
+        n_compiled
+    else
+        N_full
+    end
+    X_cpu = X_cpu[:, 1:N]
     Mnn >= 1 || error("Mnn must be >= 1.")
     N >= Mnn + 1 || error("Need at least Mnn + 1 samples; got N=$N and Mnn=$Mnn.")
     D = model.d
@@ -826,9 +818,23 @@ begin
 	        train_state.step,
 	    )
 	end
+
+	function replace_train_state_cache(train_state, cache)
+	    return Training.TrainState(
+	        cache,
+	        train_state.objective_function,
+	        train_state.allocator_cache,
+	        train_state.model,
+	        train_state.parameters,
+	        train_state.states,
+	        train_state.optimizer,
+	        train_state.optimizer_state,
+	        train_state.step,
+	    )
+	end
 	
-	function prepare_vq_training_batch(model, ps, st, batch, X_cpu, idx::Union{Nothing,LatentIndex},
-	    epoch::Int, para::VQVAE_Para, training_para::VQVAE_Training_Para;
+	function prepare_vq_training_batch(model, ps, st, batch, X_cpu, idx,
+	    epoch::Int, para, training_para;
 	    device=identity, cdev=default_cdev(), encode_compiled=nothing,
 	    ensemble_targets_cpu=nothing)
 	    target_start = time()
@@ -855,6 +861,7 @@ begin
 	        ema_decay=para.ema_decay,
 	        epsilon=para.epsilon,
 	        dead_threshold=para.dead_threshold,
+	        p_stage2_shuffle=para.p_stage2_shuffle,
 	        training=true)
 	    st_dev = merge(st, (; rvq=device(rvq_cpu)))
 	    payload_time = time() - payload_start
@@ -864,6 +871,25 @@ end
 
 # ╔═╡ cf13347d-e1fa-4ec1-86dc-38299825f65b
 begin
+    function fresh_loss_history()
+        return (;
+            train_objective=Float32[],
+            train_target_mse=Float32[],
+            train_commit=Float32[],
+            train_entropy=Float32[],
+            train_perplexity=Float32[],
+            test_recon_mse=Float32[],
+            epoch_time_s=Float32[],
+            throughput=Float32[],
+        )
+    end
+
+    function reset_vqvae(model; seed::Integer, device=identity)
+        rng = Xoshiro(seed)
+        ps, st = Lux.setup(rng, model)
+        return (ps, st) |> device
+    end
+
 	function recon_mse_inference(model, ps, st, x; normalize_target::Bool=false)
 	    target = normalize_target ? Float32.(MLUtils.normalise(x; dims=1)) : x
 	    result, _ = model(x, ps, Lux.testmode(st); training=false)
@@ -914,6 +940,103 @@ function maybe_compile_inference(model, ps, st, sample_x, training_para::VQVAE_T
     return (; encode_z_e=encode_z_e_compiled, encode_z_e_train=encode_z_e_train_compiled)
 end
 
+function compute_whitening_fir(X_cpu::AbstractMatrix{Float32}, dt::Float64;
+    kernel_length::Int=64, min_power_fraction::Float64=0.05)
+    nt = size(X_cpu, 1)
+    P = vec(mean(abs2.(fft(Float64.(X_cpu), 1)); dims=2))
+    P[1] = 0.0
+    P .= max.(P, min_power_fraction * maximum(P))
+    W = P .^ (-0.25)   # ¼ power: filtfilt squares the magnitude response → net P^(-0.5) whitening
+    W[1] = 0.0
+    w_full = real.(ifft(W))
+    w_shift = fftshift(w_full)
+    center = div(nt, 2) + 1
+    lo = center - div(kernel_length, 2)
+    taps = w_shift[lo : lo + kernel_length - 1]
+    taps .*= DSP.hann(kernel_length)
+    taps ./= sum(abs.(taps))
+    return Float32.(taps)
+end
+
+function apply_whitening_fir(X_cpu::AbstractMatrix{Float32}, fir::AbstractVector{Float32})
+    return Float32.(DSP.filtfilt(Float64.(fir), [1.0], Float64.(X_cpu)))
+end
+
+function detect_spectral_spikes(X_cpu::AbstractMatrix{Float32};
+        spike_threshold::Float64=10.0)
+    nt = size(X_cpu, 1)
+    P = vec(mean(abs2.(fft(Float64.(X_cpu), 1)); dims=2))
+    half = nt ÷ 2 + 1
+    P_half = P[1:half]
+    med = median(P_half[2:end])   # skip DC bin for median
+    spike_bins = findall(P_half .> spike_threshold * med)
+    return spike_bins, P_half, med
+end
+
+function apply_spike_suppression(X_cpu::AbstractMatrix{Float32}, spike_bins::Vector{Int};
+        suppression_factor::Float64=0.05, bandwidth_bins::Int=3)
+    nt = size(X_cpu, 1)
+    half = nt ÷ 2 + 1
+    mask = ones(Float64, nt)
+    for b in spike_bins
+        for k in max(1, b - 2*bandwidth_bins):min(half, b + 2*bandwidth_bins)
+            g = exp(-0.5 * ((k - b) / bandwidth_bins)^2)
+            mask[k] = min(mask[k], 1.0 - (1.0 - suppression_factor) * g)
+        end
+    end
+    for b in 2:half-1
+        mirror = nt - b + 2
+        mask[mirror] = mask[b]
+    end
+    X_f = fft(Float64.(X_cpu), 1)
+    X_f .*= mask
+    return Float32.(real.(ifft(X_f, 1)))
+end
+
+function compile_vqvae_helpers(model, ps, st, train_x_cpu, training_para::VQVAE_Training_Para;
+    device=identity, sample_batch_x=nothing)
+    train_x_cpu = Float32.(flatten_batch(train_x_cpu))
+    size(train_x_cpu, 2) >= training_para.batchsize ||
+        error("Training set N=$(size(train_x_cpu, 2)) is smaller than batchsize=$(training_para.batchsize).")
+    sample_batch_x = isnothing(sample_batch_x) ?
+        device(train_x_cpu[:, 1:training_para.batchsize]) : sample_batch_x
+    @info "Compiling v8 pair helpers" N=size(train_x_cpu, 2) batchsize=training_para.batchsize
+    return maybe_compile_inference(
+        model, ps, st, device(train_x_cpu), training_para;
+        device,
+        sample_batch_x,
+        compile_latent_index=true,
+        compile_train_encoder=true,
+    )
+end
+
+function compile_train_step(model, ps, st, train_x_cpu, para, training_para::VQVAE_Training_Para;
+    device=identity, cdev=default_cdev())
+    @info "Compiling v8 training step (forward+backward+optimizer)"
+    start = time()
+    opt = Optimisers.AdamW(; eta=Float64(training_para.initial_learning_rate),
+        lambda=Float64(training_para.weight_decay))
+    loss_fn = VQVAELoss(para)
+    ad_backend = training_backend(training_para, device)
+    dummy_batch_cpu = train_x_cpu[:, 1:training_para.batchsize]
+    dummy_target_cpu = Float32.(MLUtils.normalise(dummy_batch_cpu; dims=1))
+    lat, _ = encoder_latents(model, dummy_batch_cpu, cdev(ps), Lux.testmode(cdev(st)))
+    payload_cpu, rvq_cpu = prepare_rvq_payload(lat.z_e, cdev(st.rvq), model.K;
+        ema_decay=para.ema_decay, epsilon=para.epsilon,
+        dead_threshold=para.dead_threshold, p_stage2_shuffle=para.p_stage2_shuffle, training=true)
+    st_dev = merge(st, (; rvq=device(rvq_cpu)))
+    dummy_bdev = (;
+        x=device(Float32.(dummy_batch_cpu)),
+        target=device(dummy_target_cpu),
+        vq_payload=device(payload_cpu),
+    )
+    ts = Training.TrainState(model, ps, Lux.trainmode(st_dev), opt)
+    (_, _, _, ts_warmed) = Training.single_train_step!(
+        ad_backend, loss_fn, dummy_bdev, ts; return_gradients=Val(false))
+    @info "Training step compile complete" compile_time_s=round(time() - start; digits=3)
+    return ts_warmed.cache
+end
+
 # ╔═╡ 3442ef19-bf2f-4ebf-94fd-bce4dd378745
 begin
 	enzyme_training_backend() = AutoEnzyme(mode=EnzymeCore.set_runtime_activity(EnzymeCore.Reverse))
@@ -945,9 +1068,11 @@ function get_acausal_causal(pair::String, filepath::String)
     jldfile = load(matches[1])
     correlations = haskey(jldfile, "correlations") ? jldfile["correlations"] : jldfile["D"][1]
     headers = haskey(jldfile, "headers") ? jldfile["headers"] : nothing
+    latitudes = haskey(jldfile, "latitudes") ? Float64.(jldfile["latitudes"]) : nothing
+    longitudes = haskey(jldfile, "longitudes") ? Float64.(jldfile["longitudes"]) : nothing
     distance = haskey(jldfile, "dist") ? Float64(jldfile["dist"]) :
         (haskey(jldfile, "Distances") ? Float64(jldfile["Distances"][1]) : nothing)
-    return (; correlations, headers, distance)
+    return (; correlations, headers, distance, latitudes, longitudes)
 end
 
 # ╔═╡ 0b79d043-0805-43b3-80d7-f64d2018525f
@@ -979,15 +1104,16 @@ function build_training_bundle(pair::Tuple{String,String}; filepath::String, dt:
     D1fc = filtfilt(digfilter, taper(D1c))
     D1fac = Float32.(normalise(D1fac[2:end, :], dims=1))
     D1fc = Float32.(normalise(D1fc[2:end, :], dims=1))
-    return (; pair, D1=Float32.(D1), D1fac, D1fc, distance=raw.distance)
+    return (; pair, D1=Float32.(D1), D1fac, D1fc, distance=raw.distance,
+            latitudes=raw.latitudes, longitudes=raw.longitudes)
 end
 
 # ╔═╡ 8dd1c50c-587c-471d-bc80-cd77012302a9
-function make_pooled_split(D1fac, D1fc; at=0.9, shuffle=true)
+function make_pooled_split(D1fac, D1fc; at=0.9, shuffle=true, rng=Random.default_rng())
     D_all = Float32.(hcat(D1fac, D1fc))
     nw = size(D_all, 2)
     idx = collect(1:nw)
-    shuffle && Random.shuffle!(idx)
+    shuffle && Random.shuffle!(rng, idx)
     ntrain = round(Int, at * nw)
     train_idx = idx[1:ntrain]
     test_idx = idx[ntrain+1:end]
@@ -1062,6 +1188,30 @@ function cluster_averages_from_codes(x_cpu, ci; K::Int, stage::Int=1)
     return (; averages=out, counts)
 end
 
+# Joint 2-stage cluster averages: groups by (code_1, code_2) pairs → K1*K2 columns
+# Column ordering: combo index = (k2-1)*K1 + k1  (k1 varies fastest)
+# Labels returned as "(k1,k2)" strings in the same column order
+function joint_cluster_averages(x_cpu, ci; K1::Int, K2::Int)
+    nt = size(x_cpu, 1)
+    n_combos = K1 * K2
+    out = zeros(Float32, nt, n_combos)
+    counts = zeros(Int, n_combos)
+    codes1 = vec(ci[1, :])
+    codes2 = vec(ci[2, :])
+    for j in eachindex(codes1)
+        k1 = Int(codes1[j])
+        k2 = Int(codes2[j])
+        col = (k2 - 1) * K1 + k1
+        out[:, col] .+= x_cpu[:, j]
+        counts[col] += 1
+    end
+    for col in 1:n_combos
+        counts[col] > 0 && (out[:, col] ./= counts[col])
+    end
+    labels = ["($k1,$k2)" for k2 in 1:K2 for k1 in 1:K1]
+    return (; averages=out, counts, labels)
+end
+
 # ╔═╡ db53da0e-96ce-4a75-bcfc-32fdc4ffe064
 function encoded_cache(model, ps, st, data; device=identity, cdev=default_cdev())
     ps_cpu = cdev(ps)
@@ -1097,15 +1247,73 @@ end
 # ╔═╡ c974342d-4bcc-4175-9d71-8f9cfbb7105a
 function source_state_averages(model, ps, st, data; device=identity, cdev=default_cdev())
     cache = encoded_cache(model, ps, st, data; device, cdev)
-    K = model.K[1]
-    ac = cluster_averages_from_codes(Float32.(cdev(data.D_ac_all)), cache.coarse_ac; K)
-    c = cluster_averages_from_codes(Float32.(cdev(data.D_c_all)), cache.coarse_c; K)
-    return (; acausal=ac.averages, causal=c.averages,
-        counts_ac=ac.counts, counts_c=c.counts, cache)
+    if length(model.K) >= 2
+        K1, K2 = model.K[1], model.K[2]
+        ac = joint_cluster_averages(Float32.(cdev(data.D_ac_all)), cache.stage_ac; K1, K2)
+        c  = joint_cluster_averages(Float32.(cdev(data.D_c_all)),  cache.stage_c;  K1, K2)
+        return (; acausal=ac.averages, causal=c.averages,
+            counts_ac=ac.counts, counts_c=c.counts, combo_labels=ac.labels, cache)
+    else
+        K = model.K[1]
+        ac = cluster_averages_from_codes(Float32.(cdev(data.D_ac_all)), cache.coarse_ac; K)
+        c  = cluster_averages_from_codes(Float32.(cdev(data.D_c_all)),  cache.coarse_c;  K)
+        labels = string.(1:K)
+        return (; acausal=ac.averages, causal=c.averages,
+            counts_ac=ac.counts, counts_c=c.counts, combo_labels=labels, cache)
+    end
+end
+
+# ╔═╡ a1b2c3d4-0000-0000-0000-000000000001
+# Given joint_averages of shape (nt, K1*K2) with column ordering (k2-1)*K1+k1,
+# returns marginal waveforms for each stage via 2-way ANOVA decomposition:
+#   grand_mean     : (nt,)
+#   stage1_effects : (nt, K1)   — α(k1) = row-mean minus grand mean
+#   stage2_effects : (nt, K2)   — β(k2) = col-mean minus grand mean
+#   stage1_waves   : (nt, K1)   — μ + α(k1)  (ready to run MFT on)
+#   stage2_waves   : (nt, K2)   — μ + β(k2)
+#   stage1_labels  : K1 strings
+#   stage2_labels  : K2 strings
+function marginal_decomposition(averages::AbstractMatrix{Float32}, counts::AbstractVector{Int};
+        K1::Int, K2::Int)
+    nt = size(averages, 1)
+    W = reshape(Float32.(counts), K1, K2)          # weight matrix
+    A = reshape(averages, nt, K1, K2)              # (nt, K1, K2)
+
+    # weighted row/col means (weight by count so empty cells don't distort)
+    w_row = sum(W; dims=2)                         # (K1,)
+    w_col = sum(W; dims=1)                         # (K2,)
+    w_tot = sum(W)
+
+    # grand mean weighted by count
+    grand_mean = dropdims(
+        sum(A .* reshape(W, 1, K1, K2); dims=(2,3)); dims=(2,3)) ./ max(w_tot, 1f0)
+
+    # stage-1 marginal: mean over k2 for each k1
+    stage1_marginal = dropdims(
+        sum(A .* reshape(W, 1, K1, K2); dims=3); dims=3) ./
+        reshape(max.(vec(w_row), 1f0), 1, K1)      # (nt, K1)
+
+    # stage-2 marginal: mean over k1 for each k2
+    stage2_marginal = dropdims(
+        sum(A .* reshape(W, 1, K1, K2); dims=2); dims=2) ./
+        reshape(max.(vec(w_col), 1f0), 1, K2)      # (nt, K2)
+
+    stage1_effects = stage1_marginal .- grand_mean
+    stage2_effects = stage2_marginal .- grand_mean
+
+    return (;
+        grand_mean,
+        stage1_waves  = stage1_marginal,
+        stage2_waves  = stage2_marginal,
+        stage1_effects,
+        stage2_effects,
+        stage1_labels = ["s1=$k" for k in 1:K1],
+        stage2_labels = ["s2=$k" for k in 1:K2],
+    )
 end
 
 # ╔═╡ 70a460bf-b3e4-4e7c-aa4d-2674a450379a
-function plot_training_dashboard(loss_history; title="VQ-VAE v7 Training")
+function plot_training_dashboard(loss_history; title="VQ-VAE v8 Training")
     epochs = collect(1:length(loss_history.train_target_mse))
     traces = [
         PlutoPlotly.scatter(x=epochs, y=loss_history.train_objective, mode="lines", name="train_objective"),
@@ -1153,13 +1361,13 @@ function plot_state_average_matrix(avg; title::String, dt::Real=1.0, reverse_tim
         yaxis_title="State + offset", width=900, height=max(400, 70 * nstates)))
 end
 
-function plot_cluster_histogram(counts_ac, counts_c; title="Cluster Usage")
+function plot_cluster_histogram(counts_ac, counts_c; title="Cluster Usage", labels=nothing)
     K = length(counts_ac)
     total_ac = max(sum(counts_ac), 1)
     total_c  = max(sum(counts_c),  1)
     pct_ac = 100f0 .* counts_ac ./ total_ac
     pct_c  = 100f0 .* counts_c  ./ total_c
-    xlabels = string.(1:K)
+    xlabels = isnothing(labels) ? string.(1:K) : labels
     traces = [
         PlutoPlotly.bar(x=xlabels, y=pct_ac, name="Acausal",
             marker=attr(color="rgba(31,119,180,0.7)")),
@@ -1198,14 +1406,25 @@ end
 
 # ╔═╡ 11834c5a-4618-11f1-a096-01b9cbdd6fab
 function update(model, ps, st, loss_history, train_data, test_data,
-    para::VQVAE_Para, training_para::VQVAE_Training_Para=VQVAE_Training_Para();
-    device=identity, cdev=default_cdev())
+    para, training_para;
+    device=identity, cdev=default_cdev(), compiled=nothing, compile_missing::Bool=false,
+    train_step_cache=nothing, n_compiled::Union{Nothing,Int}=nothing)
 
-    train_x_cpu = Float32.(cdev(flatten_batch(train_data)))
+    setup_start = time()
+    train_x_cpu_full = Float32.(cdev(flatten_batch(train_data)))
+    # Clamp training set to compiled size so batch indices never exceed ensemble_targets_cpu columns
+    train_x_cpu = if !isnothing(n_compiled) && size(train_x_cpu_full, 2) > n_compiled
+        train_x_cpu_full[:, 1:n_compiled]
+    else
+        train_x_cpu_full
+    end
     test_x_cpu = Float32.(cdev(flatten_batch(test_data)))
     opt = Optimisers.AdamW(; eta=Float64(training_para.initial_learning_rate),
         lambda=Float64(training_para.weight_decay))
     train_state = Training.TrainState(model, ps, Lux.trainmode(st), opt)
+    if !isnothing(train_step_cache)
+        train_state = replace_train_state_cache(train_state, train_step_cache)
+    end
     loss_fn = VQVAELoss(para)
     ad_backend = training_backend(training_para, device)
     idx = LatentIndex(max_Mnn(training_para))
@@ -1214,41 +1433,55 @@ function update(model, ps, st, loss_history, train_data, test_data,
     size(train_x_cpu, 2) >= training_para.batchsize ||
         error("Training set N=$(size(train_x_cpu, 2)) is smaller than batchsize=$(training_para.batchsize). Reactant training uses fixed full batches.")
     test_eval_x_cpu = test_x_cpu[:, 1:min(512, size(test_x_cpu, 2))]
-    @info "Compiling initial Reactant training helpers" N=size(train_x_cpu, 2) batchsize=training_para.batchsize
-    inference_compiled = maybe_compile_inference(
-        model, ps, st,
-        device(train_x_cpu),
-        training_para;
-        device,
-        sample_batch_x=device(train_x_cpu[:, 1:training_para.batchsize]),
-        compile_latent_index=false,
-        compile_train_encoder=true,
-    )
+    inference_compiled = compiled
+    if isnothing(inference_compiled)
+        if !compile_missing && device isa ReactantDevice
+            error("Reactant training requires compiled helpers. Run compile_model first, or pass compile_missing=true.")
+        end
+        if compile_missing
+            @info "Compiling missing Reactant training helpers" N=size(train_x_cpu, 2) batchsize=training_para.batchsize
+            inference_compiled = compile_vqvae_helpers(
+                model, ps, st, train_x_cpu, training_para;
+                device,
+                sample_batch_x=device(train_x_cpu[:, 1:training_para.batchsize]),
+            )
+        else
+            inference_compiled = (; encode_z_e=nothing, encode_z_e_train=nothing)
+        end
+    end
+    training_para.verbose && @info "Prepared v8 update loop" setup_time_s=round(time() - setup_start; digits=3) N=size(train_x_cpu, 2) batchsize=training_para.batchsize compiled_helpers=!isnothing(compiled)
 
     for epoch in 1:training_para.nepoch
         phase = ensemble_phase(epoch, training_para)
         if phase.post_epoch > 0 &&
            (phase.Mnn != last_index_Mnn || mod(phase.post_epoch - 1, training_para.index_refresh_every) == 0)
             if isnothing(inference_compiled.encode_z_e)
-                latent_compiled = maybe_compile_inference(
-                    train_state.model, train_state.parameters, train_state.states,
-                    device(train_x_cpu),
-                    training_para;
-                    device,
-                    sample_batch_x=device(train_x_cpu[:, 1:training_para.batchsize]),
-                    compile_latent_index=true,
-                    compile_train_encoder=false,
-                )
-                inference_compiled = (;
-                    encode_z_e=latent_compiled.encode_z_e,
-                    encode_z_e_train=inference_compiled.encode_z_e_train,
-                )
+                if !compile_missing && device isa ReactantDevice
+                    error("Latent-index rebuild requires compiled.encode_z_e on Reactant. Recompile with compile_vqvae_helpers or pass compile_missing=true.")
+                end
+                if compile_missing
+                    latent_compiled = maybe_compile_inference(
+                        train_state.model, train_state.parameters, train_state.states,
+                        device(train_x_cpu),
+                        training_para;
+                        device,
+                        sample_batch_x=device(train_x_cpu[:, 1:training_para.batchsize]),
+                        compile_latent_index=true,
+                        compile_train_encoder=false,
+                    )
+                    inference_compiled = (;
+                        encode_z_e=latent_compiled.encode_z_e,
+                        encode_z_e_train=inference_compiled.encode_z_e_train,
+                    )
+                end
             end
             index_start = time()
+            training_para.verbose && @info "Rebuilding latent index before epoch batches" epoch post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn N=size(train_x_cpu, 2)
             rebuild_latent_index!(idx, train_state.model, train_state.parameters, train_state.states, train_x_cpu;
                 Mnn=phase.Mnn, device, cdev,
                 encode_compiled=inference_compiled.encode_z_e,
-                knn_search_chunk_size_fraction=training_para.knn_search_chunk_size_fraction)
+                knn_search_chunk_size_fraction=training_para.knn_search_chunk_size_fraction,
+                n_compiled)
             latent_index_time = time() - index_start
             target_cache_start = time()
             ensemble_targets_cpu = build_ensemble_targets(train_x_cpu, idx, 1:size(train_x_cpu, 2); Mnn=phase.Mnn)
@@ -1337,6 +1570,17 @@ function update(model, ps, st, loss_history, train_data, test_data,
             offset += k
         end
         last_perplexity = epoch_perplexity / nstages
+        # recompute entropy from same accumulated counts so it matches perplexity
+        epoch_entropy = 0f0
+        offset2 = 0
+        for k in para.K
+            stage_counts = epoch_counts[offset2+1:offset2+k]
+            p = stage_counts ./ max(sum(stage_counts), 1f-8)
+            psafe = clamp.(p, 1f-10, 1f0)
+            epoch_entropy += sum(psafe .* log.(psafe))  # negative value, consistent with entropy_loss convention
+            offset2 += k
+        end
+        last_entropy = epoch_entropy / nstages
         train_m = (;
             total=last_loss,
             recon_loss=last_recon,
@@ -1351,8 +1595,9 @@ function update(model, ps, st, loss_history, train_data, test_data,
 
         if mod(epoch, training_para.nprint) == 0
             r(x) = round(x; digits=4)
-            objective_str = "$(r(train_m.recon_loss)) + $(r(train_m.commit_loss)) + $(r(train_m.entropy_loss)) = $(r(train_m.total))"
-            @info "Epoch $epoch" objective="mse+commit+entropy = $objective_str" test_recon_mse=r(test_recon_mse) perplexity=r(train_m.perplexity) post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn throughput=round(throughput; digits=1) epoch_time_s=round(epoch_time; digits=3)
+            weighted_entropy = para.entropy_weight * train_m.entropy_loss
+            objective_str = "$(r(train_m.recon_loss)) + $(r(train_m.commit_loss)) + $(r(weighted_entropy)) [raw_entropy=$(r(train_m.entropy_loss))] = $(r(train_m.total))"
+            @info "Epoch $epoch" objective="mse+commit+w_entropy = $objective_str" test_recon_mse=r(test_recon_mse) perplexity=r(train_m.perplexity) post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn throughput=round(throughput; digits=1) epoch_time_s=round(epoch_time; digits=3)
             if training_para.verbose
                 @info "Epoch timing breakdown" epoch post_warmup_epoch=phase.post_epoch prep_time_s=round(prep_time; digits=3) target_time_s=round(target_time; digits=3) pack_time_s=round(pack_time; digits=3) payload_time_s=round(payload_time; digits=3) state_swap_time_s=round(state_swap_time; digits=3) step_time_s=round(step_time; digits=3) metric_sync_time_s=round(metric_sync_time; digits=3) other_time_s=round(epoch_time - prep_time - state_swap_time - step_time - metric_sync_time; digits=3)
             end
@@ -1366,46 +1611,103 @@ function update(model, ps, st, loss_history, train_data, test_data,
 end
 
 # ╔═╡ 8049c795-3466-4992-a617-686614b7ef47
-function train_one_pair(pair::Tuple{<:AbstractString,<:AbstractString}; filepath::String,
-    vqvae_parameters::NamedTuple, training_para::VQVAE_Training_Para,
-    save_root::String=joinpath(filepath, "SavedModels", "vqvae_v7"),
-    seed::Int=1234, dt::Real=1.0, period_min::Real=10, period_max::Real=50,
-    device=nothing)
+function load_pairs_data(selected_pairs; filepath::String,
+    seed::Int=1234, dt::Real=1.0, period_min::Real=10, period_max::Real=50)
+    rng = Xoshiro(seed)
+    pairs_data = Any[]
+    for pair_raw in selected_pairs
+        pair = (String(pair_raw[1]), String(pair_raw[2]))
+        @info "Loading v8 pair data" pair
+        bundle = build_training_bundle(pair; filepath, dt, period_min, period_max)
+        @info "Loaded v8 pair bundle" pair distance=bundle.distance D1fac_size=size(bundle.D1fac) D1fc_size=size(bundle.D1fc)
+        data = make_pooled_split(bundle.D1fac, bundle.D1fc; rng)
+        @info "Built v8 train/test split" pair train_size=size(data.D_train) test_size=size(data.D_test)
+        push!(pairs_data, (; pair, data, data_bundle=bundle))
+    end
+    return pairs_data
+end
+
+function compile_model(nt::Int, n_train::Int; vqvae_parameters::NamedTuple,
+    training_para::VQVAE_Training_Para, seed::Int=1234, device=nothing)
     ensure_reactant_xla_flags!()
-    pair = (String(pair[1]), String(pair[2]))
     xdev = isnothing(device) ? default_xdev(; force=true) : device
     cdev = default_cdev()
     rng = Xoshiro(seed)
-    setup_start = time()
-    @info "Loading and preprocessing v7 pair" pair
-    bundle = build_training_bundle(pair; filepath, dt, period_min, period_max)
-    @info "Loaded v7 pair bundle" pair time_s=round(time() - setup_start; digits=3) distance=bundle.distance D1fac_size=size(bundle.D1fac) D1fc_size=size(bundle.D1fc)
-    split_start = time()
-    data = make_pooled_split(bundle.D1fac, bundle.D1fc)
-    @info "Built v7 train/test split" pair time_s=round(time() - split_start; digits=3) train_size=size(data.D_train) test_size=size(data.D_test)
-    model_start = time()
-    para = VQVAE_Para(; merge(vqvae_parameters,
-        (; nt=size(data.D_train, 1), interstation_distance=bundle.distance, dt=Float64(dt), seed))...)
-    model, ps, st, loss_history = get_vqvae(para; rng, device=xdev)
-    @info "Initialized v7 model" pair time_s=round(time() - model_start; digits=3)
-    train_start = time()
-    @info "Starting v7 update loop" pair
-    ps, st, loss_history = update(model, ps, st, loss_history,
-        data.D_train, data.D_test, para, training_para; device=xdev, cdev)
-    @info "Finished v7 update loop" pair time_s=round(time() - train_start; digits=3)
-    run_dir = pair_run_dir(save_root, pair)
-    save_vqvae_run(run_dir; model, ps, st, para, training_para, loss_history, pair, data_bundle=bundle)
-    return (; pair, run_dir, model, ps, st, para, training_para, loss_history, data, data_bundle=bundle)
+    para = VQVAE_Para(; merge(vqvae_parameters, (; nt, seed))...)
+    model, ps, st, _ = get_vqvae(para; rng, device=xdev)
+    # latent-index encoder compiled at n_train (minimum across all pairs)
+    # batch encoder compiled at batchsize — these are separate XLA graphs
+    dummy_full_cpu = randn(rng, Float32, nt, n_train)
+    dummy_batch_cpu = dummy_full_cpu[:, 1:training_para.batchsize]
+    compiled = compile_vqvae_helpers(model, ps, st, dummy_full_cpu, training_para;
+        device=xdev, sample_batch_x=xdev(dummy_batch_cpu))
+    train_step_cache = compile_train_step(model, xdev(ps), xdev(st),
+        dummy_batch_cpu, para, training_para; device=xdev, cdev)
+    @info "compile_model complete" nt n_train batchsize=training_para.batchsize
+    return (; model, para, compiled, train_step_cache, compile_seed=seed, n_train)
+end
+
+function run_dir_for_seed(save_root::String, pair, seed::Integer, timestamp=now())
+    pair_str = join(pair, "_")
+    run_tag = Dates.format(timestamp, "yyyymmdd_HHMMSS")
+    return joinpath(save_root, pair_str, "seed$(seed)_$(run_tag)")
+end
+
+function train_selected_pairs(pairs_data, compiled_model;
+    seeds, training_para::VQVAE_Training_Para, save_root::String, device=nothing)
+    isempty(pairs_data) && return Any[]
+    isempty(seeds) && error("Provide at least one seed.")
+    xdev = isnothing(device) ? default_xdev(; force=true) : device
+    cdev = default_cdev()
+    results = Any[]
+    for pair_entry in pairs_data
+        for (run_index, seed) in enumerate(seeds)
+            pair = pair_entry.pair
+            @info "Training v8 pair run" pair run_index seed
+            reset_start = time()
+            ps, st = reset_vqvae(compiled_model.model; seed, device=xdev)
+            training_para.verbose && @info "Reset v8 model parameters" pair run_index seed reset_time_s=round(time() - reset_start; digits=3)
+            loss_history = fresh_loss_history()
+            train_start = time()
+            n_pair = size(pair_entry.data.D_train, 2)
+            n_ignored = max(0, n_pair - compiled_model.n_train)
+            n_ignored > 0 && @info "Pair has more waveforms than compiled size; excess ignored" pair n_pair n_compiled=compiled_model.n_train ignored=n_ignored
+            ps, st, loss_history = update(
+                compiled_model.model, ps, st, loss_history,
+                pair_entry.data.D_train, pair_entry.data.D_test,
+                compiled_model.para, training_para;
+                device=xdev, cdev,
+                compiled=compiled_model.compiled,
+                train_step_cache=compiled_model.train_step_cache,
+                n_compiled=compiled_model.n_train,
+                compile_missing=false,
+            )
+            @info "Finished v8 pair run" pair run_index seed time_s=round(time() - train_start; digits=3)
+            run_dir = run_dir_for_seed(save_root, pair, seed)
+            save_vqvae_run(run_dir; model=compiled_model.model, ps, st,
+                para=compiled_model.para, training_para, loss_history, pair,
+                data_bundle=pair_entry.data_bundle)
+            push!(results, (; pair, run_index, seed, run_dir,
+                model=compiled_model.model, ps, st, para=compiled_model.para,
+                training_para, loss_history, data=pair_entry.data,
+                data_bundle=pair_entry.data_bundle))
+        end
+    end
+    return results
 end
 
 # ╔═╡ a848319e-7bda-4844-a916-2bbdef1d5417
-function train_selected_pairs(selected_pairs; kwargs...)
-    results = Any[]
-    for pair in selected_pairs
-        @info "Training v7 pair" pair
-        push!(results, train_one_pair(pair; kwargs...))
-    end
-    return results
+function train_one_pair(pair::Tuple{<:AbstractString,<:AbstractString}; filepath::String,
+    vqvae_parameters::NamedTuple, training_para::VQVAE_Training_Para,
+    save_root::String=joinpath(filepath, "SavedModels", "vqvae_v8"),
+    seed::Int=1234, dt::Real=1.0, period_min::Real=10, period_max::Real=50,
+    device=nothing)
+    pairs_data = load_pairs_data([pair]; filepath, seed, dt, period_min, period_max)
+    nt = size(pairs_data[1].data.D_train, 1)
+    n_train = size(pairs_data[1].data.D_train, 2)
+    compiled_model = compile_model(nt, n_train; vqvae_parameters, training_para, seed, device)
+    return only(train_selected_pairs(pairs_data, compiled_model; seeds=[seed],
+        training_para, save_root, device))
 end
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
@@ -1414,6 +1716,7 @@ PLUTO_PROJECT_TOML_CONTENTS = """
 ConcreteStructs = "2569d6c7-a4a2-43d3-a901-331e8e4be471"
 DSP = "717857b8-e6f2-59f4-9121-6e50c889abd2"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
 InlineStrings = "842dd82b-1e85-43dc-bf29-5d0ee9dffc48"
@@ -1433,6 +1736,7 @@ Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 [compat]
 ConcreteStructs = "~0.2.3"
 DSP = "~0.8.4"
+FFTW = "~1.10"
 Enzyme = "~0.13.138"
 EnzymeCore = "~0.8.19"
 InlineStrings = "~1.4.5"
@@ -3235,6 +3539,7 @@ version = "17.7.0+0"
 # ╠═db53da0e-96ce-4a75-bcfc-32fdc4ffe064
 # ╠═4f2b1382-c158-417b-9fc0-1b8d04d90ed2
 # ╠═c974342d-4bcc-4175-9d71-8f9cfbb7105a
+# ╠═a1b2c3d4-0000-0000-0000-000000000001
 # ╠═70a460bf-b3e4-4e7c-aa4d-2674a450379a
 # ╠═2168a07c-e17a-4e94-bec7-5f881a5b5f09
 # ╠═d7d22b36-79b6-41d6-b9ce-403d34d4165b

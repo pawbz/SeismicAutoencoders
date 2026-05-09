@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:lux.csail.mit.edu)",
+      "WebFetch(domain:raw.githubusercontent.com)"
+    ]
+  }
+}

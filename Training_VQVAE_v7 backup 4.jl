@@ -16,69 +16,120 @@ macro bind(def, element)
     #! format: on
 end
 
-# ╔═╡ 88d64466-445a-11f1-b21f-81524747cf48
-using DSP, FFTW,PlutoPlotly, StatsBase
+# ╔═╡ 10000001-0000-0000-0000-000000000001
+begin
+    using JLD2,
+        PlutoLinks,
+        PlutoPlotly,
+        PlutoUI,
+        Random,
+        Statistics
+	
+end
 
-# ╔═╡ b7387f42-2eea-4591-823f-eb5e99175d63
-using PlutoUI, JLD2, Flux
+# ╔═╡ 96817feb-6aa9-4f35-9277-9a4560e9a2a7
+using FFTW, Peaks, ColorSchemes, Colors, InlineStrings
 
-# ╔═╡ b0000001-0000-0000-0000-000000000001
+# ╔═╡ bdeb2eb2-6b5d-4677-837c-7072e3588430
+begin
+    using ConcreteStructs,
+        Dates,
+        DSP,
+        Enzyme,
+        EnzymeCore,
+        LinearAlgebra,
+        Lux,
+        MLUtils,
+        NNlib,
+        Optimisers,
+        Reactant,
+        StatsBase
+end
+
+# ╔═╡ 10000002-0000-0000-0000-000000000001
 md"""
-### Whitening filter controls
+# VQ-VAE v7 Training
 
-Apply whitening: $(@bind apply_whitening CheckBox(default=false))
-
-Kernel length (taps): $(@bind whitening_kernel_length Slider(16:8:256, default=64, show_value=true))
-
-Min power fraction (noise floor): $(@bind whitening_min_power Slider(0.01:0.01:0.20, default=0.05, show_value=true))
+Short orchestration notebook.  The v7 architecture notebook owns the model,
+training loop, RVQ, kNN, saving/loading, source-state averaging, and plotting
+helpers.  This notebook selects station pairs, starts training, and connects the
+trained source states to MFT.
 """
 
-# ╔═╡ 53d57d5e-7f0d-4c70-a7a6-3e593f08a42c
-dt = 1.0 
+# ╔═╡ 10000003-0000-0000-0000-000000000001
 
-# ╔═╡ 9f240eaa-0d1d-4e93-9b3d-4244c19e7d3e
-function get_acausal_causal(pair::String, filepath::String)
-    jldfile = load(filter(x -> occursin(pair, x), readdir(filepath, join=true))[1])
-    correlations = jldfile["correlations"]
-	# correlations = randn(size(correlations)...)
-    headers = jldfile["headers"]
-    distance = jldfile["dist"] # sanket
-    return (; correlations, headers, distance)
-end
+    vqvae = @ingredients("/mnt/NAS/EQData/SeismicAutoencoders/VQVAE_architecture_v7.jl")
 
-# ╔═╡ af561107-385b-4c11-932a-c7ba210d2859
-data_filepath = "/mnt/NAS2/Sanket_data/California_TO_with_latlong/"
 
-# ╔═╡ 4887a145-a8ea-415a-ad46-effd959aeae9
-function split_causal_acausal(X::AbstractMatrix, zero_lag::Bool, max_lag=nothing)
-    nt, ntr = size(X)
-    !isodd(nt) && error("nt should be odd")
-    center = div(nt + 1, 2)
-    half = div(nt - 1, 2)
-    N = isnothing(max_lag) ? half : max(0, min(half, max_lag))
-    if N == 0
-        return similar(X, 0, ntr), similar(X, 0, ntr)
-    end
-    X_acausal = reverse(X[center-N:center-1, :], dims=1)
-    X_causal = X[center+1:center+N, :]
-    if zero_lag
-        return vcat(zeros(1, size(X)[2:end]...), Array(X_acausal)),
-        vcat(zeros(1, size(X)[2:end]...), Array(X_causal))
-    else
-        return Array(X_acausal), Array(X_causal)
-    end
-end
+# ╔═╡ 22ef4df8-9962-4443-aa48-cbc4bd5ddb59
+ mft = @ingredients("/mnt/NAS/EQData/SeismicAutoencoders/MFT.jl")
 
-# ╔═╡ 5afa84d0-5be1-45a7-8fe7-a965bf84f09a
+# ╔═╡ 10000004-0000-0000-0000-000000000001
+md"## Data and Pair Selection"
+
+# ╔═╡ 10000005-0000-0000-0000-000000000001
 begin
-    period_min = 3
-    period_max = 100
-    responsetype = Bandpass(inv(period_max), inv(period_min))
-    designmethod = Butterworth(2)
-    digfilter = digitalfilter(responsetype, designmethod; fs=inv(dt))
+    data_filepath = "/mnt/NAS2/Sanket_data/California_TO_with_latlong/"
+    dt = 1.0
+    period_min = 10
+    period_max = 50
 end
 
-# ╔═╡ ade5fca9-1bf4-4bc7-a79c-b56e127278c6
+# ╔═╡ 10000009-0000-0000-0000-000000000001
+md"## Hyperparameters"
+
+# ╔═╡ 1000000a-0000-0000-0000-000000000001
+vqvae_parameters = (;
+    d=24,
+    beta_commit=0.25f0,
+    K=[5],
+    ema_decay=0.999f0,
+    enc_kernels=[64, 32, 16, 8],
+    enc_strides=[1, 1, 1, 1],
+    dead_threshold=50,
+    entropy_weight=0.1f0,
+    reconstruction_loss=:l2,
+    velocity_range=(1.0, 8.0),
+    envelope_floor=1.0f0,
+)
+
+# ╔═╡ 1000000b-0000-0000-0000-000000000001
+training_para = vqvae.VQVAE_Training_Para(
+    batchsize=512,
+    nepoch=50,
+    initial_learning_rate=0.001,
+    weight_decay=0.0,
+    Mnn_schedule=[(1, 10), (6, 10), (26, 10)],
+    warmup_epochs=50,
+    index_refresh_every=1,
+    latent_index_space=:z_e,
+    compile_reactant=true,
+)
+
+# ╔═╡ 1000000c-0000-0000-0000-000000000002
+training_device = vqvae.default_xdev(; force=true)
+
+# ╔═╡ 1000000c-0000-0000-0000-000000000001
+md"## Train"
+
+# ╔═╡ 1000000d-0000-0000-0000-000000000001
+@bind train_button CounterButton("Train selected pairs")
+
+# ╔═╡ 1000000f-0000-0000-0000-000000000001
+md"## Inspect One Result"
+
+# ╔═╡ 10000015-0000-0000-0000-000000000001
+md"## Source-State Averages and MFT"
+
+# ╔═╡ b00b61c7-81c6-467a-b8bd-9f9e2ebd4d0c
+result_title_context(result) = begin
+    pair = result.pair
+    distance_label = isnothing(result.data_bundle.distance) ?
+        "distance unavailable" : "$(round(Int, result.data_bundle.distance))km"
+    "$(pair[1])-$(pair[2]) $(distance_label) $(period_min)-$(period_max)s"
+end
+
+# ╔═╡ 9c18f181-8d76-46a4-836d-c4fe2cad19c8
 function list_station_pairs(filepath::String)
     files = readdir(filepath)
     pairs = Set{Tuple{String,String}}()
@@ -90,611 +141,406 @@ function list_station_pairs(filepath::String)
     return sort!(collect(pairs), by=x -> (x[1], x[2]))
 end
 
-# ╔═╡ 4027ca28-08b3-4d20-8d58-75863db22313
+# ╔═╡ 10000006-0000-0000-0000-000000000001
 available_pairs = list_station_pairs(data_filepath)
 
-# ╔═╡ 4b3dc9f1-5008-4203-9dce-f641d9352d4f
+# ╔═╡ 10000007-0000-0000-0000-000000000001
 begin
-    if isempty(available_pairs)
-        error("No station pairs found in $(data_filepath)")
-    end
+    isempty(available_pairs) && error("No station pairs found in $(data_filepath)")
     pair_options = ["$(p[1])-$(p[2])" for p in available_pairs]
-    default_pairs = pair_options[1:min(end, 4)]
-    @bind selected_training_pair_names confirm(MultiCheckBox(pair_options, default=default_pairs))
+    default_pair_names = pair_options[1:min(end, 1)]
+    
 end
 
-# ╔═╡ 1c40c18f-914f-430d-ab1e-15587ff4587f
-selected_pairs = let
-    isempty(selected_training_pair_names) && error("Select at least one receiver pair for training.")
+# ╔═╡ 0bf6c416-bf64-4b2a-b55e-623a4f9daae2
+@bind selected_pair_names confirm(MultiCheckBox(pair_options; default=default_pair_names))
+
+# ╔═╡ 272932ae-4c54-41a2-8c9a-e1cd4834150a
+selected_pair_names
+
+# ╔═╡ 10000008-0000-0000-0000-000000000001
+selected_pairs = begin
+    isempty(selected_pair_names) && error("Select at least one station pair.")
     [begin
         parts = split(name, "-", limit=2)
-        length(parts) == 2 || error("Invalid selected pair format: $(name)")
-        (parts[1], parts[2])
-    end for name in selected_training_pair_names]
+        length(parts) == 2 || error("Invalid pair name $(name).")
+        (String(parts[1]), String(parts[2]))
+    end for name in selected_pair_names]
 end
 
-# ╔═╡ 3191d8ca-66d2-43b9-8c78-025555a5f90b
-function taper(x)
-    w = cat(tukey(size(x, 1), 0.1), dims=ndims(x))
-    return w .* x
-end
-
-# ╔═╡ fade917a-4b3b-4280-934d-61a919dd54a3
-function build_training_bundle(pair;
-    filepath="/mnt/NAS/Sanket_DRDO/station_pairs_12112025_30mins/")
-    pair_name = join(pair, "_")
-    data_pair_local = get_acausal_causal(pair_name, filepath)
-    D1 = data_pair_local.correlations
-    D1 = Flux.normalise(D1, dims=1)
-    D1ac, D1c = split_causal_acausal(D1, true)
-    D1ac = taper(D1ac)
-    D1c = taper(D1c)
-    D1fac = filtfilt(digfilter, D1ac)
-    D1fc = filtfilt(digfilter, D1c)
-    D1fac = Float32.(Flux.normalise(D1fac[2:end, :], dims=1))
-    D1fc = Float32.(Flux.normalise(D1fc[2:end, :], dims=1))
-    return (pair=pair, D1=Float32.(D1), D1fac=D1fac, D1fc=D1fc,
-        distance=data_pair_local.distance)
-end
-
-# ╔═╡ f687f07f-eb25-4232-a229-7bf997edf22b
-pair_bundles = [build_training_bundle(pair; filepath=data_filepath) for pair in selected_pairs]
-
-# ╔═╡ e5d46de5-2e45-4cb1-b71f-d93af0ad7632
-i = 1
-
-# ╔═╡ a1182443-ffbc-4f44-a9eb-bf6b056c8977
-cc_raw = pair_bundles[i].D1fac
-
-# ╔═╡ b0000002-0000-0000-0000-000000000002
-function compute_whitening_fir(X_cpu::AbstractMatrix{Float32}, dt::Float64;
-    kernel_length::Int=64, min_power_fraction::Float64=0.05)
-    nt = size(X_cpu, 1)
-    P = vec(mean(abs2.(fft(Float64.(X_cpu), 1)); dims=2))
-    P[1] = 0.0
-    P .= max.(P, min_power_fraction * maximum(P))
-    W = P .^ (-0.25)   # filtfilt squares magnitude response → net P^(-0.5) whitening
-    W[1] = 0.0
-    w_full = real.(ifft(W))
-    w_shift = fftshift(w_full)
-    center = div(nt, 2) + 1
-    lo = center - div(kernel_length, 2)
-    taps = w_shift[lo : lo + kernel_length - 1]
-    taps .*= hann(kernel_length)
-    taps ./= sum(abs.(taps))
-    return Float32.(taps)
-end
-
-# ╔═╡ b0000003-0000-0000-0000-000000000003
-whitening_fir = compute_whitening_fir(cc_raw, dt;
-    kernel_length=whitening_kernel_length, min_power_fraction=whitening_min_power)
-
-# ╔═╡ b0000004-0000-0000-0000-000000000004
-cc = if apply_whitening
-    Float32.(filtfilt(Float64.(whitening_fir), [1.0], Float64.(cc_raw)))
-else
-    cc_raw
-end
-
-# ╔═╡ b0000005-0000-0000-0000-000000000005
-let
-    nt_w = size(cc_raw, 1)
-    freqs_w = fftfreq(nt_w, inv(dt))
-    pos = freqs_w .> 0
-    f_pos = freqs_w[pos]
-    periods_w = sort(1 ./ f_pos)
-
-    P_raw = vec(mean(abs2.(fft(Float64.(cc_raw), 1)); dims=2))
-    P_whi = vec(mean(abs2.(fft(Float64.(cc),     1)); dims=2))
-
-    # sort to period axis
-    order = sortperm(1 ./ f_pos)
-    p_raw_plot = P_raw[pos][order]
-    p_whi_plot = P_whi[pos][order]
-
-    traces = [
-        scatter(x=periods_w, y=p_raw_plot, mode="lines",
-            line=attr(color="#1f77b4", width=2), name="Raw"),
-        scatter(x=periods_w, y=p_whi_plot, mode="lines",
-            line=attr(color="#d62728", width=2), name="Whitened"),
-    ]
-    WideCell(plot(traces, Layout(
-        title="Average PSD: raw vs whitened (kernel=$(whitening_kernel_length), floor=$(whitening_min_power))",
-        xaxis_title="Period (s)", yaxis_title="Power", yaxis_type="log",
-        legend=attr(x=0.95, y=0.98),
-        height=320, margin=attr(l=60, r=20, t=50, b=50),
-    )))
-end
-
-# ╔═╡ 5ea181e6-e53f-4650-a225-ade753c51137
-nth=size(cc, 1)
-
-# ╔═╡ 394c437d-fa98-41cf-bb10-d2e7c2e721c8
-ncc = size(cc, 2)
-
-# ╔═╡ 9df599e2-c603-4db8-8ff6-fc60e2fe54e3
-fs = inv(dt)
-
-# ╔═╡ 4afb282d-81fb-4819-bde7-723b2ec4b92e
-"""
-    NoiseRegimeResult
-
-Diagnostic output for noise-regime classification.
-
-Fields:
-- `regime::Symbol` :  :A (broadband), :B (wavelet-band), :C (narrowband)
-- `noise_bandwidth_hz` : effective bandwidth of the noise (half-max width)
-- `signal_bandwidth_hz` : effective bandwidth of the in-cone signal window
-- `spectral_overlap` : Jaccard overlap of noise and signal half-max supports ∈ [0,1]
-- `noise_coherence_samples` : lag at which |noise ACF| first drops below 1/e
-- `coherence_to_wavelet_ratio` : noise_coherence_samples / wavelet_support_samples
-- `noise_psd` : estimated noise PSD (one-sided)
-- `signal_psd` : estimated in-cone PSD (one-sided)
-- `freqs` : frequency axis (Hz) for the PSDs
-- `noise_window_indices` : indices of the lag axis used as noise window
-- `narrowband_peaks_hz` : detected narrowband peaks (Hz), if any
-- `notes` : human-readable summary string
-"""
-struct NoiseRegimeResult
-    regime::Symbol
-    noise_bandwidth_hz::Float64
-    signal_bandwidth_hz::Float64
-    spectral_overlap::Float64
-    noise_coherence_samples::Int
-    coherence_to_wavelet_ratio::Float64
-    noise_psd::Vector{Float64}
-    signal_psd::Vector{Float64}
-    freqs::Vector{Float64}
-    noise_window_indices::Vector{Int}
-    narrowband_peaks_hz::Vector{Float64}
-    notes::String
-end
-
-# ╔═╡ 2d94ad90-6d44-4164-819e-4649deb7d1cc
-"""
-Average Welch PSDs across a vector of segments of possibly different lengths.
-Segments shorter than `nperseg` are skipped. Remaining segments are detrended
-(mean removed), converted to Welch PSDs on a shared frequency axis, and averaged.
-"""
-function _avg_welch_psd(segments::Vector{Vector{Float64}}, fs::Real, nperseg::Int)
-    psds = Vector{Vector{Float64}}()
-    freqs_ref = nothing
-
-    for seg in segments
-        length(seg) < nperseg && continue
-        x = seg .- mean(seg)
-        p = welch_pgram(x, nperseg, div(nperseg, 2); fs=fs)
-        push!(psds, power(p))
-        freqs_ref === nothing && (freqs_ref = freq(p))
-    end
-
-    isempty(psds) && error(
-        "Could not compute any Welch PSDs: all $(length(segments)) segments are shorter than nperseg=$(nperseg). " *
-        "Segment lengths are $(length.(segments))."
-    )
-    avg = mean(reduce(hcat, psds); dims=2) |> vec
-    return avg, collect(freqs_ref)
-end
-
-# ╔═╡ 1d358796-b47c-49b7-b8d7-74c4e6dfae7e
-"""
-Estimate the coherence time of the noise (in samples) by averaging the
-biased autocorrelation across noise segments and finding the first lag
-at which |ACF| drops below 1/e of its zero-lag value.
-"""
-function _noise_coherence_time(segments::Vector{Vector{Float64}})
-    max_lag = min(256, minimum(length.(segments)) - 1)
-    acf_sum  = zeros(Float64, max_lag + 1)
-    n_used   = 0
-
-    for seg in segments
-        length(seg) <= max_lag && continue
-        x = seg .- mean(seg)
-        s2 = sum(abs2, x) / length(x)
-        s2 == 0 && continue
-        acf = autocor(x, 0:max_lag)        # StatsBase
-        acf_sum .+= acf
-        n_used += 1
-    end
-
-    n_used == 0 && return 1
-    acf_avg = acf_sum ./ n_used
-    threshold = 1 / ℯ
-
-    for k in 2:length(acf_avg)
-        abs(acf_avg[k]) < threshold && return k - 1
-    end
-    return length(acf_avg) - 1            # never crossed → very coherent
-end
-
-# ╔═╡ 9eafb82e-98db-40a2-9421-70cbcdffe965
-"""
-    classify_noise_regime(ccfs, lags, distances_km, fs;
-                         v_min=0.5, wavelet_support_samples=64,
-                         narrowband_peak_threshold=8.0,
-                         overlap_threshold_A=0.25,
-                         overlap_threshold_B=0.6)
-
-Classify the noise regime (A/B/C) for a collection of ambient-noise
-cross-correlation functions.
-
-# Arguments
-- `ccfs::AbstractMatrix` : (n_lags, n_pairs) matrix; each column is one CCF.
-- `lags::AbstractVector` : lag axis in seconds, length n_lags. Symmetric around 0.
-- `distances_km::AbstractVector` : interstation distance (km) for each column of `ccfs`.
-- `fs::Real` : sampling rate of the CCFs (Hz).
-
-# Keyword arguments
-- `v_min::Real=0.5` : minimum physical velocity (km/s). Anything at |lag| > d/v_min
-  is treated as noise.
-- `wavelet_support_samples::Int=64` : the support of the wavelet you intend to
-  detect, in samples. Used to compare against the noise coherence time.
-- `narrowband_peak_threshold::Real=8.0` : a noise PSD bin is flagged as a
-  narrowband peak if it exceeds the median PSD by this factor.
-- `overlap_threshold_A::Real=0.25` : spectral-overlap below this → regime A.
-- `overlap_threshold_B::Real=0.6` : spectral-overlap above this (and not C) → regime B.
-
-# Returns
-A `NoiseRegimeResult`.
-"""
-function classify_noise_regime(ccfs::AbstractMatrix, lags::AbstractVector,
-                               distances_km::AbstractVector, fs::Real;
-                               v_min::Real=0.5,
-                               wavelet_support_samples::Int=64,
-                               narrowband_peak_threshold::Real=8.0,
-                               overlap_threshold_A::Real=0.25,
-                               overlap_threshold_B::Real=0.6)
-
-    n_lags, n_pairs = size(ccfs)
-    @assert length(lags) == n_lags     "lags length must match ccfs rows"
-    @assert length(distances_km) == n_pairs   "distances_km must match number of CCFs"
-
-    # ---- 1. Pool noise-window and signal-window samples across all pairs ----
-    noise_segments  = Vector{Vector{Float64}}()
-    signal_segments = Vector{Vector{Float64}}()
-    noise_window_indices_first = Int[]   # for the first pair, for reporting
-
-    for p in 1:n_pairs
-        d = distances_km[p]
-        t_cone = d / v_min                  # seconds
-
-        noise_mask  = abs.(lags) .>  t_cone
-        signal_mask = abs.(lags) .<= t_cone
-
-        # Sanity: need enough samples on each side
-        if count(noise_mask) < 32 || count(signal_mask) < 32
-            @warn "Pair $p has too few samples in noise/signal window; skipping."
-            continue
-        end
-
-        push!(noise_segments,  Float64.(ccfs[noise_mask,  p]))
-        push!(signal_segments, Float64.(ccfs[signal_mask, p]))
-
-        if p == 1
-            noise_window_indices_first = findall(noise_mask)
-        end
-    end
-
-    isempty(noise_segments)  && error("No usable noise windows found.")
-    isempty(signal_segments) && error("No usable signal windows found.")
-
-    # ---- 2. Estimate PSDs via Welch, averaging across pairs ----
-    shortest_segment = min(minimum(length.(noise_segments)),
-                           minimum(length.(signal_segments)))
-    nperseg = min(256, shortest_segment)
-    nperseg = max(nperseg, 32)            # floor
-
-    noise_psd, freqs = _avg_welch_psd(noise_segments,  fs, nperseg)
-    signal_psd, _    = _avg_welch_psd(signal_segments, fs, nperseg)
-
-    # ---- 3. Bandwidth and spectral-overlap diagnostics ----
-    noise_band_mask  = noise_psd  .>= 0.5 * maximum(noise_psd)
-    signal_band_mask = signal_psd .>= 0.5 * maximum(signal_psd)
-
-    df = freqs[2] - freqs[1]
-    noise_bw  = count(noise_band_mask)  * df
-    signal_bw = count(signal_band_mask) * df
-
-    intersection = count(noise_band_mask .& signal_band_mask)
-    union_       = count(noise_band_mask .| signal_band_mask)
-    spectral_overlap = union_ == 0 ? 0.0 : intersection / union_
-
-    # ---- 4. Noise autocorrelation coherence time ----
-    coherence_samples = _noise_coherence_time(noise_segments)
-    coherence_ratio   = coherence_samples / wavelet_support_samples
-
-    # ---- 5. Detect narrowband peaks in the noise PSD ----
-    med_psd = median(noise_psd)
-    peak_idx = findall(noise_psd .> narrowband_peak_threshold * med_psd)
-    peak_freqs = collect(freqs[peak_idx])
-
-    has_narrowband_peaks = !isempty(peak_freqs) &&
-                           noise_bw < 0.2 * (freqs[end] - freqs[1])
-
-    # ---- 6. Classify ----
-    regime, notes = if has_narrowband_peaks
-        (:C,
-         "Narrowband interferers detected at " *
-         join(round.(peak_freqs; digits=2), ", ") *
-         " Hz. Pre-whiten or notch-filter before training. " *
-         "Masking alone may actively encode these into the codebook.")
-    elseif spectral_overlap < overlap_threshold_A
-        (:A,
-         "Noise band and signal band are largely disjoint " *
-         "(overlap=$(round(spectral_overlap; digits=2))). " *
-         "Masked VQ-VAE should suppress noise effectively. Use as-is.")
-    elseif spectral_overlap < overlap_threshold_B
-        (:B,
-         "Noise and signal bands partially overlap " *
-         "(overlap=$(round(spectral_overlap; digits=2))). " *
-         "Coherence/wavelet ratio = $(round(coherence_ratio; digits=2)). " *
-         "Masking helps but is not sufficient. " *
-         "Add VICReg-style contrastive term and/or TF-domain reconstruction.")
+# ╔═╡ 1000000e-0000-0000-0000-000000000001
+train_results = let
+    if train_button === missing || train_button == 0
+        nothing
     else
-        (:B,                              # heavy overlap is still B, just worse
-         "Noise and signal bands largely overlap " *
-         "(overlap=$(round(spectral_overlap; digits=2))). " *
-         "Strong regime B. Augmentation contrastive is essential; " *
-         "consider pre-whitening from the noise-window PSD.")
+        vqvae.train_selected_pairs(
+            selected_pairs;
+            filepath=data_filepath,
+            vqvae_parameters=vqvae_parameters,
+            training_para=training_para,
+            save_root=joinpath(data_filepath, "SavedModels", "vqvae_v7"),
+            seed=1234,
+            dt=dt,
+            period_min=period_min,
+            period_max=period_max,
+            device=training_device,
+        )
     end
+end
 
-    return NoiseRegimeResult(
-        regime,
-        noise_bw,
-        signal_bw,
-        spectral_overlap,
-        coherence_samples,
-        coherence_ratio,
-        noise_psd,
-        signal_psd,
-        collect(freqs),
-        noise_window_indices_first,
-        peak_freqs,
-        notes,
+# ╔═╡ 10000010-0000-0000-0000-000000000001
+selected_result_options = if isnothing(train_results)
+    String[]
+else
+    ["$(i). $(result_title_context(result))" for (i, result) in enumerate(train_results)]
+end
+
+# ╔═╡ 3c23d4cb-4bf9-4b4b-a57f-fefdc8f29cf1
+selected_result_label_ui = @bind selected_result_label Select(
+    isempty(selected_result_options) ? ["No training results"] : selected_result_options
+)
+
+# ╔═╡ 928d4238-216b-4f62-a4d7-62075275252b
+selected_result_label_ui
+
+# ╔═╡ f41c2e62-efbf-47c8-8b7e-adf828ffde4f
+selected_result = begin
+    idx = findfirst(==(selected_result_label), selected_result_options)
+    isnothing(train_results) || isnothing(idx) ? nothing : train_results[idx]
+end
+
+# ╔═╡ 10000011-0000-0000-0000-000000000001
+if isnothing(selected_result)
+    md"Press **Train selected pairs** to create v7 runs."
+else
+    WideCell(vqvae.plot_training_dashboard(selected_result.loss_history;
+        title="VQ-VAE v7 Training Dashboard ($(result_title_context(selected_result)))"))
+end
+
+# ╔═╡ 10000012-0000-0000-0000-000000000001
+if isnothing(selected_result)
+    md""
+else
+    WideCell(vqvae.plot_envelope(selected_result.para;
+        title="Physics Arrival Weight Envelope ($(result_title_context(selected_result)))"))
+end
+
+# ╔═╡ 10000013-0000-0000-0000-000000000001
+if isnothing(selected_result)
+    md""
+else
+    WideCell(vqvae.plot_codebook_heatmap(selected_result.st; stage=1,
+        title="RVQ Stage 1 Codebook ($(result_title_context(selected_result)))"))
+end
+
+# ╔═╡ 10000014-0000-0000-0000-000000000001
+if isnothing(selected_result)
+    md""
+else
+    WideCell(vqvae.plot_reconstruction_examples(
+        selected_result.model,
+        selected_result.ps,
+        selected_result.st,
+        selected_result.data.D_ac_all;
+        nsamples=8,
+        dt=dt,
+        device=training_device,
+        title="Acausal Reconstruction Examples ($(result_title_context(selected_result)))",
+    ))
+end
+
+# ╔═╡ 10000016-0000-0000-0000-000000000001
+state_averages = if isnothing(selected_result)
+    nothing
+else
+    vqvae.source_state_averages(
+        selected_result.model,
+        selected_result.ps,
+        selected_result.st,
+        selected_result.data;
+        device=training_device,
     )
 end
 
-# ╔═╡ 7453949d-b9af-4905-bf05-59ffb6eb23c5
-result = classify_noise_regime(cc, range(dt, step=dt, length=nth), fill(pair_bundles[i].distance, ncc), fs;
-                               v_min=1, wavelet_support_samples=64)
-
-# ╔═╡ 21a30e16-8f28-40f0-b95f-d0e55e0f1860
-
-
-"""
-    plot_noise_regime(result::NoiseRegimeResult; fs=nothing)
-
-Produce diagnostic plots for the output of `classify_noise_regime`.
-Returns a NamedTuple of PlutoPlotly figures so you can display them
-individually in separate Pluto cells.
-
-Fields of the returned NamedTuple:
-- `psd`        : noise vs. signal-window PSDs (log-y), with half-max bands shaded
-- `psd_linear` : same but on a linear y-axis (useful for spotting narrowband peaks)
-- `bandwidth`  : bar chart comparing noise vs. signal effective bandwidth
-- `overlap`    : visualization of spectral overlap (Jaccard) and regime classification
-- `summary`    : single combined figure with subplots
-"""
-function plot_noise_regime(result::NoiseRegimeResult)
-
-    f       = result.freqs
-    n_psd   = result.noise_psd
-    s_psd   = result.signal_psd
-    peaks   = result.narrowband_peaks_hz
-
-    period_mask = f .> 0
-    periods = 1 ./ f[period_mask]
-    n_psd_period = n_psd[period_mask]
-    s_psd_period = s_psd[period_mask]
-    n_band_period = (n_psd .>= 0.5 * maximum(n_psd))[period_mask]
-    period_order = sortperm(periods)
-    periods = periods[period_order]
-    n_psd_period = n_psd_period[period_order]
-    s_psd_period = s_psd_period[period_order]
-    n_band_period = n_band_period[period_order]
-    peaks_positive = peaks[peaks .> 0]
-    peaks_period = 1 ./ peaks_positive
-
-    # half-max supports (matches the logic in classify_noise_regime)
-    n_band = n_psd .>= 0.5 * maximum(n_psd)
-    s_band = s_psd .>= 0.5 * maximum(s_psd)
-
-    regime_color = result.regime === :A ? "#2ca02c" :   # green
-                   result.regime === :B ? "#ff7f0e" :   # orange
-                                          "#d62728"     # red
-
-    # ----- 1. PSD comparison, log-y -----
-    psd_traces = [
-        scatter(x=periods, y=n_psd_period, mode="lines",
-                line=attr(color="#1f77b4", width=2),
-                name="Noise window"),
-        scatter(x=periods, y=s_psd_period, mode="lines",
-                line=attr(color="#d62728", width=2),
-                name="Signal window"),
-    ]
-
-    # shaded noise half-max band
-    if any(n_band_period)
-        p_lo_n = periods[findfirst(n_band_period)]
-        p_hi_n = periods[findlast(n_band_period)]
-        push!(psd_traces, scatter(
-            x=[p_lo_n, p_hi_n, p_hi_n, p_lo_n, p_lo_n],
-            y=[minimum(n_psd_period), minimum(n_psd_period), maximum(n_psd_period),
-               maximum(n_psd_period), minimum(n_psd_period)],
-            fill="toself", mode="lines",
-            line=attr(color="rgba(31,119,180,0)", width=0),
-            fillcolor="rgba(31,119,180,0.12)",
-            name="Noise half-max band",
-            hoverinfo="skip", showlegend=true))
-    end
-
-    # narrowband peak markers
-    if !isempty(peaks_period)
-        push!(psd_traces, scatter(
-            x=peaks_period,
-            y=[n_psd[argmin(abs.(f .- pk))] for pk in peaks_positive],
-            mode="markers",
-            marker=attr(color="black", size=10, symbol="x"),
-            name="Narrowband peaks"))
-    end
-
-    psd_layout = Layout(
-        title="PSD: noise vs. signal window  (regime = $(result.regime))",
-        xaxis_title="Period (s)",
-        yaxis_title="Power",
-        yaxis_type="log",
-        legend=attr(x=0.02, y=0.98),
-        margin=attr(l=60, r=20, t=50, b=50),
-    )
-    fig_psd = plot(psd_traces, psd_layout)
-
-    # ----- 2. PSD linear y -----
-    psd_layout_lin = Layout(
-        title="PSD (linear scale)",
-        xaxis_title="Period (s)",
-        yaxis_title="Power",
-        legend=attr(x=0.02, y=0.98),
-        margin=attr(l=60, r=20, t=50, b=50),
-    )
-    fig_psd_lin = plot(deepcopy(psd_traces), psd_layout_lin)
-
-    # ----- 3. Bandwidth bar comparison -----
-    bw_trace = bar(
-        x=["Noise BW", "Signal BW"],
-        y=[result.noise_bandwidth_hz, result.signal_bandwidth_hz],
-        marker=attr(color=["#1f77b4", "#d62728"]),
-        text=[string(round(result.noise_bandwidth_hz; digits=2), " Hz"),
-              string(round(result.signal_bandwidth_hz; digits=2), " Hz")],
-        textposition="outside",
-    )
-    bw_layout = Layout(
-        title="Effective bandwidth (half-max width)",
-        yaxis_title="Bandwidth (Hz)",
-        showlegend=false,
-        margin=attr(l=60, r=20, t=50, b=50),
-    )
-    fig_bw = plot([bw_trace], bw_layout)
-
-    # ----- 4. Spectral overlap gauge -----
-    overlap_pct = 100 * result.spectral_overlap
-
-    overlap_trace = bar(
-        x=[overlap_pct],
-        y=[""],
-        orientation="h",
-        marker=attr(color=regime_color),
-        text=[string(round(overlap_pct; digits=1), "%")],
-        textposition="inside",
-    )
-
-    # threshold reference lines
-    shapes = [
-        attr(type="line", x0=25, x1=25, y0=-0.5, y1=0.5,
-             line=attr(color="green", dash="dash", width=1)),
-        attr(type="line", x0=60, x1=60, y0=-0.5, y1=0.5,
-             line=attr(color="red",   dash="dash", width=1)),
-    ]
-    annotations = [
-        attr(x=25, y=0.6, text="A→B", showarrow=false, font=attr(size=10)),
-        attr(x=60, y=0.6, text="B→C-ish", showarrow=false, font=attr(size=10)),
-    ]
-
-    overlap_layout = Layout(
-        title="Spectral overlap (noise ∩ signal) / (noise ∪ signal)",
-        xaxis=attr(title="Overlap %", range=[0, 100]),
-        yaxis=attr(visible=false),
-        shapes=shapes,
-        annotations=annotations,
-        showlegend=false,
-        height=180,
-        margin=attr(l=20, r=20, t=50, b=50),
-    )
-    fig_overlap = plot([overlap_trace], overlap_layout)
-
-    # ----- 5. Combined summary with subplots -----
-    fig_summary = make_subplots(
-        rows=2, cols=2,
-        subplot_titles=["PSD (log)" "Bandwidth";
-                        "Spectral overlap" "Coherence vs wavelet support"],
-        vertical_spacing=0.18, horizontal_spacing=0.12,
-    )
-
-    # row 1, col 1: PSD log
-    add_trace!(fig_summary,
-        scatter(x=periods, y=n_psd_period, mode="lines",
-                line=attr(color="#1f77b4"), name="Noise"),
-        row=1, col=1)
-    add_trace!(fig_summary,
-        scatter(x=periods, y=s_psd_period, mode="lines",
-                line=attr(color="#d62728"), name="Signal"),
-        row=1, col=1)
-    relayout!(fig_summary, yaxis_type="log", xaxis_title="Period (s)")
-
-    # row 1, col 2: bandwidth
-    add_trace!(fig_summary,
-        bar(x=["Noise", "Signal"],
-            y=[result.noise_bandwidth_hz, result.signal_bandwidth_hz],
-            marker=attr(color=["#1f77b4", "#d62728"]),
-            showlegend=false),
-        row=1, col=2)
-
-    # row 2, col 1: overlap horizontal bar
-    add_trace!(fig_summary,
-        bar(x=[overlap_pct], y=[""], orientation="h",
-            marker=attr(color=regime_color),
-            text=[string(round(overlap_pct; digits=1), "%")],
-            textposition="inside",
-            showlegend=false),
-        row=2, col=1)
-
-    # row 2, col 2: coherence vs wavelet support
-    coh = result.noise_coherence_samples
-    wl  = round(Int, coh / max(result.coherence_to_wavelet_ratio, 1e-9))
-    add_trace!(fig_summary,
-        bar(x=["Noise coherence", "Wavelet support"],
-            y=[coh, wl],
-            marker=attr(color=["#9467bd", "#8c564b"]),
-            showlegend=false),
-        row=2, col=2)
-
-    relayout!(fig_summary,
-        title_text="Noise regime diagnostics — regime = $(result.regime)",
-        title_x=0.5,
-        height=620, width=900,
-        margin=attr(l=60, r=20, t=80, b=50),
-    )
-
-    return (psd        = fig_psd,
-            psd_linear = fig_psd_lin,
-            bandwidth  = fig_bw,
-            overlap    = fig_overlap,
-            summary    = fig_summary)
+# ╔═╡ 10000017-0000-0000-0000-000000000001
+if isnothing(state_averages)
+    md""
+else
+    WideCell(vqvae.plot_state_average_matrix(state_averages.acausal;
+        title="Acausal Source-State Averages ($(result_title_context(selected_result)))",
+        dt=dt, reverse_time=false))
 end
 
-# ╔═╡ 9450b47e-2668-4f7f-a0a5-7b230888b4c0
-figs = plot_noise_regime(result);
+# ╔═╡ 10000018-0000-0000-0000-000000000001
+if isnothing(state_averages)
+    md""
+else
+    WideCell(vqvae.plot_state_average_matrix(state_averages.causal;
+        title="Causal Source-State Averages ($(result_title_context(selected_result)))",
+        dt=dt, reverse_time=false))
+end
 
-# ╔═╡ 8f107885-40ff-4b9a-81e7-0b739b99dcad
-WideCell(figs.summary)
+# ╔═╡ b11c9e24-6593-497c-a706-146619251e36
+if isnothing(selected_result) || isnothing(state_averages)
+    md""
+else
+    let
+        cluster_avg_ac = state_averages.acausal
+        cluster_avg_c = state_averages.causal
+        nth = size(cluster_avg_ac, 1)
+        t_neg = [-(nth - i + 1) * dt for i in 1:nth]
+        t_pos = [i * dt for i in 1:nth]
+        t_full = [t_neg; t_pos]
+
+        global_avg_ac = vec(mean(selected_result.data.D_ac_all; dims=2))
+        global_avg_c = vec(mean(selected_result.data.D_c_all; dims=2))
+        global_full = [reverse(global_avg_ac); global_avg_c]
+        global_ac0 = global_avg_ac .- mean(global_avg_ac)
+        global_c0 = global_avg_c .- mean(global_avg_c)
+        global_ncc = dot(global_ac0, global_c0) / ((norm(global_ac0) * norm(global_c0)) + 1f-8)
+
+        combo_labels_local = string.(1:size(cluster_avg_ac, 2))
+        ncomb = length(combo_labels_local)
+        traces = AbstractTrace[]
+        colors = begin
+            nc = max(ncomb, 1)
+            cs = ColorSchemes.rainbow
+            [Colors.hex(get(cs, (i - 1) / max(1, nc - 1))) for i in 1:nc]
+        end
+
+        total_ac = size(selected_result.data.D_ac_all, 2)
+        total_c = size(selected_result.data.D_c_all, 2)
+        amp_peak = maximum(abs.(vcat(vec(cluster_avg_ac), vec(cluster_avg_c), global_full)))
+        vertical_spacing = amp_peak * 2.5 + 1f-3
+
+        for combo_idx in 1:ncomb
+            c = colors[mod1(combo_idx, length(colors))]
+            a = cluster_avg_ac[:, combo_idx]
+            b = cluster_avg_c[:, combo_idx]
+            full_k = [reverse(a); b]
+            a0 = a .- mean(a)
+            b0 = b .- mean(b)
+            ncc = dot(a0, b0) / ((norm(a0) * norm(b0)) + 1f-8)
+            pct_ac = 100 * state_averages.counts_ac[combo_idx] / max(total_ac, 1)
+            pct_c = 100 * state_averages.counts_c[combo_idx] / max(total_c, 1)
+            legend_label = "State $(combo_labels_local[combo_idx]) (ac: $(round(pct_ac; digits=1))%, c: $(round(pct_c; digits=1))%, corr=$(round(ncc; digits=3)))"
+            offset = (combo_idx - 1) * vertical_spacing
+            push!(traces, PlutoPlotly.scatter(x=t_full, y=full_k .+ offset, mode="lines",
+                name=legend_label, line=attr(color=c, width=2)))
+            push!(traces, PlutoPlotly.scatter(x=t_full, y=global_full .+ offset, mode="lines",
+                name=combo_idx == 1 ? "Global mean (corr=$(round(global_ncc; digits=3)))" : "Global mean",
+                showlegend=combo_idx == 1,
+                line=attr(color="black", width=3)))
+        end
+
+        shapes = let distance = selected_result.data_bundle.distance
+            if isnothing(distance)
+                []
+            else
+                vmin, vmax = selected_result.para.velocity_range
+                t_fast = distance / vmax
+                t_slow = distance / vmin
+                vcat([
+                    attr(type="line", x0=t, x1=t, y0=0, y1=1, yref="paper",
+                        line=attr(color="rgba(0,0,0,0.25)", width=1, dash="dash"))
+                    for t in (-t_slow, -t_fast, t_fast, t_slow)
+                ])
+            end
+        end
+
+        layout = Layout(
+            title=attr(text="Source State Average Waveforms ($(result_title_context(selected_result)))",
+                font=attr(size=18, family="Computer Modern, serif")),
+            height=500, width=900,
+            xaxis=attr(title="Lag (s)", zeroline=true, zerolinecolor="rgba(0,0,0,0.3)"),
+            yaxis=attr(title="Amplitude"),
+            plot_bgcolor="white", paper_bgcolor="white",
+            legend=attr(x=0.5, xanchor="center", y=-0.2, orientation="h",
+                font=attr(size=12, family="Computer Modern, serif")),
+            shapes=shapes,
+        )
+        WideCell(PlutoPlotly.plot(traces, layout))
+    end
+end
+
+# ╔═╡ 86843302-bb3b-494c-afe4-b9a43fcc0e7c
+if isnothing(selected_result) || isnothing(state_averages)
+    md""
+else
+    let
+    cluster_avg_ac = state_averages.acausal
+	    cluster_avg_c = state_averages.causal
+	    combo_labels = string.(1:size(cluster_avg_ac, 2))
+    labels = string.(combo_labels)
+    n = length(labels)
+
+    function norm_corr_matrix(A)
+        # A: (nt, n); returns (n, n) normalized correlation matrix
+        C = Matrix{Float32}(undef, n, n)
+        cols = [begin v = vec(A[:, i]); v .- mean(v) end for i in 1:n]
+        norms = [norm(c) + 1f-8 for c in cols]
+        for i in 1:n, j in 1:n
+            C[i, j] = dot(cols[i], cols[j]) / (norms[i] * norms[j])
+        end
+        C
+    end
+
+    C_ac = norm_corr_matrix(cluster_avg_ac)
+    C_c  = norm_corr_matrix(cluster_avg_c)
+    trace_ac = PlutoPlotly.heatmap(
+        z=C_ac, x=labels, y=labels,
+        colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
+        colorbar=attr(title="Corr", len=0.9, x=0.46),
+        xaxis="x1", yaxis="y1",
+    )
+    trace_c = PlutoPlotly.heatmap(
+        z=C_c, x=labels, y=labels,
+        colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
+        colorbar=attr(title="Corr", len=0.9, x=1.01),
+        xaxis="x2", yaxis="y2",
+    )
+
+    sz = max(350, n * 40)
+    layout = Layout(
+        title=attr(text="State-State Normalised Correlation ($(result_title_context(selected_result)))",
+            font=attr(size=16)),
+        grid=attr(rows=1, columns=2, pattern="independent"),
+        annotations=[
+            attr(text="Acausal", x=0.22, xref="paper", y=1.05, yref="paper",
+                 showarrow=false, font=attr(size=14)),
+            attr(text="Causal",  x=0.78, xref="paper", y=1.05, yref="paper",
+                 showarrow=false, font=attr(size=14)),
+        ],
+        xaxis=attr(title="State", tickangle=-45),
+        yaxis=attr(title="State"),
+        xaxis2=attr(title="State", tickangle=-45),
+        yaxis2=attr(title="State"),
+        width=900, height=sz + 80,
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=attr(t=80, b=80, l=80, r=80),
+    )
+    WideCell(PlutoPlotly.plot([trace_ac, trace_c], layout))
+    end
+end
+
+# ╔═╡ 10000019-0000-0000-0000-000000000001
+mft_analysis = if isnothing(state_averages)
+    nothing
+else
+    nstates = size(state_averages.acausal, 2)
+    global_avg_ac = vec(mean(selected_result.data.D_ac_all; dims=2))
+    global_avg_c = vec(mean(selected_result.data.D_c_all; dims=2))
+    ac_traces = [
+        mft.SeismicTrace(data=vec(state_averages.acausal[:, i]), dt=dt,
+            distance=selected_result.data_bundle.distance)
+        for i in 1:nstates
+    ]
+    push!(ac_traces, mft.SeismicTrace(data=global_avg_ac, dt=dt,
+        distance=selected_result.data_bundle.distance))
+    c_traces = [
+        mft.SeismicTrace(data=vec(state_averages.causal[:, i]), dt=dt,
+            distance=selected_result.data_bundle.distance)
+        for i in 1:nstates
+    ]
+    push!(c_traces, mft.SeismicTrace(data=global_avg_c, dt=dt,
+        distance=selected_result.data_bundle.distance))
+    labels = vcat(string.(1:nstates), "Full")
+    mft.analyze_causal_acausal_branches(
+        ac_traces,
+        c_traces;
+        state_labels=labels,
+        period_max=80.0,
+        velocity_range=(1.0, 8.0),
+        bandwidth_factor=0.15,
+        zero_pad_factor=4,
+    )
+end
+
+# ╔═╡ 1000001a-0000-0000-0000-000000000001
+if isnothing(mft_analysis)
+    md""
+else
+    @bind ui_period Slider(mft_analysis.periods; default=10, show_value=true)
+end
+
+# ╔═╡ 1000001b-0000-0000-0000-000000000001
+if isnothing(mft_analysis)
+    md""
+else
+    WideCell(mft.plot_filtered_traces_by_period(
+        mft_analysis;
+        period=ui_period,
+        correlation_threshold=nothing,
+        normalize_each=true,
+        scale=0.7,
+        spacing=2.2,
+        title="MFT Filtered Source-State Traces ($(result_title_context(selected_result)); period=$(ui_period)s)",
+    ))
+end
+
+# ╔═╡ 1000001c-0000-0000-0000-000000000001
+if isnothing(mft_analysis)
+    md""
+else
+    WideCell(mft.plot_branch_correlation(
+        mft_analysis;
+        title="MFT Branch Correlation ($(result_title_context(selected_result)))",
+    ))
+end
+
+# ╔═╡ 52edc77f-d951-40a2-bae7-ed04e2c778ce
+WideCell(mft.plot_all_highcorr_groupvelocity_picks(mft_analysis; correlation_threshold=0.9, pair_and_average=true, title=string("Group Velocity Picks ", result_title_context(selected_result))))
+
+# ╔═╡ b48757f3-a9f1-4ff4-b714-de58221a1660
+WideCell(mft.plot_all_highcorr_groupvelocity_picks(mft_analysis; correlation_threshold=0.9, title=string("Group Velocity Picks ", result_title_context(selected_result))))
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
 [deps]
+ColorSchemes = "35d6a980-a343-548e-a6ea-1d62b119f2f4"
+Colors = "5ae59095-9a9b-59fe-a467-6f913c188581"
+ConcreteStructs = "2569d6c7-a4a2-43d3-a901-331e8e4be471"
 DSP = "717857b8-e6f2-59f4-9121-6e50c889abd2"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
-Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+InlineStrings = "842dd82b-1e85-43dc-bf29-5d0ee9dffc48"
 JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
+MLUtils = "f1d291b0-491e-4a28-83b9-f70985020b54"
+NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
+Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
+Peaks = "18e31ff7-3703-566c-8e60-38913d67486b"
+PlutoLinks = "0ff47ea0-7a50-410d-8455-4348d5de0420"
 PlutoPlotly = "8e989ff0-3d88-8e9f-f020-2b208a939ff0"
 PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
+Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 
 [compat]
+ColorSchemes = "~3.31.0"
+Colors = "~0.13.1"
+ConcreteStructs = "~0.2.3"
 DSP = "~0.8.4"
+Enzyme = "~0.13.140"
+EnzymeCore = "~0.8.20"
 FFTW = "~1.10.0"
-Flux = "~0.16.10"
+InlineStrings = "~1.4.5"
 JLD2 = "~0.6.4"
+Lux = "~1.31.4"
+MLUtils = "~0.4.8"
+NNlib = "~0.9.34"
+Optimisers = "~0.4.7"
+Peaks = "~0.6.2"
+PlutoLinks = "~0.1.8"
 PlutoPlotly = "~0.6.5"
 PlutoUI = "~0.7.80"
+Reactant = "~0.2.254"
 StatsBase = "~0.34.10"
 """
 
@@ -704,12 +550,12 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.12.4"
 manifest_format = "2.0"
-project_hash = "48db4653c7b8077b3d9e6e2f46ee865a89dd371c"
+project_hash = "f4c0181ba5aa09cc6df988290009d5e4876d737f"
 
 [[deps.ADTypes]]
-git-tree-sha1 = "f7304359109c768cf32dc5fa2d371565bb63b68a"
+git-tree-sha1 = "bbc22a9a08a0ef6460041086d8a7b27940ed4ffd"
 uuid = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
-version = "1.21.0"
+version = "1.22.0"
 weakdeps = ["ChainRulesCore", "ConstructionBase", "EnzymeCore"]
 
     [deps.ADTypes.extensions]
@@ -784,6 +630,42 @@ version = "2.5.0"
 uuid = "0dad84c5-d112-42e6-8d28-ef12dabb789f"
 version = "1.1.2"
 
+[[deps.ArrayInterface]]
+deps = ["Adapt", "LinearAlgebra"]
+git-tree-sha1 = "54f895554d05c83e3dd59f6a396671dae8999573"
+uuid = "4fba245c-0d91-5ea0-9b3e-6abc04ee57a9"
+version = "7.24.0"
+
+    [deps.ArrayInterface.extensions]
+    ArrayInterfaceAMDGPUExt = "AMDGPU"
+    ArrayInterfaceBandedMatricesExt = "BandedMatrices"
+    ArrayInterfaceBlockBandedMatricesExt = "BlockBandedMatrices"
+    ArrayInterfaceCUDAExt = "CUDA"
+    ArrayInterfaceCUDSSExt = ["CUDSS", "CUDA"]
+    ArrayInterfaceChainRulesCoreExt = "ChainRulesCore"
+    ArrayInterfaceChainRulesExt = "ChainRules"
+    ArrayInterfaceGPUArraysCoreExt = "GPUArraysCore"
+    ArrayInterfaceMetalExt = "Metal"
+    ArrayInterfaceReverseDiffExt = "ReverseDiff"
+    ArrayInterfaceSparseArraysExt = "SparseArrays"
+    ArrayInterfaceStaticArraysCoreExt = "StaticArraysCore"
+    ArrayInterfaceTrackerExt = "Tracker"
+
+    [deps.ArrayInterface.weakdeps]
+    AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
+    BandedMatrices = "aae01518-5342-5314-be14-df237901396f"
+    BlockBandedMatrices = "ffab5731-97b5-5995-9138-79e8c1846df0"
+    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+    CUDSS = "45b445bb-4962-46a0-9369-b4df9d0f772e"
+    ChainRules = "082447d4-558c-5d27-93f4-14fc19e9eca2"
+    ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+    GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
+    Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
+    ReverseDiff = "37e2e3b7-166d-5795-8a7a-e32c996b4267"
+    SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+    StaticArraysCore = "1e83bf80-4336-4d27-bf5d-d5a4f845583c"
+    Tracker = "9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c"
+
 [[deps.Artifacts]]
 uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
 version = "1.11.0"
@@ -805,6 +687,12 @@ version = "1.1.3"
     Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
     OpenCL = "08131aa3-fb12-5dee-8b74-c09406e224a2"
     oneAPI = "8f75cd03-7ff8-4ecb-9b8f-daf728133b1b"
+
+[[deps.BFloat16s]]
+deps = ["LinearAlgebra", "Printf", "Random"]
+git-tree-sha1 = "e386db8b4753b42caac75ac81d0a4fe161a68a97"
+uuid = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
+version = "0.6.1"
 
 [[deps.BangBang]]
 deps = ["Accessors", "ConstructionBase", "InitialValues", "LinearAlgebra"]
@@ -842,10 +730,26 @@ git-tree-sha1 = "4435559dc39793d53a9e3d278e185e920b4619ef"
 uuid = "0e736298-9ec6-45e8-9647-e4fc86a2fe38"
 version = "0.2.8"
 
+[[deps.BitFlags]]
+git-tree-sha1 = "0691e34b3bb8be9307330f88d1a3c3f25466c24d"
+uuid = "d1d4a3ce-64b1-5f1a-9ba4-7e7e69966f35"
+version = "0.1.9"
+
+[[deps.BufferedStreams]]
+git-tree-sha1 = "6863c5b7fc997eadcabdbaf6c5f201dc30032643"
+uuid = "e1450e63-4bb3-523b-b2a4-4ffa8c0fd77d"
+version = "1.2.2"
+
 [[deps.CEnum]]
 git-tree-sha1 = "389ad5c84de1ae7cf0e28e381131c98ea87d54fc"
 uuid = "fa961155-64e5-5f13-b03f-caf6b980ea82"
 version = "0.5.0"
+
+[[deps.CPUSummary]]
+deps = ["CpuId", "IfElse", "PrecompileTools", "Preferences", "Static"]
+git-tree-sha1 = "f3a21d7fc84ba618a779d1ed2fcca2e682865bab"
+uuid = "2a0fbf3d-bb9c-48f3-b0a9-814d99fd7ab9"
+version = "0.2.7"
 
 [[deps.ChainRules]]
 deps = ["Adapt", "ChainRulesCore", "Compat", "Distributed", "GPUArraysCore", "IrrationalConstants", "LinearAlgebra", "Random", "RealDot", "SparseArrays", "SparseInverseSubset", "Statistics", "StructArrays", "SuiteSparse"]
@@ -879,6 +783,18 @@ deps = ["ChunkCodecCore", "Zstd_jll"]
 git-tree-sha1 = "34d9873079e4cb3d0c62926a225136824677073f"
 uuid = "55437552-ac27-4d47-9aa3-63184e8fd398"
 version = "1.0.0"
+
+[[deps.CodeTracking]]
+deps = ["InteractiveUtils", "REPL", "UUIDs"]
+git-tree-sha1 = "cfb7a2e89e245a9d5016b70323db412b3a7438d5"
+uuid = "da1fd8a2-8d9e-5ec2-8556-3022fb5608a2"
+version = "3.0.2"
+
+[[deps.CodecZlib]]
+deps = ["TranscodingStreams", "Zlib_jll"]
+git-tree-sha1 = "962834c22b66e32aa10f7611c08c8ca4e20749a9"
+uuid = "944b1d66-785c-5afd-91f1-9de20f533193"
+version = "0.7.8"
 
 [[deps.ColorSchemes]]
 deps = ["ColorTypes", "ColorVectorSpace", "Colors", "FixedPointNumbers", "PrecompileTools", "Random"]
@@ -918,6 +834,11 @@ git-tree-sha1 = "cda2cfaebb4be89c9084adaca7dd7333369715c5"
 uuid = "bbf7d656-a473-5ed7-a52c-81e309532950"
 version = "0.3.1"
 
+[[deps.CommonWorldInvalidations]]
+git-tree-sha1 = "ae52d1c52048455e85a387fbee9be553ec2b68d0"
+uuid = "f70d9fcc-98c5-4d4a-abd7-e4cdeebd8ca8"
+version = "1.0.0"
+
 [[deps.Compat]]
 deps = ["TOML", "UUIDs"]
 git-tree-sha1 = "9d8a54ce4b17aa5bdce0ea5c34bc5e7c340d16ad"
@@ -927,6 +848,11 @@ weakdeps = ["Dates", "LinearAlgebra"]
 
     [deps.Compat.extensions]
     CompatLinearAlgebraExt = "LinearAlgebra"
+
+[[deps.Compiler]]
+git-tree-sha1 = "382d79bfe72a406294faca39ef0c3cef6e6ce1f1"
+uuid = "807dbc54-b67e-4c79-8afb-eafe4df6f2e1"
+version = "0.1.1"
 
 [[deps.CompilerSupportLibraries_jll]]
 deps = ["Artifacts", "Libdl"]
@@ -941,6 +867,17 @@ weakdeps = ["InverseFunctions"]
 
     [deps.CompositionsBase.extensions]
     CompositionsBaseInverseFunctionsExt = "InverseFunctions"
+
+[[deps.ConcreteStructs]]
+git-tree-sha1 = "f749037478283d372048690eb3b5f92a79432b34"
+uuid = "2569d6c7-a4a2-43d3-a901-331e8e4be471"
+version = "0.2.3"
+
+[[deps.ConcurrentUtilities]]
+deps = ["Serialization", "Sockets"]
+git-tree-sha1 = "21d088c496ea22914fe80906eb5bce65755e5ec8"
+uuid = "f0e56b4a-5159-44fe-b623-3e5288b988bb"
+version = "2.5.1"
 
 [[deps.ConstructionBase]]
 git-tree-sha1 = "b4b092499347b18a015186eae3042f72267106cb"
@@ -962,6 +899,17 @@ deps = ["Compat", "Logging", "UUIDs"]
 git-tree-sha1 = "25cc3803f1030ab855e383129dcd3dc294e322cc"
 uuid = "6add18c4-b38d-439d-96f6-d6bc489c04c5"
 version = "0.1.3"
+
+[[deps.CpuId]]
+deps = ["Markdown"]
+git-tree-sha1 = "fcbb72b032692610bfbdb15018ac16a36cf2e406"
+uuid = "adafc99b-e345-5852-983c-f28acb93d879"
+version = "0.3.1"
+
+[[deps.Crayons]]
+git-tree-sha1 = "249fe38abf76d48563e2f4556bebd215aa317e15"
+uuid = "a8cc5b0e-0ffa-5ad4-8c14-923d3ee1735f"
+version = "4.1.1"
 
 [[deps.DSP]]
 deps = ["Bessels", "FFTW", "IterTools", "LinearAlgebra", "Polynomials", "Random", "Reexport", "SpecialFunctions", "Statistics"]
@@ -1019,6 +967,17 @@ git-tree-sha1 = "23163d55f885173722d1e4cf0f6110cdbaf7e272"
 uuid = "b552c78f-8df3-52c6-915a-8e097449b14b"
 version = "1.15.1"
 
+[[deps.DispatchDoctor]]
+deps = ["MacroTools", "Preferences"]
+git-tree-sha1 = "42cd00edaac86f941815fe557c1d01e11913e07c"
+uuid = "8d63f2c5-f18a-4cf2-ba9d-b3f60fc568c8"
+version = "0.4.28"
+weakdeps = ["ChainRulesCore", "EnzymeCore"]
+
+    [deps.DispatchDoctor.extensions]
+    DispatchDoctorChainRulesCoreExt = "ChainRulesCore"
+    DispatchDoctorEnzymeCoreExt = "EnzymeCore"
+
 [[deps.Distributed]]
 deps = ["Random", "Serialization", "Sockets"]
 uuid = "8ba89e20-285c-5b6f-9357-94700520ee1b"
@@ -1034,15 +993,57 @@ deps = ["ArgTools", "FileWatching", "LibCURL", "NetworkOptions"]
 uuid = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
 version = "1.7.0"
 
+[[deps.EnumX]]
+git-tree-sha1 = "c49898e8438c828577f04b92fc9368c388ac783c"
+uuid = "4e289a0a-7415-4d19-859d-a7e5c4648b56"
+version = "1.0.7"
+
+[[deps.Enzyme]]
+deps = ["CEnum", "EnzymeCore", "Enzyme_jll", "GPUCompiler", "InteractiveUtils", "LLVM", "Libdl", "LinearAlgebra", "ObjectFile", "PrecompileTools", "Preferences", "Printf", "Random", "SparseArrays"]
+git-tree-sha1 = "78704dd8d84c93a7f2ac5af0bbb95d26763ec9b9"
+uuid = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+version = "0.13.140"
+weakdeps = ["ADTypes", "BFloat16s", "ChainRulesCore", "GPUArraysCore", "LogExpFunctions", "SpecialFunctions", "StaticArrays"]
+
+    [deps.Enzyme.extensions]
+    EnzymeBFloat16sExt = "BFloat16s"
+    EnzymeChainRulesCoreExt = "ChainRulesCore"
+    EnzymeGPUArraysCoreExt = "GPUArraysCore"
+    EnzymeLogExpFunctionsExt = "LogExpFunctions"
+    EnzymeSpecialFunctionsExt = "SpecialFunctions"
+    EnzymeStaticArraysExt = "StaticArrays"
+
 [[deps.EnzymeCore]]
-git-tree-sha1 = "24bbb6fc8fb87eb71c1f8d00184a60fc22c63903"
+git-tree-sha1 = "c6ee69ee502060982d12dbaaf3d8fcb4e835a0d1"
 uuid = "f151be2c-9106-41f4-ab19-57ee4f262869"
-version = "0.8.19"
+version = "0.8.20"
 weakdeps = ["Adapt", "ChainRulesCore"]
 
     [deps.EnzymeCore.extensions]
     AdaptExt = "Adapt"
     EnzymeCoreChainRulesCoreExt = "ChainRulesCore"
+
+[[deps.Enzyme_jll]]
+deps = ["Artifacts", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
+git-tree-sha1 = "d3ad8f5eca369ac8803ff7db660028d47debc75d"
+uuid = "7cc45869-7501-5eee-bdea-0790c847d4ef"
+version = "0.0.258+0"
+
+[[deps.ExceptionUnwrapping]]
+deps = ["Test"]
+git-tree-sha1 = "d36f682e590a83d63d1c7dbd287573764682d12a"
+uuid = "460bff9d-24e4-43bc-9d9f-a8973cb893f4"
+version = "0.1.11"
+
+[[deps.ExprTools]]
+git-tree-sha1 = "27415f162e6028e81c72b82ef756bf321213b6ec"
+uuid = "e2ba6199-217a-4e67-a87a-7c52f15ade04"
+version = "0.1.10"
+
+[[deps.ExpressionExplorer]]
+git-tree-sha1 = "5f1c005ed214356bbe41d442cc1ccd416e510b7e"
+uuid = "21656369-7473-754a-2065-74616d696c43"
+version = "1.1.4"
 
 [[deps.FFTW]]
 deps = ["AbstractFFTs", "FFTW_jll", "Libdl", "LinearAlgebra", "MKL_jll", "Preferences", "Reexport"]
@@ -1068,17 +1069,20 @@ git-tree-sha1 = "656f7a6859be8673bf1f35da5670246b923964f7"
 uuid = "b9860ae5-e623-471e-878b-f6a53c775ea6"
 version = "0.1.1"
 
+[[deps.FastClosures]]
+git-tree-sha1 = "acebe244d53ee1b461970f8910c235b259e772ef"
+uuid = "9aa1b823-49e4-5ca5-8b0f-3971ec8bab6a"
+version = "0.3.2"
+
 [[deps.FileIO]]
 deps = ["Pkg", "Requires", "UUIDs"]
-git-tree-sha1 = "6522cfb3b8fe97bec632252263057996cbd3de20"
+git-tree-sha1 = "8e9c059d6857607253e837730dbf780b6b151acd"
 uuid = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
-version = "1.18.0"
+version = "1.19.0"
+weakdeps = ["HTTP"]
 
     [deps.FileIO.extensions]
     HTTPExt = "HTTP"
-
-    [deps.FileIO.weakdeps]
-    HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
 
 [[deps.FileWatching]]
 uuid = "7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"
@@ -1108,32 +1112,6 @@ git-tree-sha1 = "05882d6995ae5c12bb5f36dd2ed3f61c98cbb172"
 uuid = "53c48c17-4a7d-5ca2-90c5-79b7896eea93"
 version = "0.8.5"
 
-[[deps.Flux]]
-deps = ["ADTypes", "Adapt", "ChainRulesCore", "Compat", "EnzymeCore", "Functors", "GPUArrays", "LinearAlgebra", "MLCore", "MLDataDevices", "MLUtils", "MacroTools", "NNlib", "OneHotArrays", "Optimisers", "Preferences", "ProgressLogging", "Random", "Reexport", "Setfield", "SparseArrays", "SpecialFunctions", "Statistics", "Zygote"]
-git-tree-sha1 = "cb318a415a089c337d0c15000d1608cee8434ebf"
-uuid = "587475ba-b771-5e3f-ad9e-33799f191a9c"
-version = "0.16.10"
-
-    [deps.Flux.extensions]
-    FluxAMDGPUExt = "AMDGPU"
-    FluxCUDAExt = "CUDA"
-    FluxCUDAcuDNNExt = ["CUDA", "cuDNN"]
-    FluxEnzymeExt = "Enzyme"
-    FluxFiniteDifferencesExt = "FiniteDifferences"
-    FluxMPIExt = "MPI"
-    FluxMPINCCLExt = ["CUDA", "MPI", "NCCL"]
-    FluxMooncakeExt = "Mooncake"
-
-    [deps.Flux.weakdeps]
-    AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
-    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
-    Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
-    FiniteDifferences = "26cc04aa-876d-5657-8c51-4c34ba976000"
-    MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
-    Mooncake = "da2b9cff-9c12-43a0-ae48-6db2b0edb7d6"
-    NCCL = "3fe64909-d7a1-4096-9b7d-7a0f12cf0f6b"
-    cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
-
 [[deps.ForwardDiff]]
 deps = ["CommonSubexpressions", "DiffResults", "DiffRules", "LinearAlgebra", "LogExpFunctions", "NaNMath", "Preferences", "Printf", "Random", "SpecialFunctions"]
 git-tree-sha1 = "cddeab6487248a39dae1a960fff0ac17b2a28888"
@@ -1155,21 +1133,23 @@ deps = ["Random"]
 uuid = "9fa8497b-333b-5362-9e8d-4d0656e87820"
 version = "1.11.0"
 
-[[deps.GPUArrays]]
-deps = ["Adapt", "GPUArraysCore", "KernelAbstractions", "LLVM", "LinearAlgebra", "Printf", "Random", "Reexport", "ScopedValues", "Serialization", "SparseArrays", "Statistics"]
-git-tree-sha1 = "34fd745547978beb471f029f447290ef4dbc7bbd"
-uuid = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
-version = "11.5.3"
-weakdeps = ["JLD2"]
-
-    [deps.GPUArrays.extensions]
-    JLD2Ext = "JLD2"
-
 [[deps.GPUArraysCore]]
 deps = ["Adapt"]
 git-tree-sha1 = "83cf05ab16a73219e5f6bd1bdfa9848fa24ac627"
 uuid = "46192b85-c4d5-4398-a991-12ede77f4527"
 version = "0.2.0"
+
+[[deps.GPUCompiler]]
+deps = ["ExprTools", "InteractiveUtils", "LLVM", "Libdl", "Logging", "PrecompileTools", "Preferences", "Scratch", "Serialization", "TOML", "Tracy", "UUIDs"]
+git-tree-sha1 = "fedfe5e7db7035271c3f58359007f971da1dde87"
+uuid = "61eb1bfa-7361-4325-ad38-22787b887f55"
+version = "1.9.1"
+
+[[deps.HTTP]]
+deps = ["Base64", "CodecZlib", "ConcurrentUtilities", "Dates", "ExceptionUnwrapping", "Logging", "LoggingExtras", "MbedTLS", "NetworkOptions", "OpenSSL", "PrecompileTools", "Random", "SimpleBufferStream", "Sockets", "URIs", "UUIDs"]
+git-tree-sha1 = "51059d23c8bb67911a2e6fd5130229113735fc7e"
+uuid = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+version = "1.11.0"
 
 [[deps.HashArrayMappedTries]]
 git-tree-sha1 = "2eaa69a7cab70a52b9687c8bf950a5a93ec895ae"
@@ -1200,10 +1180,28 @@ git-tree-sha1 = "57e9ce6cf68d0abf5cb6b3b4abf9bedf05c939c0"
 uuid = "7869d1d1-7146-5819-86e3-90919afe41df"
 version = "0.4.15"
 
+[[deps.IfElse]]
+git-tree-sha1 = "debdd00ffef04665ccbb3e150747a77560e8fad1"
+uuid = "615f187c-cbe4-4ef1-ba3b-2fcf58d6d173"
+version = "0.1.1"
+
 [[deps.InitialValues]]
 git-tree-sha1 = "4da0f88e9a39111c2fa3add390ab15f3a44f3ca3"
 uuid = "22cec73e-a1b8-11e9-2c92-598750a2cf9c"
 version = "0.3.1"
+
+[[deps.InlineStrings]]
+git-tree-sha1 = "8f3d257792a522b4601c24a577954b0a8cd7334d"
+uuid = "842dd82b-1e85-43dc-bf29-5d0ee9dffc48"
+version = "1.4.5"
+
+    [deps.InlineStrings.extensions]
+    ArrowTypesExt = "ArrowTypes"
+    ParsersExt = "Parsers"
+
+    [deps.InlineStrings.weakdeps]
+    ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
+    Parsers = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
 
 [[deps.IntelOpenMP_jll]]
 deps = ["Artifacts", "JLLWrappers", "LazyArtifacts", "Libdl"]
@@ -1259,15 +1257,21 @@ version = "1.7.1"
 
 [[deps.JSON]]
 deps = ["Dates", "Logging", "Parsers", "PrecompileTools", "StructUtils", "UUIDs", "Unicode"]
-git-tree-sha1 = "67c6f1f085cb2671c93fe34244c9cccde30f7a26"
+git-tree-sha1 = "fe23330af47b8ab4e135b2ff65f7398c3a2bfc65"
 uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-version = "1.5.0"
+version = "1.5.2"
 
     [deps.JSON.extensions]
     JSONArrowExt = ["ArrowTypes"]
 
     [deps.JSON.weakdeps]
     ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
+
+[[deps.JuliaInterpreter]]
+deps = ["CodeTracking", "InteractiveUtils", "Random", "UUIDs"]
+git-tree-sha1 = "58927c485919bf17ea308d9d82156de1adf4b006"
+uuid = "aa1ae85d-cabe-5617-a682-6adf51b2e16a"
+version = "0.10.12"
 
 [[deps.JuliaSyntaxHighlighting]]
 deps = ["StyledStrings"]
@@ -1294,21 +1298,25 @@ weakdeps = ["EnzymeCore", "LinearAlgebra", "SparseArrays"]
 
 [[deps.LLVM]]
 deps = ["CEnum", "LLVMExtra_jll", "Libdl", "PrecompileTools", "Preferences", "Printf", "Unicode"]
-git-tree-sha1 = "f1b04cbf4be550fabad4bbc38c3b18ba5bdf53a6"
+git-tree-sha1 = "85592339c4363f40863f0b61f9cba80b885070c3"
 uuid = "929cbde3-209d-540e-8aea-75f648917ca0"
-version = "9.7.0"
+version = "9.7.1"
+weakdeps = ["BFloat16s"]
 
     [deps.LLVM.extensions]
     BFloat16sExt = "BFloat16s"
-
-    [deps.LLVM.weakdeps]
-    BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
 
 [[deps.LLVMExtra_jll]]
 deps = ["Artifacts", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
 git-tree-sha1 = "f1d1adfff151fd02b4062d1af82df02052dc4a0c"
 uuid = "dad2f222-ce93-54a1-a47d-0025e8a3acab"
 version = "0.0.42+0"
+
+[[deps.LLVMOpenMP_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "eb62a3deb62fc6d8822c0c4bef73e4412419c5d8"
+uuid = "1d63c593-3942-5779-bab2-d838dc0a180e"
+version = "18.1.8+0"
 
 [[deps.LaTeXStrings]]
 git-tree-sha1 = "dda21b8cbd6a6c40d9d02a73230f9d70fed6918c"
@@ -1345,6 +1353,12 @@ deps = ["Artifacts", "Libdl", "OpenSSL_jll"]
 uuid = "29816b5a-b9ab-546f-933c-edad1886dfa8"
 version = "1.11.3+1"
 
+[[deps.LibTracyClient_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "d4e20500d210247322901841d4eafc7a0c52642d"
+uuid = "ad6e5548-8b26-5c9f-8ef3-ef0ad883f3a5"
+version = "0.13.1+0"
+
 [[deps.Libdl]]
 uuid = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 version = "1.11.0"
@@ -1373,6 +1387,131 @@ version = "0.3.29"
 [[deps.Logging]]
 uuid = "56ddb016-857b-54e1-b83d-db4d58db5568"
 version = "1.11.0"
+
+[[deps.LoggingExtras]]
+deps = ["Dates", "Logging"]
+git-tree-sha1 = "f00544d95982ea270145636c181ceda21c4e2575"
+uuid = "e6f89c97-d47a-5376-807f-9c37f3926c36"
+version = "1.2.0"
+
+[[deps.LoweredCodeUtils]]
+deps = ["CodeTracking", "Compiler", "JuliaInterpreter"]
+git-tree-sha1 = "5d4278f755440f70648d80cc6225f51e78e94094"
+uuid = "6f1432cf-f94c-5a45-995e-cdbf5db27b0b"
+version = "3.5.1"
+
+[[deps.Lux]]
+deps = ["ADTypes", "Adapt", "ArrayInterface", "ChainRulesCore", "ConcreteStructs", "DiffResults", "DispatchDoctor", "EnzymeCore", "FastClosures", "ForwardDiff", "Functors", "GPUArraysCore", "LinearAlgebra", "LuxCore", "LuxLib", "MLDataDevices", "MacroTools", "Markdown", "NNlib", "Optimisers", "PrecompileTools", "Preferences", "Random", "ReactantCore", "Reexport", "SciMLPublic", "Setfield", "Static", "StaticArraysCore", "Statistics", "UUIDs", "WeightInitializers"]
+git-tree-sha1 = "b7654d9b1144792d7fa165add2e07434329e3193"
+uuid = "b2108857-7c20-44ae-9111-449ecde12c47"
+version = "1.31.4"
+
+    [deps.Lux.extensions]
+    ComponentArraysExt = "ComponentArrays"
+    EnzymeExt = "Enzyme"
+    FluxExt = "Flux"
+    GPUArraysExt = "GPUArrays"
+    LossFunctionsExt = "LossFunctions"
+    MLUtilsExt = "MLUtils"
+    MPIExt = "MPI"
+    MPINCCLExt = ["CUDA", "MPI", "NCCL"]
+    MooncakeExt = "Mooncake"
+    ReactantExt = ["Enzyme", "Reactant"]
+    ReverseDiffExt = ["FunctionWrappers", "ReverseDiff"]
+    SimpleChainsExt = "SimpleChains"
+    TrackerExt = "Tracker"
+    ZygoteExt = "Zygote"
+
+    [deps.Lux.weakdeps]
+    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+    ComponentArrays = "b0b7db55-cfe3-40fc-9ded-d10e2dbeff66"
+    Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+    Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+    FunctionWrappers = "069b7b12-0de2-55c6-9aab-29f3d0a68a2e"
+    GPUArrays = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
+    LossFunctions = "30fc2ffe-d236-52d8-8643-a9d8f7c094a7"
+    MLUtils = "f1d291b0-491e-4a28-83b9-f70985020b54"
+    MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+    Mooncake = "da2b9cff-9c12-43a0-ae48-6db2b0edb7d6"
+    NCCL = "3fe64909-d7a1-4096-9b7d-7a0f12cf0f6b"
+    Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+    ReverseDiff = "37e2e3b7-166d-5795-8a7a-e32c996b4267"
+    SimpleChains = "de6bee2f-e2f4-4ec7-b6ed-219cc6f6e9e5"
+    Tracker = "9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c"
+    Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
+
+[[deps.LuxCore]]
+deps = ["DispatchDoctor", "Random", "SciMLPublic"]
+git-tree-sha1 = "9455b1e829d8dacad236143869be70b7fdb826b8"
+uuid = "bb33d45b-7691-41d6-9220-0943567d0623"
+version = "1.5.3"
+
+    [deps.LuxCore.extensions]
+    ArrayInterfaceReverseDiffExt = ["ArrayInterface", "ReverseDiff"]
+    ArrayInterfaceTrackerExt = ["ArrayInterface", "Tracker"]
+    ChainRulesCoreExt = "ChainRulesCore"
+    EnzymeCoreExt = "EnzymeCore"
+    FluxExt = "Flux"
+    FunctorsExt = "Functors"
+    MLDataDevicesExt = ["Adapt", "MLDataDevices"]
+    ReactantExt = "Reactant"
+    SetfieldExt = "Setfield"
+
+    [deps.LuxCore.weakdeps]
+    Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
+    ArrayInterface = "4fba245c-0d91-5ea0-9b3e-6abc04ee57a9"
+    ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+    EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
+    Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+    Functors = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
+    MLDataDevices = "7e8f7934-dd98-4c1a-8fe8-92b47a384d40"
+    Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+    ReverseDiff = "37e2e3b7-166d-5795-8a7a-e32c996b4267"
+    Setfield = "efcf1570-3423-57d1-acb7-fd33fddbac46"
+    Tracker = "9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c"
+
+[[deps.LuxLib]]
+deps = ["ArrayInterface", "CPUSummary", "ChainRulesCore", "DispatchDoctor", "EnzymeCore", "FastClosures", "Functors", "KernelAbstractions", "LinearAlgebra", "LuxCore", "MLDataDevices", "Markdown", "NNlib", "Preferences", "Random", "Reexport", "SciMLPublic", "Static", "StaticArraysCore", "Statistics", "UUIDs"]
+git-tree-sha1 = "6a6453d556f7bc3870d797657636b1ad5f45fd27"
+uuid = "82251201-b29d-42c6-8e01-566dec8acb11"
+version = "1.15.9"
+
+    [deps.LuxLib.extensions]
+    AppleAccelerateExt = "AppleAccelerate"
+    BLISBLASExt = "BLISBLAS"
+    CUDAExt = "CUDA"
+    CUDAForwardDiffExt = ["CUDA", "ForwardDiff"]
+    EnzymeExt = "Enzyme"
+    ForwardDiffExt = "ForwardDiff"
+    LoopVectorizationExt = ["LoopVectorization", "Polyester"]
+    MKLExt = "MKL"
+    OctavianExt = ["Octavian", "LoopVectorization"]
+    OneHotArraysExt = ["OneHotArrays"]
+    ReactantExt = ["Reactant", "ReactantCore"]
+    ReverseDiffExt = "ReverseDiff"
+    SLEEFPiratesExt = "SLEEFPirates"
+    TrackerAMDGPUExt = ["AMDGPU", "Tracker"]
+    TrackerExt = "Tracker"
+    cuDNNExt = ["CUDA", "cuDNN"]
+
+    [deps.LuxLib.weakdeps]
+    AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
+    AppleAccelerate = "13e28ba4-7ad8-5781-acae-3021b1ed3924"
+    BLISBLAS = "6f275bd8-fec0-4d39-945b-7e95a765fa1e"
+    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+    Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+    ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
+    LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
+    MKL = "33e6dc65-8f57-5167-99aa-e5a354878fb2"
+    Octavian = "6fd5a793-0b7e-452c-907f-f8bfe9c57db4"
+    OneHotArrays = "0b1bfda6-eb8a-41d2-88d8-f5af5cad476f"
+    Polyester = "f517fe37-dbe3-4b94-8317-1923a5111588"
+    Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+    ReactantCore = "a3311ec8-5e00-46d5-b541-4f83e724a433"
+    ReverseDiff = "37e2e3b7-166d-5795-8a7a-e32c996b4267"
+    SLEEFPirates = "476501e8-09a2-5ece-8869-fb82de89a1fa"
+    Tracker = "9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c"
+    cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
 [[deps.MIMEs]]
 git-tree-sha1 = "c64d943587f7187e751162b3b84445bbbd79f691"
@@ -1460,6 +1599,18 @@ deps = ["Base64", "JuliaSyntaxHighlighting", "StyledStrings"]
 uuid = "d6f4376e-aef5-505a-96c1-9c027394607a"
 version = "1.11.0"
 
+[[deps.MbedTLS]]
+deps = ["Dates", "MbedTLS_jll", "MozillaCACerts_jll", "NetworkOptions", "Random", "Sockets"]
+git-tree-sha1 = "8785729fa736197687541f7053f6d8ab7fc44f92"
+uuid = "739be429-bea8-5141-9913-cc70e7f3736d"
+version = "1.1.10"
+
+[[deps.MbedTLS_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "ff69a2b1330bcb730b9ac1ab7dd680176f5896b8"
+uuid = "c8ffd9c3-330d-5841-b78e-0817d7145fa1"
+version = "2.28.1010+0"
+
 [[deps.MicroCollections]]
 deps = ["Accessors", "BangBang", "InitialValues"]
 git-tree-sha1 = "44d32db644e84c75dab479f1bc15ee76a1a3618f"
@@ -1522,11 +1673,11 @@ version = "0.1.5"
 uuid = "ca575930-c2e3-43a9-ace4-1e988b2c1908"
 version = "1.3.0"
 
-[[deps.OneHotArrays]]
-deps = ["Adapt", "ChainRulesCore", "Compat", "GPUArraysCore", "LinearAlgebra", "NNlib"]
-git-tree-sha1 = "9510d7008275fc5b33fc72a73f8fddef0b5430c6"
-uuid = "0b1bfda6-eb8a-41d2-88d8-f5af5cad476f"
-version = "0.2.11"
+[[deps.ObjectFile]]
+deps = ["Reexport", "StructIO"]
+git-tree-sha1 = "22faba70c22d2f03e60fbc61da99c4ebfc3eb9ba"
+uuid = "d8793406-e978-5875-9003-1fc021f44a92"
+version = "0.5.0"
 
 [[deps.OpenBLAS_jll]]
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "Libdl"]
@@ -1537,6 +1688,12 @@ version = "0.3.29+0"
 deps = ["Artifacts", "Libdl"]
 uuid = "05823500-19ac-5b8b-9628-191a04bc5112"
 version = "0.8.7+0"
+
+[[deps.OpenSSL]]
+deps = ["BitFlags", "Dates", "MozillaCACerts_jll", "NetworkOptions", "OpenSSL_jll", "Sockets"]
+git-tree-sha1 = "1d1aaa7d449b58415f97d2839c318b70ffb525a0"
+uuid = "4d8831e6-92b7-49fb-bdf8-b643e874388c"
+version = "1.6.1"
 
 [[deps.OpenSSL_jll]]
 deps = ["Artifacts", "Libdl"]
@@ -1554,16 +1711,12 @@ deps = ["ChainRulesCore", "ConstructionBase", "Functors", "LinearAlgebra", "Rand
 git-tree-sha1 = "36b5d2b9dd06290cd65fcf5bdbc3a551ed133af5"
 uuid = "3bd65402-5787-11e9-1adc-39752487f4e2"
 version = "0.4.7"
+weakdeps = ["Adapt", "EnzymeCore", "Reactant"]
 
     [deps.Optimisers.extensions]
     OptimisersAdaptExt = ["Adapt"]
     OptimisersEnzymeCoreExt = "EnzymeCore"
     OptimisersReactantExt = "Reactant"
-
-    [deps.Optimisers.weakdeps]
-    Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
-    EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
-    Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 
 [[deps.OrderedCollections]]
 git-tree-sha1 = "05868e21324cede2207c6f0f466b4bfef6d5e7ee"
@@ -1578,9 +1731,23 @@ version = "0.12.3"
 
 [[deps.Parsers]]
 deps = ["Dates", "PrecompileTools", "UUIDs"]
-git-tree-sha1 = "7d2f8f21da5db6a806faf7b9b292296da42b2810"
+git-tree-sha1 = "5d5e0a78e971354b1c7bff0655d11fdc1b0e12c8"
 uuid = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
-version = "2.8.3"
+version = "2.8.4"
+
+[[deps.Peaks]]
+deps = ["SIMD"]
+git-tree-sha1 = "a9b6680fb7fb097fb6eb1210c35549218d73da84"
+uuid = "18e31ff7-3703-566c-8e60-38913d67486b"
+version = "0.6.2"
+
+    [deps.Peaks.extensions]
+    MakieExt = "Makie"
+    PlotsExt = "RecipesBase"
+
+    [deps.Peaks.weakdeps]
+    Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
+    RecipesBase = "3cdcf5f2-1ef4-517c-9805-6587b60abb01"
 
 [[deps.Pkg]]
 deps = ["Artifacts", "Dates", "Downloads", "FileWatching", "LibGit2", "Libdl", "Logging", "Markdown", "Printf", "Random", "SHA", "TOML", "Tar", "UUIDs", "p7zip_jll"]
@@ -1608,6 +1775,18 @@ version = "0.8.23"
     Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
     IJulia = "7073ff75-c697-5162-941a-fcdaad2a7d2a"
     JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+
+[[deps.PlutoHooks]]
+deps = ["InteractiveUtils", "Markdown", "UUIDs"]
+git-tree-sha1 = "844a829c8dc9fd0fe62eced22bc2d0dfd66a3f51"
+uuid = "0ff47ea0-7a50-410d-8455-4348d5de0774"
+version = "0.1.0"
+
+[[deps.PlutoLinks]]
+deps = ["FileWatching", "InteractiveUtils", "Markdown", "PlutoHooks", "Revise", "UUIDs"]
+git-tree-sha1 = "aea4eede5ab3ee188906d0cf3bbfa36eb543dccc"
+uuid = "0ff47ea0-7a50-410d-8455-4348d5de0420"
+version = "0.1.8"
 
 [[deps.PlutoPlotly]]
 deps = ["AbstractPlutoDingetjes", "Artifacts", "ColorSchemes", "Colors", "Dates", "Downloads", "HypertextLiteral", "InteractiveUtils", "LaTeXStrings", "Markdown", "Pkg", "PlotlyBase", "PrecompileTools", "Reexport", "ScopedValues", "Scratch", "TOML"]
@@ -1666,16 +1845,28 @@ git-tree-sha1 = "632eb4abab3449ab30c5e1afaa874f0b98b586e4"
 uuid = "8162dcfd-2161-5ef2-ae6c-7681170c5f98"
 version = "0.2.0"
 
+[[deps.PrettyTables]]
+deps = ["Crayons", "LaTeXStrings", "Markdown", "PrecompileTools", "Printf", "REPL", "Reexport", "StringManipulation", "Tables"]
+git-tree-sha1 = "624de6279ab7d94fc9f672f0068107eb6619732c"
+uuid = "08abe8d2-0d0c-5749-adfa-8a2ac140af0d"
+version = "3.3.2"
+
+    [deps.PrettyTables.extensions]
+    PrettyTablesTypstryExt = "Typstry"
+
+    [deps.PrettyTables.weakdeps]
+    Typstry = "f0ed7684-a786-439e-b1e3-3b82803b501e"
+
 [[deps.Printf]]
 deps = ["Unicode"]
 uuid = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 version = "1.11.0"
 
-[[deps.ProgressLogging]]
-deps = ["Logging", "SHA", "UUIDs"]
-git-tree-sha1 = "f0803bc1171e455a04124affa9c21bba5ac4db32"
-uuid = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
-version = "0.1.6"
+[[deps.ProtoBuf]]
+deps = ["BufferedStreams", "EnumX", "TOML"]
+git-tree-sha1 = "da18083a52d9d57bbe6dadaacad39731e5f7be39"
+uuid = "3349acd9-ac6a-5e09-bcdb-63829b23a429"
+version = "1.3.0"
 
 [[deps.PtrArrays]]
 git-tree-sha1 = "4fbbafbc6251b883f4d2705356f3641f3652a7fe"
@@ -1691,6 +1882,80 @@ version = "1.11.0"
 deps = ["SHA"]
 uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 version = "1.11.0"
+
+[[deps.Reactant]]
+deps = ["Adapt", "BFloat16s", "CEnum", "Crayons", "Downloads", "EnumX", "Enzyme", "EnzymeCore", "FileWatching", "Functors", "GPUArraysCore", "GPUCompiler", "HTTP", "JSON", "LLVM", "LLVMOpenMP_jll", "Libdl", "LinearAlgebra", "OrderedCollections", "PrecompileTools", "Preferences", "PrettyTables", "ProtoBuf", "Random", "ReactantCore", "Reactant_jll", "ScopedValues", "Scratch", "Serialization", "Setfield", "Sockets", "StableRNGs", "StructUtils", "StyledStrings", "UUIDs", "p7zip_jll"]
+git-tree-sha1 = "e02293894a505abfc68ef5e0743d6035d411c64f"
+uuid = "3c362404-f566-11ee-1572-e11a4b42c853"
+version = "0.2.254"
+
+    [deps.Reactant.extensions]
+    ReactantAbstractFFTsExt = "AbstractFFTs"
+    ReactantArrayInterfaceExt = "ArrayInterface"
+    ReactantCUDAExt = ["CUDA", "Enzyme", "GPUCompiler", "KernelAbstractions", "LLVM", "Printf"]
+    ReactantDLFP8TypesExt = "DLFP8Types"
+    ReactantDatesExt = "Dates"
+    ReactantFFTWExt = ["FFTW", "AbstractFFTs", "LinearAlgebra"]
+    ReactantFillArraysExt = "FillArrays"
+    ReactantFloat8sExt = "Float8s"
+    ReactantKernelAbstractionsExt = "KernelAbstractions"
+    ReactantLogExpFunctionsExt = ["IrrationalConstants", "LogExpFunctions"]
+    ReactantMCMCDiagnosticToolsExt = ["MCMCDiagnosticTools", "Statistics"]
+    ReactantMPIExt = "MPI"
+    ReactantNNlibExt = ["NNlib", "Statistics"]
+    ReactantNPZExt = "NPZ"
+    ReactantOffsetArraysExt = "OffsetArrays"
+    ReactantOneHotArraysExt = "OneHotArrays"
+    ReactantPythonCallExt = "PythonCall"
+    ReactantRandom123Ext = "Random123"
+    ReactantSparseArraysExt = "SparseArrays"
+    ReactantSpecialFunctionsExt = "SpecialFunctions"
+    ReactantStaticArraysExt = "StaticArrays"
+    ReactantStatisticsExt = "Statistics"
+    ReactantStructArraysExt = "StructArrays"
+    ReactantYaoBlocksExt = "YaoBlocks"
+    ReactantZygoteExt = "Zygote"
+
+    [deps.Reactant.weakdeps]
+    AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
+    ArrayInterface = "4fba245c-0d91-5ea0-9b3e-6abc04ee57a9"
+    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+    DLFP8Types = "f4c16678-4a16-415b-82ef-ed337c5d6c7c"
+    Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+    FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+    FillArrays = "1a297f60-69ca-5386-bcde-b61e274b549b"
+    Float8s = "81dfefd7-55b0-40c6-a251-db853704e186"
+    IrrationalConstants = "92d709cd-6900-40b7-9082-c6be49f344b6"
+    KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+    LogExpFunctions = "2ab3a3ac-af41-5b50-aa03-7779005ae688"
+    MCMCDiagnosticTools = "be115224-59cd-429b-ad48-344e309966f0"
+    MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+    NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
+    NPZ = "15e1cf62-19b3-5cfa-8e77-841668bca605"
+    OffsetArrays = "6fe1bfb0-de20-5000-8ca7-80f57d26f881"
+    OneHotArrays = "0b1bfda6-eb8a-41d2-88d8-f5af5cad476f"
+    Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+    PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
+    Random123 = "74087812-796a-5b5d-8853-05524746bad3"
+    SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+    SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
+    StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+    Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+    StructArrays = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
+    YaoBlocks = "418bc28f-b43b-5e0b-a6e7-61bbc1a2c1df"
+    Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
+
+[[deps.ReactantCore]]
+deps = ["ExpressionExplorer", "MacroTools"]
+git-tree-sha1 = "5b9e0fe7fb2cf3794fd96ac32bf2732aa4bb9776"
+uuid = "a3311ec8-5e00-46d5-b541-4f83e724a433"
+version = "0.1.19"
+
+[[deps.Reactant_jll]]
+deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
+git-tree-sha1 = "2749c35cb1bcc588ad71a50acf19108b9c6e47ed"
+uuid = "0192cb87-2b54-54ad-80e0-3be72ad8a3c0"
+version = "0.0.371+0"
 
 [[deps.RealDot]]
 deps = ["LinearAlgebra"]
@@ -1709,9 +1974,25 @@ git-tree-sha1 = "62389eeff14780bfe55195b7204c0d8738436d64"
 uuid = "ae029012-a4dd-5104-9daa-d747884805df"
 version = "1.3.1"
 
+[[deps.Revise]]
+deps = ["CodeTracking", "FileWatching", "InteractiveUtils", "JuliaInterpreter", "LibGit2", "LoweredCodeUtils", "OrderedCollections", "Preferences", "REPL", "UUIDs"]
+git-tree-sha1 = "5f4f629c085b87e71125eec6773f5f872c74a47a"
+uuid = "295af30f-e4ad-537b-8983-00126c2a3abe"
+version = "3.14.2"
+weakdeps = ["Distributed"]
+
+    [deps.Revise.extensions]
+    DistributedExt = "Distributed"
+
 [[deps.SHA]]
 uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 version = "0.7.0"
+
+[[deps.SIMD]]
+deps = ["PrecompileTools"]
+git-tree-sha1 = "e24dc23107d426a096d3eae6c165b921e74c18e4"
+uuid = "fdea26ae-647d-5447-a871-4b548cad5224"
+version = "3.7.2"
 
 [[deps.SciMLPublic]]
 git-tree-sha1 = "0ba076dbdce87ba230fff48ca9bca62e1f345c9b"
@@ -1720,9 +2001,9 @@ version = "1.0.1"
 
 [[deps.ScopedValues]]
 deps = ["HashArrayMappedTries", "Logging"]
-git-tree-sha1 = "ac4b837d89a58c848e85e698e2a2514e9d59d8f6"
+git-tree-sha1 = "67a144433c4ce877ee6d1ada69a124d6b1ecf7be"
 uuid = "7e506255-f358-4e82-b7e4-beb19740aa63"
-version = "1.6.0"
+version = "1.6.2"
 
 [[deps.Scratch]]
 deps = ["Dates"]
@@ -1744,6 +2025,11 @@ version = "1.1.2"
 git-tree-sha1 = "7f534ad62ab2bd48591bdeac81994ea8c445e4a5"
 uuid = "605ecd9f-84a6-4c9e-81e2-4798472b76a3"
 version = "0.1.0"
+
+[[deps.SimpleBufferStream]]
+git-tree-sha1 = "f305871d2f381d21527c770d4788c06c097c9bc1"
+uuid = "777ac1f9-54b0-4bf8-805c-2214025038e7"
+version = "1.2.0"
 
 [[deps.SimpleTraits]]
 deps = ["InteractiveUtils", "MacroTools"]
@@ -1788,6 +2074,18 @@ git-tree-sha1 = "e08a62abc517eb79667d0a29dc08a3b589516bb5"
 uuid = "171d559e-b47b-412a-8079-5efa626c420e"
 version = "0.1.15"
 
+[[deps.StableRNGs]]
+deps = ["Random"]
+git-tree-sha1 = "4f96c596b8c8258cc7d3b19797854d368f243ddc"
+uuid = "860ef19b-820b-49d6-a774-d7a799459cd3"
+version = "1.0.4"
+
+[[deps.Static]]
+deps = ["CommonWorldInvalidations", "IfElse", "PrecompileTools", "SciMLPublic"]
+git-tree-sha1 = "bb072715f158b59ad8819ff80da5ffa90cce6ceb"
+uuid = "aedffcd0-7271-4cad-89d0-dc628f76c6d3"
+version = "1.4.0"
+
 [[deps.StaticArrays]]
 deps = ["LinearAlgebra", "PrecompileTools", "Random", "StaticArraysCore"]
 git-tree-sha1 = "246a8bb2e6667f832eea063c3a56aef96429a3db"
@@ -1826,6 +2124,12 @@ git-tree-sha1 = "aceda6f4e598d331548e04cc6b2124a6148138e3"
 uuid = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 version = "0.34.10"
 
+[[deps.StringManipulation]]
+deps = ["PrecompileTools"]
+git-tree-sha1 = "d05693d339e37d6ab134c5ab53c29fce5ee5d7d5"
+uuid = "892a3eda-7b42-436c-8928-eab12a02cf0e"
+version = "0.4.4"
+
 [[deps.StructArrays]]
 deps = ["ConstructionBase", "DataAPI", "Tables"]
 git-tree-sha1 = "ad8002667372439f2e3611cfd14097e03fa4bccd"
@@ -1840,11 +2144,16 @@ weakdeps = ["Adapt", "GPUArraysCore", "KernelAbstractions", "LinearAlgebra", "Sp
     StructArraysSparseArraysExt = "SparseArrays"
     StructArraysStaticArraysExt = "StaticArrays"
 
+[[deps.StructIO]]
+git-tree-sha1 = "c581be48ae1cbf83e899b14c07a807e1787512cc"
+uuid = "53d494c1-5632-5724-8f4c-31dff12d585f"
+version = "0.3.1"
+
 [[deps.StructUtils]]
 deps = ["Dates", "UUIDs"]
-git-tree-sha1 = "86f5831495301b2a1387476cb30f86af7ab99194"
+git-tree-sha1 = "dd974aefe288ef2898733aecf40858dc86742d74"
 uuid = "ec057cc2-7a8d-4b58-b3b3-92acb9f63b42"
-version = "2.8.0"
+version = "2.8.1"
 
     [deps.StructUtils.extensions]
     StructUtilsMeasurementsExt = ["Measurements"]
@@ -1902,6 +2211,23 @@ deps = ["InteractiveUtils", "Logging", "Random", "Serialization"]
 uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 version = "1.11.0"
 
+[[deps.Tracy]]
+deps = ["ExprTools", "LibTracyClient_jll", "Libdl"]
+git-tree-sha1 = "73e3ff50fd3990874c59fef0f35d10644a1487bc"
+uuid = "e689c965-62c8-4b79-b2c5-8359227902fd"
+version = "0.1.6"
+
+    [deps.Tracy.extensions]
+    TracyProfilerExt = "TracyProfiler_jll"
+
+    [deps.Tracy.weakdeps]
+    TracyProfiler_jll = "0c351ed6-8a68-550e-8b79-de6f926da83c"
+
+[[deps.TranscodingStreams]]
+git-tree-sha1 = "0c45878dcfdcfa8480052b6ab162cdd138781742"
+uuid = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
+version = "0.11.3"
+
 [[deps.Transducers]]
 deps = ["Accessors", "ArgCheck", "BangBang", "Baselet", "CompositionsBase", "ConstructionBase", "DefineSingletons", "Distributed", "InitialValues", "Logging", "Markdown", "MicroCollections", "SplittablesBase", "Tables"]
 git-tree-sha1 = "4aa1fdf6c1da74661f6f5d3edfd96648321dade9"
@@ -1956,6 +2282,26 @@ weakdeps = ["LLVM"]
 
     [deps.UnsafeAtomics.extensions]
     UnsafeAtomicsLLVM = ["LLVM"]
+
+[[deps.WeightInitializers]]
+deps = ["ConcreteStructs", "GPUArraysCore", "LinearAlgebra", "Random", "SpecialFunctions", "Statistics"]
+git-tree-sha1 = "2af44c69f5c37b7b1d14e262347a24ba349052d6"
+uuid = "d49dbf32-c5c2-4618-8acc-27bb2598ef2d"
+version = "1.3.3"
+
+    [deps.WeightInitializers.extensions]
+    AMDGPUExt = "AMDGPU"
+    CUDAExt = "CUDA"
+    ChainRulesCoreExt = "ChainRulesCore"
+    GPUArraysExt = "GPUArrays"
+    ReactantExt = "Reactant"
+
+    [deps.WeightInitializers.weakdeps]
+    AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
+    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+    ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+    GPUArrays = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
+    Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 
 [[deps.Zlib_jll]]
 deps = ["Libdl"]
@@ -2015,37 +2361,48 @@ version = "17.7.0+0"
 """
 
 # ╔═╡ Cell order:
-# ╟─4b3dc9f1-5008-4203-9dce-f641d9352d4f
-# ╟─b0000001-0000-0000-0000-000000000001
-# ╟─b0000005-0000-0000-0000-000000000005
-# ╠═8f107885-40ff-4b9a-81e7-0b739b99dcad
-# ╠═88d64466-445a-11f1-b21f-81524747cf48
-# ╠═b7387f42-2eea-4591-823f-eb5e99175d63
-# ╠═53d57d5e-7f0d-4c70-a7a6-3e593f08a42c
-# ╠═9f240eaa-0d1d-4e93-9b3d-4244c19e7d3e
-# ╠═fade917a-4b3b-4280-934d-61a919dd54a3
-# ╠═af561107-385b-4c11-932a-c7ba210d2859
-# ╠═4887a145-a8ea-415a-ad46-effd959aeae9
-# ╠═5afa84d0-5be1-45a7-8fe7-a965bf84f09a
-# ╠═ade5fca9-1bf4-4bc7-a79c-b56e127278c6
-# ╠═4027ca28-08b3-4d20-8d58-75863db22313
-# ╠═1c40c18f-914f-430d-ab1e-15587ff4587f
-# ╠═3191d8ca-66d2-43b9-8c78-025555a5f90b
-# ╠═f687f07f-eb25-4232-a229-7bf997edf22b
-# ╠═e5d46de5-2e45-4cb1-b71f-d93af0ad7632
-# ╠═a1182443-ffbc-4f44-a9eb-bf6b056c8977
-# ╠═b0000002-0000-0000-0000-000000000002
-# ╠═b0000003-0000-0000-0000-000000000003
-# ╠═b0000004-0000-0000-0000-000000000004
-# ╠═5ea181e6-e53f-4650-a225-ade753c51137
-# ╠═394c437d-fa98-41cf-bb10-d2e7c2e721c8
-# ╠═9df599e2-c603-4db8-8ff6-fc60e2fe54e3
-# ╠═7453949d-b9af-4905-bf05-59ffb6eb23c5
-# ╠═9450b47e-2668-4f7f-a0a5-7b230888b4c0
-# ╠═4afb282d-81fb-4819-bde7-723b2ec4b92e
-# ╠═9eafb82e-98db-40a2-9421-70cbcdffe965
-# ╠═2d94ad90-6d44-4164-819e-4649deb7d1cc
-# ╠═1d358796-b47c-49b7-b8d7-74c4e6dfae7e
-# ╠═21a30e16-8f28-40f0-b95f-d0e55e0f1860
+# ╠═10000001-0000-0000-0000-000000000001
+# ╠═96817feb-6aa9-4f35-9277-9a4560e9a2a7
+# ╠═bdeb2eb2-6b5d-4677-837c-7072e3588430
+# ╟─10000002-0000-0000-0000-000000000001
+# ╠═10000003-0000-0000-0000-000000000001
+# ╠═22ef4df8-9962-4443-aa48-cbc4bd5ddb59
+# ╟─10000004-0000-0000-0000-000000000001
+# ╠═10000005-0000-0000-0000-000000000001
+# ╠═10000006-0000-0000-0000-000000000001
+# ╠═10000007-0000-0000-0000-000000000001
+# ╠═0bf6c416-bf64-4b2a-b55e-623a4f9daae2
+# ╠═272932ae-4c54-41a2-8c9a-e1cd4834150a
+# ╠═10000008-0000-0000-0000-000000000001
+# ╟─10000009-0000-0000-0000-000000000001
+# ╠═1000000a-0000-0000-0000-000000000001
+# ╠═1000000b-0000-0000-0000-000000000001
+# ╠═1000000c-0000-0000-0000-000000000002
+# ╟─1000000c-0000-0000-0000-000000000001
+# ╠═1000000d-0000-0000-0000-000000000001
+# ╠═1000000e-0000-0000-0000-000000000001
+# ╟─1000000f-0000-0000-0000-000000000001
+# ╠═928d4238-216b-4f62-a4d7-62075275252b
+# ╟─10000010-0000-0000-0000-000000000001
+# ╠═10000011-0000-0000-0000-000000000001
+# ╠═10000012-0000-0000-0000-000000000001
+# ╠═10000013-0000-0000-0000-000000000001
+# ╠═10000014-0000-0000-0000-000000000001
+# ╟─10000015-0000-0000-0000-000000000001
+# ╠═10000016-0000-0000-0000-000000000001
+# ╠═10000017-0000-0000-0000-000000000001
+# ╠═10000018-0000-0000-0000-000000000001
+# ╟─b11c9e24-6593-497c-a706-146619251e36
+# ╟─86843302-bb3b-494c-afe4-b9a43fcc0e7c
+# ╠═10000019-0000-0000-0000-000000000001
+# ╠═1000001a-0000-0000-0000-000000000001
+# ╠═1000001b-0000-0000-0000-000000000001
+# ╠═1000001c-0000-0000-0000-000000000001
+# ╠═52edc77f-d951-40a2-bae7-ed04e2c778ce
+# ╠═b48757f3-a9f1-4ff4-b714-de58221a1660
+# ╠═b00b61c7-81c6-467a-b8bd-9f9e2ebd4d0c
+# ╠═9c18f181-8d76-46a4-836d-c4fe2cad19c8
+# ╠═3c23d4cb-4bf9-4b4b-a57f-fefdc8f29cf1
+# ╠═f41c2e62-efbf-47c8-8b7e-adf828ffde4f
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002

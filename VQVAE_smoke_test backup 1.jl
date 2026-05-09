@@ -19,26 +19,6 @@ xpu = gpu
 # ╔═╡ 5360ab64-be7d-477a-83a4-664a2b318933
 Random.seed!(1234)
 
-# ╔═╡ e0a22d76-93d7-45ec-a01e-7a5430902016
-# Non-diff NN search (indices only)
-function quantize_indices_shared(emb_layer::Flux.Embedding, z_e)
-    emb_mat = xpu(emb_layer.weight)
-    _, K = size(emb_mat)
-    _, T, N = size(z_e)
-    indices = Array{Int}(undef, T, N)
-    for t in 1:T
-        emb = emb_mat
-        z_e_t = z_e[:, t, :]
-        z_sq = sum(abs2, z_e_t; dims=1)
-        e_sq = sum(abs2, emb; dims=1)
-        dist = e_sq' .+ z_sq .- 2f0 .* (transpose(emb) * z_e_t)
-        idx_cart = dropdims(CUDA.argmin(dist; dims=1); dims=1)
-        idxs = getindex.(idx_cart, 1)
-        indices[t, :] .= cpu(idxs)
-    end
-    return indices
-end
-
 # ╔═╡ e520e7d7-a45e-45ea-b647-bd79125ae98b
 begin
     # Standalone minimal VQ-VAE (GPU) for testing Zygote.@ignore + STE
@@ -79,6 +59,26 @@ begin
 
         return (; z_q, codebook_loss, commit_loss, embedding_loss, perplexity, code_subscriptions, indices)
     end
+end
+
+# ╔═╡ e0a22d76-93d7-45ec-a01e-7a5430902016
+# Non-diff NN search (indices only)
+function quantize_indices_shared(emb_layer::Flux.Embedding, z_e)
+    emb_mat = xpu(emb_layer.weight)
+    _, K = size(emb_mat)
+    _, T, N = size(z_e)
+    indices = Array{Int}(undef, T, N)
+    for t in 1:T
+        emb = emb_mat
+        z_e_t = z_e[:, t, :]
+        z_sq = sum(abs2, z_e_t; dims=1)
+        e_sq = sum(abs2, emb; dims=1)
+        dist = e_sq' .+ z_sq .- 2f0 .* (transpose(emb) * z_e_t)
+        idx_cart = dropdims(CUDA.argmin(dist; dims=1); dims=1)
+        idxs = getindex.(idx_cart, 1)
+        indices[t, :] .= cpu(idxs)
+    end
+    return indices
 end
 
 # ╔═╡ 9be3deda-0091-4d0e-b06b-12c38ba1be15
@@ -171,6 +171,39 @@ begin
     x_lux = Array(cpu(x))
 end
 
+# ╔═╡ 11134e4f-f83b-4ad0-8d17-100a837fe596
+begin
+    struct LuxToyVQVAE <: Lux.AbstractLuxContainerLayer{(:pre_vq, :decoder)}
+        pre_vq <: Lux.AbstractLuxLayer
+        decoder <: Lux.AbstractLuxLayer
+        K::Int
+        d::Int
+        T::Int
+        beta_commit::Float32
+        ema_decay::Float32
+    end
+
+    function Lux.initialparameters(rng::AbstractRNG, m::LuxToyVQVAE)
+        return (;
+            pre_vq=Lux.initialparameters(rng, m.pre_vq),
+            decoder=Lux.initialparameters(rng, m.decoder),
+        )
+    end
+
+    function Lux.initialstates(rng::AbstractRNG, m::LuxToyVQVAE)
+        embedding = randn(rng, Float32, m.d, m.K) .* (1f0 / max(m.K, 1))
+        return (;
+            pre_vq=Lux.initialstates(rng, m.pre_vq),
+            decoder=Lux.initialstates(rng, m.decoder),
+            quantizer=(;
+                embedding,
+                ema_cluster_size=ones(Float32, m.K),
+                ema_dw=copy(embedding),
+            ),
+        )
+    end
+end
+
 # ╔═╡ d8a4e456-e264-4239-96ce-458b70ed098d
 begin
     lux_argmin_col_indices(idx::AbstractArray{<:CartesianIndex}) = getindex.(idx, 1)
@@ -228,40 +261,8 @@ function lux_quantize(m::LuxToyVQVAE, z_e, qst; training::Bool)
     return (; z_q, indices, commit_loss, perplexity), qst_new
 end
 
-# ╔═╡ 11134e4f-f83b-4ad0-8d17-100a837fe596
-begin
-    struct LuxToyVQVAE{P<:Lux.AbstractLuxLayer,D<:Lux.AbstractLuxLayer} <:
-        Lux.AbstractLuxContainerLayer{(:pre_vq, :decoder)}
-        pre_vq::P
-        decoder::D
-        K::Int
-        d::Int
-        T::Int
-        beta_commit::Float32
-        ema_decay::Float32
-    end
-
-    function Lux.initialparameters(rng::AbstractRNG, m::LuxToyVQVAE)
-        return (;
-            pre_vq=Lux.initialparameters(rng, m.pre_vq),
-            decoder=Lux.initialparameters(rng, m.decoder),
-        )
-    end
-
-    function Lux.initialstates(rng::AbstractRNG, m::LuxToyVQVAE)
-        embedding = randn(rng, Float32, m.d, m.K) .* (1f0 / max(m.K, 1))
-        return (;
-            pre_vq=Lux.initialstates(rng, m.pre_vq),
-            decoder=Lux.initialstates(rng, m.decoder),
-            quantizer=(;
-                embedding,
-                ema_cluster_size=ones(Float32, m.K),
-                ema_dw=copy(embedding),
-            ),
-        )
-    end
-
-	function (m::LuxToyVQVAE)(x, ps, st; training::Bool=true)
+# ╔═╡ c115d647-70d3-4749-9012-b40394a0bddf
+function (m::LuxToyVQVAE)(x, ps, st; training::Bool=true)
     z_pre, st_pre = m.pre_vq(x, ps.pre_vq, st.pre_vq)
     z_e = reshape(z_pre, m.d, m.T, size(x, 2))
     q, st_quantizer = lux_quantize(m, z_e, st.quantizer; training)
@@ -271,12 +272,6 @@ begin
     return (; xhat, z_e, z_q, commit_loss=q.commit_loss, perplexity=q.perplexity,
         indices=q.indices), st_new
 end
-
-	
-end
-
-# ╔═╡ c115d647-70d3-4749-9012-b40394a0bddf
-
 
 # ╔═╡ 834836a5-01ea-4b18-a681-b74371b1255c
 begin
@@ -376,256 +371,15 @@ function lux_enzyme_step_diagnostics(model, ps, st, batch)
     )
 end
 
-# ╔═╡ 1ef9b5c6-8dd6-448a-9afe-7bc3b939ab72
-begin
-    fixed_codebook_payload = (; x=x_lux, embedding=copy(lux_st.quantizer.embedding))
-
-    function lux_fixed_codebook_forward(model, ps, st, payload; training::Bool=true)
-        batch = payload.x
-        embedding = payload.embedding
-        z_pre, st_pre = model.pre_vq(batch, ps.pre_vq, st.pre_vq)
-        z_e = reshape(z_pre, model.d, model.T, size(batch, 2))
-        z_q_detached, indices, counts, _ = EnzymeCore.ignore_derivatives(
-            lux_lookup_and_stats(embedding, z_e)
-        )
-        z_q = z_e .+ EnzymeCore.ignore_derivatives(z_q_detached .- z_e)
-        commit_loss = model.beta_commit *
-            mean(abs2, z_e .- EnzymeCore.ignore_derivatives(z_q_detached))
-        z_q_flat = reshape(z_q, model.d * model.T, size(batch, 2))
-        xhat, st_dec = model.decoder(z_q_flat, ps.decoder, st.decoder)
-        st_new = (; pre_vq=st_pre, decoder=st_dec)
-        return (; xhat, commit_loss, perplexity=lux_perplexity(counts),
-            indices), st_new
-    end
-end
-
-# ╔═╡ 3f32f44d-3479-4ffc-ae7e-363e8f28a47d
-function lux_fixed_codebook_loss(model, ps, st, payload)
-    result, st_new = lux_fixed_codebook_forward(model, ps, st, payload; training=true)
-    recon_loss = mean(abs2, result.xhat .- payload.x)
-    total = recon_loss + result.commit_loss
-    return total, st_new, (; recon_loss, commit_loss=result.commit_loss,
-        perplexity=result.perplexity)
-end
-
-# ╔═╡ 44b33fed-119d-4385-a9c8-3c94a9f814a2
-function lux_fixed_codebook_eval_loss(model, ps, st, payload)
-    result, _ = lux_fixed_codebook_forward(model, ps, st, payload; training=false)
-    recon_loss = mean(abs2, result.xhat .- payload.x)
-    total = recon_loss + result.commit_loss
-    return total, (; recon_loss, commit_loss=result.commit_loss,
-        perplexity=result.perplexity)
-end
-
-# ╔═╡ e7debd35-07b4-4676-a3c2-365f5e588211
-function lux_enzyme_fixed_codebook_gradient_smoke(model, ps, st, payload)
-    train_st = (; pre_vq=st.pre_vq, decoder=st.decoder)
-    tstate = Lux.Training.TrainState(model, ps, train_st, Optimisers.Adam(1f-3))
-    gs, loss, stats, tstate = Lux.Training.compute_gradients(
-        ADTypes.AutoEnzyme(), lux_fixed_codebook_loss, payload, tstate
-    )
-    return (; gs, loss, stats)
-end
-
-# ╔═╡ ed6b80bf-a6db-41b2-bca8-a260bdc2d707
-function lux_enzyme_fixed_codebook_step_diagnostics(model, ps, st, payload)
-    train_st = (; pre_vq=st.pre_vq, decoder=st.decoder)
-    tstate = Lux.Training.TrainState(model, ps, train_st, Optimisers.Adam(1f-3))
-    ps_before = tree_copy(tstate.parameters)
-    loss_before, stats_before = lux_fixed_codebook_eval_loss(
-        model, tstate.parameters, tstate.states, payload
-    )
-    _, step_loss, step_stats, tstate = Lux.Training.single_train_step!(
-        ADTypes.AutoEnzyme(), lux_fixed_codebook_loss, payload, tstate
-    )
-    loss_after_one_step, stats_after = lux_fixed_codebook_eval_loss(
-        model, tstate.parameters, tstate.states, payload
-    )
-    return (;
-        loss_before=Float32(loss_before),
-        step_loss=Float32(step_loss),
-        loss_after_one_step=Float32(loss_after_one_step),
-        pre_vq_delta=tree_delta(ps_before.pre_vq, tstate.parameters.pre_vq),
-        decoder_delta=tree_delta(ps_before.decoder, tstate.parameters.decoder),
-        perplexity_before=Float32(stats_before.perplexity),
-        perplexity_after=Float32(stats_after.perplexity),
-        recon_before=Float32(stats_before.recon_loss),
-        recon_after=Float32(stats_after.recon_loss),
-        commit_before=Float32(stats_before.commit_loss),
-        commit_after=Float32(stats_after.commit_loss),
-        parameters=tstate.parameters,
-        states=tstate.states,
-        stats=step_stats,
-    )
-end
-
-# ╔═╡ a4614d4f-26fa-4dbd-9022-23da7910d264
-function lux_external_codebook_update(model, ps, st, payload)
-    batch = payload.x
-    z_pre, _ = model.pre_vq(batch, ps.pre_vq, st.pre_vq)
-    z_e = reshape(z_pre, model.d, model.T, size(batch, 2))
-    _, _, counts, sums = lux_lookup_and_stats(st.quantizer.embedding, z_e)
-    ema_cluster_size = model.ema_decay .* st.quantizer.ema_cluster_size .+
-        (1f0 - model.ema_decay) .* counts
-    ema_dw = model.ema_decay .* st.quantizer.ema_dw .+
-        (1f0 - model.ema_decay) .* sums
-    embedding = ema_dw ./ reshape(max.(ema_cluster_size, 1f-5), 1, :)
-    qst_new = (; embedding=Float32.(embedding),
-        ema_cluster_size=Float32.(ema_cluster_size),
-        ema_dw=Float32.(ema_dw))
-    return (; qst_new, codebook_state_delta=tree_delta(st.quantizer.embedding, qst_new.embedding),
-        perplexity=lux_perplexity(counts))
-end
-
-# ╔═╡ 7fd86a7c-d3fd-4dc3-9784-4b55ef0e9216
-function lux_plain_ae_loss(model, ps, st, batch)
-    z_pre, st_pre = model.pre_vq(batch, ps.pre_vq, st.pre_vq)
-    xhat, st_dec = model.decoder(z_pre, ps.decoder, st.decoder)
-    loss = mean(abs2, xhat .- batch)
-    return loss, (; pre_vq=st_pre, decoder=st_dec), (; recon_loss=loss)
-end
-
-# ╔═╡ 74a5177f-ad9a-4e2e-acb2-ea16d105e770
-function lux_plain_ae_eval_loss(model, ps, st, batch)
-    z_pre, _ = model.pre_vq(batch, ps.pre_vq, st.pre_vq)
-    xhat, _ = model.decoder(z_pre, ps.decoder, st.decoder)
-    loss = mean(abs2, xhat .- batch)
-    return loss, (; recon_loss=loss)
-end
-
-# ╔═╡ 02d1a13f-e076-4b0a-b6e8-118540d8deec
-function lux_enzyme_plain_ae_gradient_smoke(model, ps, st, batch)
-    train_st = (; pre_vq=st.pre_vq, decoder=st.decoder)
-    tstate = Lux.Training.TrainState(model, ps, train_st, Optimisers.Adam(1f-3))
-    gs, loss, stats, tstate = Lux.Training.compute_gradients(
-        ADTypes.AutoEnzyme(), lux_plain_ae_loss, batch, tstate
-    )
-    return (; gs, loss, stats)
-end
-
-# ╔═╡ b385ce59-28b9-411d-911e-bf79bacb76cf
-function lux_enzyme_plain_ae_step_diagnostics(model, ps, st, batch)
-    train_st = (; pre_vq=st.pre_vq, decoder=st.decoder)
-    tstate = Lux.Training.TrainState(model, ps, train_st, Optimisers.Adam(1f-3))
-    ps_before = tree_copy(tstate.parameters)
-    loss_before, stats_before = lux_plain_ae_eval_loss(model, tstate.parameters, tstate.states, batch)
-    _, step_loss, step_stats, tstate = Lux.Training.single_train_step!(
-        ADTypes.AutoEnzyme(), lux_plain_ae_loss, batch, tstate
-    )
-    loss_after_one_step, stats_after = lux_plain_ae_eval_loss(
-        model, tstate.parameters, tstate.states, batch
-    )
-    return (;
-        loss_before=Float32(loss_before),
-        step_loss=Float32(step_loss),
-        loss_after_one_step=Float32(loss_after_one_step),
-        pre_vq_delta=tree_delta(ps_before.pre_vq, tstate.parameters.pre_vq),
-        decoder_delta=tree_delta(ps_before.decoder, tstate.parameters.decoder),
-        recon_before=Float32(stats_before.recon_loss),
-        recon_after=Float32(stats_after.recon_loss),
-        stats=step_stats,
-    )
-end
-
-# ╔═╡ 387b9bfb-28bf-4fd6-8608-599c78ea8e91
-begin
-    function lux_precomputed_ste_payload(model, ps, st, batch)
-        z_pre, _ = model.pre_vq(batch, ps.pre_vq, st.pre_vq)
-        z_e = reshape(z_pre, model.d, model.T, size(batch, 2))
-        z_q_fixed, indices, counts, _ = lux_lookup_and_stats(st.quantizer.embedding, z_e)
-        return (; x=batch, z_q_fixed=Float32.(z_q_fixed),
-            perplexity=lux_perplexity(counts), indices)
-    end
-
-    precomputed_ste_payload = lux_precomputed_ste_payload(lux_model, lux_ps, lux_st, x_lux)
-end
-
-# ╔═╡ 73612870-4310-4791-a68f-fd25892a9c2a
-function lux_precomputed_ste_loss(model, ps, st, payload)
-    batch = payload.x
-    z_pre, st_pre = model.pre_vq(batch, ps.pre_vq, st.pre_vq)
-    z_e = reshape(z_pre, model.d, model.T, size(batch, 2))
-    z_q_fixed = payload.z_q_fixed
-    z_q = z_e .+ (EnzymeCore.ignore_derivatives(z_q_fixed) .-
-        EnzymeCore.ignore_derivatives(z_e))
-    commit_loss = model.beta_commit *
-        mean(abs2, z_e .- EnzymeCore.ignore_derivatives(z_q_fixed))
-    z_q_flat = reshape(z_q, model.d * model.T, size(batch, 2))
-    xhat, st_dec = model.decoder(z_q_flat, ps.decoder, st.decoder)
-    recon_loss = mean(abs2, xhat .- batch)
-    total = recon_loss + commit_loss
-    return total, (; pre_vq=st_pre, decoder=st_dec),
-        (; recon_loss, commit_loss, perplexity=payload.perplexity)
-end
-
-# ╔═╡ 2f24d41d-ae04-4e0d-b9d4-97d3814c905c
-function lux_precomputed_ste_eval_loss(model, ps, st, payload)
-    total, _, stats = lux_precomputed_ste_loss(model, ps, st, payload)
-    return total, stats
-end
-
-# ╔═╡ e4c55070-916d-48b9-b34d-a3ab34ad4062
-function lux_enzyme_precomputed_ste_gradient_smoke(model, ps, st, payload)
-    train_st = (; pre_vq=st.pre_vq, decoder=st.decoder)
-    tstate = Lux.Training.TrainState(model, ps, train_st, Optimisers.Adam(1f-3))
-    gs, loss, stats, tstate = Lux.Training.compute_gradients(
-        ADTypes.AutoEnzyme(), lux_precomputed_ste_loss, payload, tstate
-    )
-    return (; gs, loss, stats)
-end
-
-# ╔═╡ 671bf2d2-76eb-48e1-9396-f8e383425339
-function lux_enzyme_precomputed_ste_step_diagnostics(model, ps, st, payload)
-    train_st = (; pre_vq=st.pre_vq, decoder=st.decoder)
-    tstate = Lux.Training.TrainState(model, ps, train_st, Optimisers.Adam(1f-3))
-    ps_before = tree_copy(tstate.parameters)
-    loss_before, stats_before = lux_precomputed_ste_eval_loss(
-        model, tstate.parameters, tstate.states, payload
-    )
-    _, step_loss, step_stats, tstate = Lux.Training.single_train_step!(
-        ADTypes.AutoEnzyme(), lux_precomputed_ste_loss, payload, tstate
-    )
-    loss_after_one_step, stats_after = lux_precomputed_ste_eval_loss(
-        model, tstate.parameters, tstate.states, payload
-    )
-    return (;
-        loss_before=Float32(loss_before),
-        step_loss=Float32(step_loss),
-        loss_after_one_step=Float32(loss_after_one_step),
-        pre_vq_delta=tree_delta(ps_before.pre_vq, tstate.parameters.pre_vq),
-        decoder_delta=tree_delta(ps_before.decoder, tstate.parameters.decoder),
-        perplexity=Float32(stats_after.perplexity),
-        recon_before=Float32(stats_before.recon_loss),
-        recon_after=Float32(stats_after.recon_loss),
-        commit_before=Float32(stats_before.commit_loss),
-        commit_after=Float32(stats_after.commit_loss),
-        stats=step_stats,
-    )
-end
-
 # ╔═╡ cdc3957f-381b-4946-80e6-a90e9f585044
 smoke_results = [
     smoke_try("Flux control forward", () -> lossfun(model, x)),
     smoke_try("Flux/Zygote gradient", () -> Flux.gradient(model, x) do m, xb
         lossfun(m, xb)
     end),
-    smoke_try("Lux/Enzyme plain AE gradient", () ->
-        lux_enzyme_plain_ae_gradient_smoke(lux_model, lux_ps, lux_st, x_lux)),
-    smoke_try("Lux/Enzyme plain AE train step", () ->
-        lux_enzyme_plain_ae_step_diagnostics(lux_model, lux_ps, lux_st, x_lux)),
-    smoke_try("Lux/Enzyme precomputed STE gradient", () ->
-        lux_enzyme_precomputed_ste_gradient_smoke(lux_model, lux_ps, lux_st, precomputed_ste_payload)),
-    smoke_try("Lux/Enzyme precomputed STE train step", () ->
-        lux_enzyme_precomputed_ste_step_diagnostics(lux_model, lux_ps, lux_st, precomputed_ste_payload)),
     smoke_try("Lux forward", () -> lux_forward_smoke(lux_model, lux_ps, lux_st, x_lux)),
     smoke_try("Lux/Enzyme gradient", () -> lux_enzyme_gradient_smoke(lux_model, lux_ps, lux_st, x_lux)),
     smoke_try("Lux/Enzyme train step", () -> lux_enzyme_step_diagnostics(lux_model, lux_ps, lux_st, x_lux)),
-    smoke_try("Lux/Enzyme fixed-codebook gradient", () ->
-        lux_enzyme_fixed_codebook_gradient_smoke(lux_model, lux_ps, lux_st, fixed_codebook_payload)),
-    smoke_try("Lux/Enzyme fixed-codebook train step", () ->
-        lux_enzyme_fixed_codebook_step_diagnostics(lux_model, lux_ps, lux_st, fixed_codebook_payload)),
-    smoke_try("External codebook update", () ->
-        lux_external_codebook_update(lux_model, lux_ps, lux_st, fixed_codebook_payload)),
 ]
 
 # ╔═╡ 6896023b-ed14-4378-9251-7cfba17c9137
@@ -634,69 +388,8 @@ smoke_status_text = join([
     for r in smoke_results
 ], "\n")
 
-# ╔═╡ a119c1d5-2819-4c72-aefa-bd0e2cfb8604
-result_by_label(label) = smoke_results[findfirst(r -> r.label == label, smoke_results)]
-
 # ╔═╡ b3b09a8c-3bb0-45e8-a6c9-26598e17049f
-lux_step_row = result_by_label("Lux/Enzyme train step")
-
-# ╔═╡ 8dc1484a-0fd6-4f09-8953-a9f30a50b266
-lux_step_metrics = lux_step_row.ok ? lux_step_row.value : nothing
-
-# ╔═╡ 278431a0-256d-4a8a-8795-238b3c6c1d2f
-plain_ae_step_row = result_by_label("Lux/Enzyme plain AE train step")
-
-# ╔═╡ af63db60-b2a4-47a8-bb39-819f704270f2
-plain_ae_step_metrics = plain_ae_step_row.ok ? plain_ae_step_row.value : nothing
-
-# ╔═╡ 5a6fe71d-1210-4c44-90c2-96321231991d
-precomputed_ste_step_row = result_by_label("Lux/Enzyme precomputed STE train step")
-
-# ╔═╡ 44113888-23fc-4166-abab-ae29d06a09ce
-precomputed_ste_step_metrics = precomputed_ste_step_row.ok ? precomputed_ste_step_row.value : nothing
-
-# ╔═╡ 91ae0d18-7d9c-42f1-bb83-61789c41ae8a
-plain_ae_metric_text = if isnothing(plain_ae_step_metrics)
-    "Lux/Enzyme plain AE train step failed, so plain-AE deltas are unavailable."
-else
-    join([
-        "- plain_ae_loss_before: $(plain_ae_step_metrics.loss_before)",
-        "- plain_ae_loss_after_one_step: $(plain_ae_step_metrics.loss_after_one_step)",
-        "- plain_ae_pre_vq_delta: $(plain_ae_step_metrics.pre_vq_delta)",
-        "- plain_ae_decoder_delta: $(plain_ae_step_metrics.decoder_delta)",
-        "- plain_ae_recon_before: $(plain_ae_step_metrics.recon_before)",
-        "- plain_ae_recon_after: $(plain_ae_step_metrics.recon_after)",
-    ], "\n")
-end
-
-# ╔═╡ 010b27b4-c7c9-4180-b34b-ae327e85c95b
-precomputed_ste_metric_text = if isnothing(precomputed_ste_step_metrics)
-    "Lux/Enzyme precomputed STE train step failed, so precomputed-STE deltas are unavailable."
-else
-    join([
-        "- ste_loss_before: $(precomputed_ste_step_metrics.loss_before)",
-        "- ste_loss_after_one_step: $(precomputed_ste_step_metrics.loss_after_one_step)",
-        "- ste_pre_vq_delta: $(precomputed_ste_step_metrics.pre_vq_delta)",
-        "- ste_decoder_delta: $(precomputed_ste_step_metrics.decoder_delta)",
-        "- ste_perplexity: $(precomputed_ste_step_metrics.perplexity)",
-        "- ste_recon_before: $(precomputed_ste_step_metrics.recon_before)",
-        "- ste_recon_after: $(precomputed_ste_step_metrics.recon_after)",
-        "- ste_commit_before: $(precomputed_ste_step_metrics.commit_before)",
-        "- ste_commit_after: $(precomputed_ste_step_metrics.commit_after)",
-    ], "\n")
-end
-
-# ╔═╡ 59e58140-8741-484c-95e4-e79214a0df77
-fixed_step_row = result_by_label("Lux/Enzyme fixed-codebook train step")
-
-# ╔═╡ f4099841-fc40-4c4f-84bf-5e79e8fd927e
-fixed_step_metrics = fixed_step_row.ok ? fixed_step_row.value : nothing
-
-# ╔═╡ c22f4459-c732-4437-84d7-16e774f667d2
-external_codebook_row = result_by_label("External codebook update")
-
-# ╔═╡ f8e98ef1-b2e0-411d-a083-9027867668b9
-external_codebook_metrics = external_codebook_row.ok ? external_codebook_row.value : nothing
+lux_step_metrics = smoke_results[end].ok ? smoke_results[end].value : nothing
 
 # ╔═╡ 773f4779-86fc-4eff-8db2-bc3284de274f
 lux_metric_text = if isnothing(lux_step_metrics)
@@ -717,36 +410,9 @@ else
     ], "\n")
 end
 
-# ╔═╡ fa01e2d1-e197-44fa-9184-1521b6c2ec95
-fixed_metric_text = if isnothing(fixed_step_metrics)
-    "Lux/Enzyme fixed-codebook train step failed, so fixed-codebook deltas are unavailable."
-else
-    external_delta = isnothing(external_codebook_metrics) ? NaN :
-        external_codebook_metrics.codebook_state_delta
-    join([
-        "- fixed_loss_before: $(fixed_step_metrics.loss_before)",
-        "- fixed_loss_after_one_step: $(fixed_step_metrics.loss_after_one_step)",
-        "- fixed_pre_vq_delta: $(fixed_step_metrics.pre_vq_delta)",
-        "- fixed_decoder_delta: $(fixed_step_metrics.decoder_delta)",
-        "- external_codebook_state_delta: $(external_delta)",
-        "- fixed_perplexity_before: $(fixed_step_metrics.perplexity_before)",
-        "- fixed_perplexity_after: $(fixed_step_metrics.perplexity_after)",
-        "- fixed_recon_before: $(fixed_step_metrics.recon_before)",
-        "- fixed_recon_after: $(fixed_step_metrics.recon_after)",
-    ], "\n")
-end
-
 # ╔═╡ 8c365a6b-52c0-47f8-93c4-98d4cbd07004
 lux_interpretation_text = if isnothing(lux_step_metrics)
-    if !isnothing(precomputed_ste_step_metrics)
-        join([
-            "- full in-loss VQ lookup: fail",
-            "- precomputed STE training path: pass",
-            "- implication: keep nearest-neighbor lookup and codebook updates outside the Enzyme loss",
-        ], "\n")
-    else
-        "- Lux/Enzyme path failed before diagnostics could run."
-    end
+    "- Lux/Enzyme path failed before diagnostics could run."
 else
     param_ok = lux_step_metrics.pre_vq_delta > 0 || lux_step_metrics.decoder_delta > 0
     codebook_ok = lux_step_metrics.codebook_state_delta > 0
@@ -758,51 +424,65 @@ else
     ], "\n")
 end
 
-# ╔═╡ b3fd20d5-36dd-47ce-bd08-d26450e02638
-fixed_interpretation_text = let 
-if isnothing(fixed_step_metrics)
-    "- Fixed-codebook Lux/Enzyme path failed before diagnostics could run."
-else
-    param_ok = fixed_step_metrics.pre_vq_delta > 0 || fixed_step_metrics.decoder_delta > 0
-    codebook_ok = !isnothing(external_codebook_metrics) &&
-        external_codebook_metrics.codebook_state_delta > 0
-    loss_ok = fixed_step_metrics.loss_after_one_step < fixed_step_metrics.loss_before
-    join([
-        "- fixed-codebook parameter update: $(param_ok ? "pass" : "fail")",
-        "- external codebook update: $(codebook_ok ? "pass" : "fail")",
-        "- fixed-codebook one-step loss decrease: $(loss_ok ? "pass" : "not guaranteed / inspect after multiple steps")",
-    ], "\n")
-end
-end
-
 # ╔═╡ c047f29c-0282-4c1d-a798-deb3be5389a8
 md"""
 ## Side-by-side Smoke Status
 
 $(smoke_status_text)
 
-## Plain AE Lux/Enzyme Diagnostics
-
-$(plain_ae_metric_text)
-
-## Precomputed STE Lux/Enzyme Diagnostics
-
-$(precomputed_ste_metric_text)
-
 ## Lux/Enzyme Numeric Diagnostics
 
 $(lux_metric_text)
 
-## Fixed-codebook Lux/Enzyme Diagnostics
-
-$(fixed_metric_text)
-
 ## Interpretation
 
 $(lux_interpretation_text)
-
-$(fixed_interpretation_text)
 """
+
+# ╔═╡ 11134e4f-f83b-4ad0-8d17-100a837fe596
+begin
+    struct LuxToyVQVAE <: Lux.AbstractLuxContainerLayer{(:pre_vq, :decoder)}
+        pre_vq <: Lux.AbstractLuxLayer
+        decoder <: Lux.AbstractLuxLayer
+        K::Int
+        d::Int
+        T::Int
+        beta_commit::Float32
+        ema_decay::Float32
+    end
+
+    function Lux.initialparameters(rng::AbstractRNG, m::LuxToyVQVAE)
+        return (;
+            pre_vq=Lux.initialparameters(rng, m.pre_vq),
+            decoder=Lux.initialparameters(rng, m.decoder),
+        )
+    end
+
+    function Lux.initialstates(rng::AbstractRNG, m::LuxToyVQVAE)
+        embedding = randn(rng, Float32, m.d, m.K) .* (1f0 / max(m.K, 1))
+        return (;
+            pre_vq=Lux.initialstates(rng, m.pre_vq),
+            decoder=Lux.initialstates(rng, m.decoder),
+            quantizer=(;
+                embedding,
+                ema_cluster_size=ones(Float32, m.K),
+                ema_dw=copy(embedding),
+            ),
+        )
+    end
+end
+
+# ╔═╡ c115d647-70d3-4749-9012-b40394a0bddf
+function (m::LuxToyVQVAE)(x, ps, st; training::Bool=true)
+    z_pre, st_pre = m.pre_vq(x, ps.pre_vq, st.pre_vq)
+    z_e = reshape(z_pre, m.d, m.T, size(x, 2))
+    q, st_quantizer = lux_quantize(m, z_e, st.quantizer; training)
+    z_q = reshape(q.z_q, m.d * m.T, size(x, 2))
+    xhat, st_dec = m.decoder(z_q, ps.decoder, st.decoder)
+    st_new = (; pre_vq=st_pre, decoder=st_dec, quantizer=st_quantizer)
+    return (; xhat, z_e, z_q, commit_loss=q.commit_loss, perplexity=q.perplexity,
+        indices=q.indices), st_new
+end
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
@@ -812,7 +492,6 @@ CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
 Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
-LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
 NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
 Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
@@ -821,14 +500,10 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 
 [compat]
-ADTypes = "~1.22.0"
-CUDA = "~6.0.0"
-Enzyme = "~0.13.140"
-EnzymeCore = "~0.8.20"
-Flux = "~0.16.10"
+CUDA = "~5.11.0"
+Enzyme = "~0.13.138"
+Flux = "~0.16.9"
 Lux = "~1.31.4"
-NNlib = "~0.9.34"
-Optimisers = "~0.4.7"
 Zygote = "~0.7.10"
 """
 
@@ -838,12 +513,12 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.12.4"
 manifest_format = "2.0"
-project_hash = "52d7cf29b4b6e6ed60dc35e61bccb544f9231e88"
+project_hash = "76180c66ab1c316a66b42a4c034495fb8be5dea7"
 
 [[deps.ADTypes]]
-git-tree-sha1 = "bbc22a9a08a0ef6460041086d8a7b27940ed4ffd"
+git-tree-sha1 = "f7304359109c768cf32dc5fa2d371565bb63b68a"
 uuid = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
-version = "1.22.0"
+version = "1.21.0"
 weakdeps = ["ChainRulesCore", "ConstructionBase", "EnzymeCore"]
 
     [deps.ADTypes.extensions]
@@ -888,9 +563,9 @@ version = "0.1.44"
 
 [[deps.Adapt]]
 deps = ["LinearAlgebra", "Requires"]
-git-tree-sha1 = "0761717147821d696c9470a7a86364b2fbd22fd8"
+git-tree-sha1 = "35ea197a51ce46fcd01c4a44befce0578a1aaeca"
 uuid = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
-version = "4.5.2"
+version = "4.5.0"
 weakdeps = ["SparseArrays", "StaticArrays"]
 
     [deps.Adapt.extensions]
@@ -911,42 +586,6 @@ version = "2.5.0"
 [[deps.ArgTools]]
 uuid = "0dad84c5-d112-42e6-8d28-ef12dabb789f"
 version = "1.1.2"
-
-[[deps.ArrayInterface]]
-deps = ["Adapt", "LinearAlgebra"]
-git-tree-sha1 = "54f895554d05c83e3dd59f6a396671dae8999573"
-uuid = "4fba245c-0d91-5ea0-9b3e-6abc04ee57a9"
-version = "7.24.0"
-
-    [deps.ArrayInterface.extensions]
-    ArrayInterfaceAMDGPUExt = "AMDGPU"
-    ArrayInterfaceBandedMatricesExt = "BandedMatrices"
-    ArrayInterfaceBlockBandedMatricesExt = "BlockBandedMatrices"
-    ArrayInterfaceCUDAExt = "CUDA"
-    ArrayInterfaceCUDSSExt = ["CUDSS", "CUDA"]
-    ArrayInterfaceChainRulesCoreExt = "ChainRulesCore"
-    ArrayInterfaceChainRulesExt = "ChainRules"
-    ArrayInterfaceGPUArraysCoreExt = "GPUArraysCore"
-    ArrayInterfaceMetalExt = "Metal"
-    ArrayInterfaceReverseDiffExt = "ReverseDiff"
-    ArrayInterfaceSparseArraysExt = "SparseArrays"
-    ArrayInterfaceStaticArraysCoreExt = "StaticArraysCore"
-    ArrayInterfaceTrackerExt = "Tracker"
-
-    [deps.ArrayInterface.weakdeps]
-    AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
-    BandedMatrices = "aae01518-5342-5314-be14-df237901396f"
-    BlockBandedMatrices = "ffab5731-97b5-5995-9138-79e8c1846df0"
-    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
-    CUDSS = "45b445bb-4962-46a0-9369-b4df9d0f772e"
-    ChainRules = "082447d4-558c-5d27-93f4-14fc19e9eca2"
-    ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
-    GPUArraysCore = "46192b85-c4d5-4398-a991-12ede77f4527"
-    Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
-    ReverseDiff = "37e2e3b7-166d-5795-8a7a-e32c996b4267"
-    SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
-    StaticArraysCore = "1e83bf80-4336-4d27-bf5d-d5a4f845583c"
-    Tracker = "9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c"
 
 [[deps.Artifacts]]
 uuid = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
@@ -1012,47 +651,35 @@ git-tree-sha1 = "389ad5c84de1ae7cf0e28e381131c98ea87d54fc"
 uuid = "fa961155-64e5-5f13-b03f-caf6b980ea82"
 version = "0.5.0"
 
-[[deps.CPUSummary]]
-deps = ["CpuId", "IfElse", "PrecompileTools", "Preferences", "Static"]
-git-tree-sha1 = "f3a21d7fc84ba618a779d1ed2fcca2e682865bab"
-uuid = "2a0fbf3d-bb9c-48f3-b0a9-814d99fd7ab9"
-version = "0.2.7"
-
 [[deps.CUDA]]
-deps = ["CUDACore", "CUDATools", "Reexport", "cuBLAS", "cuFFT", "cuRAND", "cuSOLVER", "cuSPARSE"]
-git-tree-sha1 = "bcbaecc92b4b8b0fb25997f4d84451b198344d4d"
+deps = ["AbstractFFTs", "Adapt", "BFloat16s", "CEnum", "CUDA_Compiler_jll", "CUDA_Driver_jll", "CUDA_Runtime_Discovery", "CUDA_Runtime_jll", "Crayons", "ExprTools", "GPUArrays", "GPUCompiler", "GPUToolbox", "KernelAbstractions", "LLVM", "LLVMLoopInfo", "LazyArtifacts", "Libdl", "LinearAlgebra", "Logging", "NVTX", "Preferences", "PrettyTables", "Printf", "Random", "Random123", "RandomNumbers", "Reexport", "SparseArrays", "StaticArrays", "Statistics", "demumble_jll"]
+git-tree-sha1 = "ea6a2ab8307059b6c9ea186ff7dfcd032a13b731"
 uuid = "052768ef-5323-5732-b1bb-66c8b64840ba"
-version = "6.0.0"
+version = "5.11.0"
 
-[[deps.CUDACore]]
-deps = ["Adapt", "BFloat16s", "CEnum", "CUDA_Compiler_jll", "CUDA_Driver_jll", "CUDA_Runtime_Discovery", "CUDA_Runtime_jll", "ExprTools", "GPUArrays", "GPUCompiler", "GPUToolbox", "KernelAbstractions", "LLVM", "LLVMLoopInfo", "LazyArtifacts", "Libdl", "LinearAlgebra", "Logging", "PrecompileTools", "Preferences", "Printf", "Random", "Random123", "RandomNumbers", "StaticArrays"]
-git-tree-sha1 = "dc5b6ea53fa3b3bedd2fe1c6037687dd4ee85e70"
-uuid = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
-version = "6.0.0"
-weakdeps = ["ChainRulesCore", "EnzymeCore", "SpecialFunctions"]
-
-    [deps.CUDACore.extensions]
+    [deps.CUDA.extensions]
     ChainRulesCoreExt = "ChainRulesCore"
     EnzymeCoreExt = "EnzymeCore"
+    SparseMatricesCSRExt = "SparseMatricesCSR"
     SpecialFunctionsExt = "SpecialFunctions"
 
-[[deps.CUDATools]]
-deps = ["CUDACore", "CUDA_Compiler_jll", "CUPTI", "Crayons", "GPUCompiler", "LLVM", "NVML", "NVTX", "PrecompileTools", "Preferences", "PrettyTables", "Printf", "Statistics", "demumble_jll"]
-git-tree-sha1 = "38ee815c0b8b1423035d10f657f9f756e39c5205"
-uuid = "9ec180c6-1c07-47c7-9e6e-ebefa4d1f6d0"
-version = "6.0.0"
+    [deps.CUDA.weakdeps]
+    ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+    EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
+    SparseMatricesCSR = "a0a7dd2c-ebf4-11e9-1f05-cf50bc540ca1"
+    SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 
 [[deps.CUDA_Compiler_jll]]
 deps = ["Artifacts", "CUDA_Driver_jll", "CUDA_Runtime_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
-git-tree-sha1 = "b977706846cb0a75d3842a1fed810ab2e6ab2f94"
+git-tree-sha1 = "8c19e97de5b7574672e4a7a3abd55714ad66d59a"
 uuid = "d1e2174e-dfdc-576e-b43e-73b79eb1aca8"
-version = "0.4.3+0"
+version = "0.4.2+0"
 
 [[deps.CUDA_Driver_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "TOML"]
-git-tree-sha1 = "3b759ec65ac87ad192c2925114fa5c126657a5bd"
+git-tree-sha1 = "061f39cc84e99928830aa1005d79f7e99097ba28"
 uuid = "4ee394cb-3365-5eb0-8335-949819d2adfc"
-version = "13.2.1+0"
+version = "13.2.0+0"
 
 [[deps.CUDA_Runtime_Discovery]]
 deps = ["Libdl"]
@@ -1062,15 +689,9 @@ version = "1.0.0"
 
 [[deps.CUDA_Runtime_jll]]
 deps = ["Artifacts", "CUDA_Driver_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
-git-tree-sha1 = "c0314d9fb0ebd00e404feba4c3fbc04c9975abc1"
+git-tree-sha1 = "af17d37b5b8b4d7525f8902eba1ef6141a9a7d3b"
 uuid = "76a88914-d11a-5bdc-97e0-2f5a05c973a2"
-version = "0.21.0+1"
-
-[[deps.CUPTI]]
-deps = ["CEnum", "CUDACore", "CUDA_Runtime_Discovery", "CUDA_Runtime_jll", "GPUToolbox"]
-git-tree-sha1 = "b37790736de8e067a26ade5cbcd6bf240ddd20ec"
-uuid = "9e67e8f6-ba02-4b6c-a7db-3b11ae1e7ab7"
-version = "6.0.0"
+version = "0.21.0+0"
 
 [[deps.ChainRules]]
 deps = ["Adapt", "ChainRulesCore", "Compat", "Distributed", "GPUArraysCore", "IrrationalConstants", "LinearAlgebra", "Random", "RealDot", "SparseArrays", "SparseInverseSubset", "Statistics", "StructArrays", "SuiteSparse"]
@@ -1080,9 +701,9 @@ version = "1.73.0"
 
 [[deps.ChainRulesCore]]
 deps = ["Compat", "LinearAlgebra"]
-git-tree-sha1 = "12177ad6b3cad7fd50c8b3825ce24a99ad61c18f"
+git-tree-sha1 = "e4c6a16e77171a5f5e25e9646617ab1c276c5607"
 uuid = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
-version = "1.26.1"
+version = "1.26.0"
 weakdeps = ["SparseArrays"]
 
     [deps.ChainRulesCore.extensions]
@@ -1093,11 +714,6 @@ deps = ["MacroTools"]
 git-tree-sha1 = "cda2cfaebb4be89c9084adaca7dd7333369715c5"
 uuid = "bbf7d656-a473-5ed7-a52c-81e309532950"
 version = "0.3.1"
-
-[[deps.CommonWorldInvalidations]]
-git-tree-sha1 = "ae52d1c52048455e85a387fbee9be553ec2b68d0"
-uuid = "f70d9fcc-98c5-4d4a-abd7-e4cdeebd8ca8"
-version = "1.0.0"
 
 [[deps.Compat]]
 deps = ["TOML", "UUIDs"]
@@ -1123,11 +739,6 @@ weakdeps = ["InverseFunctions"]
     [deps.CompositionsBase.extensions]
     CompositionsBaseInverseFunctionsExt = "InverseFunctions"
 
-[[deps.ConcreteStructs]]
-git-tree-sha1 = "f749037478283d372048690eb3b5f92a79432b34"
-uuid = "2569d6c7-a4a2-43d3-a901-331e8e4be471"
-version = "0.2.3"
-
 [[deps.ConstructionBase]]
 git-tree-sha1 = "b4b092499347b18a015186eae3042f72267106cb"
 uuid = "187b0558-2788-49d3-abe0-74a17ed4e7c9"
@@ -1149,12 +760,6 @@ git-tree-sha1 = "25cc3803f1030ab855e383129dcd3dc294e322cc"
 uuid = "6add18c4-b38d-439d-96f6-d6bc489c04c5"
 version = "0.1.3"
 
-[[deps.CpuId]]
-deps = ["Markdown"]
-git-tree-sha1 = "fcbb72b032692610bfbdb15018ac16a36cf2e406"
-uuid = "adafc99b-e345-5852-983c-f28acb93d879"
-version = "0.3.1"
-
 [[deps.Crayons]]
 git-tree-sha1 = "249fe38abf76d48563e2f4556bebd215aa317e15"
 uuid = "a8cc5b0e-0ffa-5ad4-8c14-923d3ee1735f"
@@ -1167,9 +772,9 @@ version = "1.16.0"
 
 [[deps.DataStructures]]
 deps = ["OrderedCollections"]
-git-tree-sha1 = "e86f4a2805f7f19bec5129bc9150c38208e5dc23"
+git-tree-sha1 = "e357641bb3e0638d353c4b29ea0e40ea644066a6"
 uuid = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
-version = "0.19.4"
+version = "0.19.3"
 
 [[deps.DataValueInterfaces]]
 git-tree-sha1 = "bfc1187b79289637fa0ef6d4436ebdfe6905cbd6"
@@ -1204,17 +809,6 @@ git-tree-sha1 = "23163d55f885173722d1e4cf0f6110cdbaf7e272"
 uuid = "b552c78f-8df3-52c6-915a-8e097449b14b"
 version = "1.15.1"
 
-[[deps.DispatchDoctor]]
-deps = ["MacroTools", "Preferences"]
-git-tree-sha1 = "42cd00edaac86f941815fe557c1d01e11913e07c"
-uuid = "8d63f2c5-f18a-4cf2-ba9d-b3f60fc568c8"
-version = "0.4.28"
-weakdeps = ["ChainRulesCore", "EnzymeCore"]
-
-    [deps.DispatchDoctor.extensions]
-    DispatchDoctorChainRulesCoreExt = "ChainRulesCore"
-    DispatchDoctorEnzymeCoreExt = "EnzymeCore"
-
 [[deps.Distributed]]
 deps = ["Random", "Serialization", "Sockets"]
 uuid = "8ba89e20-285c-5b6f-9357-94700520ee1b"
@@ -1230,46 +824,20 @@ deps = ["ArgTools", "FileWatching", "LibCURL", "NetworkOptions"]
 uuid = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
 version = "1.7.0"
 
-[[deps.Enzyme]]
-deps = ["CEnum", "EnzymeCore", "Enzyme_jll", "GPUCompiler", "InteractiveUtils", "LLVM", "Libdl", "LinearAlgebra", "ObjectFile", "PrecompileTools", "Preferences", "Printf", "Random", "SparseArrays"]
-git-tree-sha1 = "78704dd8d84c93a7f2ac5af0bbb95d26763ec9b9"
-uuid = "7da242da-08ed-463a-9acd-ee780be4f1d9"
-version = "0.13.140"
-weakdeps = ["ADTypes", "BFloat16s", "ChainRulesCore", "GPUArraysCore", "LogExpFunctions", "SpecialFunctions", "StaticArrays"]
-
-    [deps.Enzyme.extensions]
-    EnzymeBFloat16sExt = "BFloat16s"
-    EnzymeChainRulesCoreExt = "ChainRulesCore"
-    EnzymeGPUArraysCoreExt = "GPUArraysCore"
-    EnzymeLogExpFunctionsExt = "LogExpFunctions"
-    EnzymeSpecialFunctionsExt = "SpecialFunctions"
-    EnzymeStaticArraysExt = "StaticArrays"
-
 [[deps.EnzymeCore]]
-git-tree-sha1 = "c6ee69ee502060982d12dbaaf3d8fcb4e835a0d1"
+git-tree-sha1 = "990991b8aa76d17693a98e3a915ac7aa49f08d1a"
 uuid = "f151be2c-9106-41f4-ab19-57ee4f262869"
-version = "0.8.20"
+version = "0.8.18"
 weakdeps = ["Adapt", "ChainRulesCore"]
 
     [deps.EnzymeCore.extensions]
     AdaptExt = "Adapt"
     EnzymeCoreChainRulesCoreExt = "ChainRulesCore"
 
-[[deps.Enzyme_jll]]
-deps = ["Artifacts", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
-git-tree-sha1 = "d3ad8f5eca369ac8803ff7db660028d47debc75d"
-uuid = "7cc45869-7501-5eee-bdea-0790c847d4ef"
-version = "0.0.258+0"
-
 [[deps.ExprTools]]
 git-tree-sha1 = "27415f162e6028e81c72b82ef756bf321213b6ec"
 uuid = "e2ba6199-217a-4e67-a87a-7c52f15ade04"
 version = "0.1.10"
-
-[[deps.ExpressionExplorer]]
-git-tree-sha1 = "5f1c005ed214356bbe41d442cc1ccd416e510b7e"
-uuid = "21656369-7473-754a-2065-74616d696c43"
-version = "1.1.4"
 
 [[deps.FLoops]]
 deps = ["BangBang", "Compat", "FLoopsBase", "InitialValues", "JuliaVariables", "MLStyle", "Serialization", "Setfield", "Transducers"]
@@ -1282,11 +850,6 @@ deps = ["ContextVariablesX"]
 git-tree-sha1 = "656f7a6859be8673bf1f35da5670246b923964f7"
 uuid = "b9860ae5-e623-471e-878b-f6a53c775ea6"
 version = "0.1.1"
-
-[[deps.FastClosures]]
-git-tree-sha1 = "acebe244d53ee1b461970f8910c235b259e772ef"
-uuid = "9aa1b823-49e4-5ca5-8b0f-3971ec8bab6a"
-version = "0.3.2"
 
 [[deps.FileWatching]]
 uuid = "7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"
@@ -1311,10 +874,10 @@ version = "1.16.0"
     Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [[deps.Flux]]
-deps = ["ADTypes", "Adapt", "ChainRulesCore", "Compat", "EnzymeCore", "Functors", "GPUArrays", "LinearAlgebra", "MLCore", "MLDataDevices", "MLUtils", "MacroTools", "NNlib", "OneHotArrays", "Optimisers", "Preferences", "ProgressLogging", "Random", "Reexport", "Setfield", "SparseArrays", "SpecialFunctions", "Statistics", "Zygote"]
-git-tree-sha1 = "cb318a415a089c337d0c15000d1608cee8434ebf"
+deps = ["ADTypes", "Adapt", "ChainRulesCore", "Compat", "EnzymeCore", "Functors", "LinearAlgebra", "MLCore", "MLDataDevices", "MLUtils", "MacroTools", "NNlib", "OneHotArrays", "Optimisers", "Preferences", "ProgressLogging", "Random", "Reexport", "Setfield", "SparseArrays", "SpecialFunctions", "Statistics", "Zygote"]
+git-tree-sha1 = "ea6715b3d7a95a07a62109df1c9ede2641a50706"
 uuid = "587475ba-b771-5e3f-ad9e-33799f191a9c"
-version = "0.16.10"
+version = "0.16.9"
 
     [deps.Flux.extensions]
     FluxAMDGPUExt = "AMDGPU"
@@ -1359,9 +922,9 @@ version = "1.11.0"
 
 [[deps.GPUArrays]]
 deps = ["Adapt", "GPUArraysCore", "KernelAbstractions", "LLVM", "LinearAlgebra", "Printf", "Random", "Reexport", "ScopedValues", "Serialization", "SparseArrays", "Statistics"]
-git-tree-sha1 = "34fd745547978beb471f029f447290ef4dbc7bbd"
+git-tree-sha1 = "6487601563e4a1d1dab796e88b4548bf5544209e"
 uuid = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
-version = "11.5.3"
+version = "11.4.1"
 
     [deps.GPUArrays.extensions]
     JLD2Ext = "JLD2"
@@ -1377,15 +940,15 @@ version = "0.2.0"
 
 [[deps.GPUCompiler]]
 deps = ["ExprTools", "InteractiveUtils", "LLVM", "Libdl", "Logging", "PrecompileTools", "Preferences", "Scratch", "Serialization", "TOML", "Tracy", "UUIDs"]
-git-tree-sha1 = "fedfe5e7db7035271c3f58359007f971da1dde87"
+git-tree-sha1 = "966946d226e8b676ca6409454718accb18c34c54"
 uuid = "61eb1bfa-7361-4325-ad38-22787b887f55"
-version = "1.9.1"
+version = "1.8.2"
 
 [[deps.GPUToolbox]]
 deps = ["LLVM"]
-git-tree-sha1 = "a589b6c1a0eff953571f5d8b0474f5020831114d"
+git-tree-sha1 = "e5cc871cac863a14706d745dcf73c91de948eca5"
 uuid = "096a3bc2-3ced-46d0-87f4-dd12716f4bfc"
-version = "1.1.1"
+version = "1.1.0"
 
 [[deps.HashArrayMappedTries]]
 git-tree-sha1 = "2eaa69a7cab70a52b9687c8bf950a5a93ec895ae"
@@ -1397,11 +960,6 @@ deps = ["InteractiveUtils", "MacroTools"]
 git-tree-sha1 = "57e9ce6cf68d0abf5cb6b3b4abf9bedf05c939c0"
 uuid = "7869d1d1-7146-5819-86e3-90919afe41df"
 version = "0.4.15"
-
-[[deps.IfElse]]
-git-tree-sha1 = "debdd00ffef04665ccbb3e150747a77560e8fad1"
-uuid = "615f187c-cbe4-4ef1-ba3b-2fcf58d6d173"
-version = "0.1.1"
 
 [[deps.InitialValues]]
 git-tree-sha1 = "4da0f88e9a39111c2fa3add390ab15f3a44f3ca3"
@@ -1469,10 +1027,10 @@ weakdeps = ["EnzymeCore", "LinearAlgebra", "SparseArrays"]
     SparseArraysExt = "SparseArrays"
 
 [[deps.LLVM]]
-deps = ["CEnum", "LLVMExtra_jll", "Libdl", "PrecompileTools", "Preferences", "Printf", "Unicode"]
-git-tree-sha1 = "85592339c4363f40863f0b61f9cba80b885070c3"
+deps = ["CEnum", "LLVMExtra_jll", "Libdl", "Preferences", "Printf", "Unicode"]
+git-tree-sha1 = "69e4739502b7ab5176117e97e1664ed181c35036"
 uuid = "929cbde3-209d-540e-8aea-75f648917ca0"
-version = "9.7.1"
+version = "9.4.6"
 weakdeps = ["BFloat16s"]
 
     [deps.LLVM.extensions]
@@ -1480,9 +1038,9 @@ weakdeps = ["BFloat16s"]
 
 [[deps.LLVMExtra_jll]]
 deps = ["Artifacts", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
-git-tree-sha1 = "f1d1adfff151fd02b4062d1af82df02052dc4a0c"
+git-tree-sha1 = "8e76807afb59ebb833e9b131ebf1a8c006510f33"
 uuid = "dad2f222-ce93-54a1-a47d-0025e8a3acab"
-version = "0.0.42+0"
+version = "0.0.38+0"
 
 [[deps.LLVMLoopInfo]]
 git-tree-sha1 = "2e5c102cfc41f48ae4740c7eca7743cc7e7b75ea"
@@ -1559,119 +1117,6 @@ version = "0.3.29"
 uuid = "56ddb016-857b-54e1-b83d-db4d58db5568"
 version = "1.11.0"
 
-[[deps.Lux]]
-deps = ["ADTypes", "Adapt", "ArrayInterface", "ChainRulesCore", "ConcreteStructs", "DiffResults", "DispatchDoctor", "EnzymeCore", "FastClosures", "ForwardDiff", "Functors", "GPUArraysCore", "LinearAlgebra", "LuxCore", "LuxLib", "MLDataDevices", "MacroTools", "Markdown", "NNlib", "Optimisers", "PrecompileTools", "Preferences", "Random", "ReactantCore", "Reexport", "SciMLPublic", "Setfield", "Static", "StaticArraysCore", "Statistics", "UUIDs", "WeightInitializers"]
-git-tree-sha1 = "b7654d9b1144792d7fa165add2e07434329e3193"
-uuid = "b2108857-7c20-44ae-9111-449ecde12c47"
-version = "1.31.4"
-
-    [deps.Lux.extensions]
-    ComponentArraysExt = "ComponentArrays"
-    EnzymeExt = "Enzyme"
-    FluxExt = "Flux"
-    GPUArraysExt = "GPUArrays"
-    LossFunctionsExt = "LossFunctions"
-    MLUtilsExt = "MLUtils"
-    MPIExt = "MPI"
-    MPINCCLExt = ["CUDA", "MPI", "NCCL"]
-    MooncakeExt = "Mooncake"
-    ReactantExt = ["Enzyme", "Reactant"]
-    ReverseDiffExt = ["FunctionWrappers", "ReverseDiff"]
-    SimpleChainsExt = "SimpleChains"
-    TrackerExt = "Tracker"
-    ZygoteExt = "Zygote"
-
-    [deps.Lux.weakdeps]
-    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
-    ComponentArrays = "b0b7db55-cfe3-40fc-9ded-d10e2dbeff66"
-    Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
-    Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
-    FunctionWrappers = "069b7b12-0de2-55c6-9aab-29f3d0a68a2e"
-    GPUArrays = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
-    LossFunctions = "30fc2ffe-d236-52d8-8643-a9d8f7c094a7"
-    MLUtils = "f1d291b0-491e-4a28-83b9-f70985020b54"
-    MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
-    Mooncake = "da2b9cff-9c12-43a0-ae48-6db2b0edb7d6"
-    NCCL = "3fe64909-d7a1-4096-9b7d-7a0f12cf0f6b"
-    Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
-    ReverseDiff = "37e2e3b7-166d-5795-8a7a-e32c996b4267"
-    SimpleChains = "de6bee2f-e2f4-4ec7-b6ed-219cc6f6e9e5"
-    Tracker = "9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c"
-    Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
-
-[[deps.LuxCore]]
-deps = ["DispatchDoctor", "Random", "SciMLPublic"]
-git-tree-sha1 = "9455b1e829d8dacad236143869be70b7fdb826b8"
-uuid = "bb33d45b-7691-41d6-9220-0943567d0623"
-version = "1.5.3"
-
-    [deps.LuxCore.extensions]
-    ArrayInterfaceReverseDiffExt = ["ArrayInterface", "ReverseDiff"]
-    ArrayInterfaceTrackerExt = ["ArrayInterface", "Tracker"]
-    ChainRulesCoreExt = "ChainRulesCore"
-    EnzymeCoreExt = "EnzymeCore"
-    FluxExt = "Flux"
-    FunctorsExt = "Functors"
-    MLDataDevicesExt = ["Adapt", "MLDataDevices"]
-    ReactantExt = "Reactant"
-    SetfieldExt = "Setfield"
-
-    [deps.LuxCore.weakdeps]
-    Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
-    ArrayInterface = "4fba245c-0d91-5ea0-9b3e-6abc04ee57a9"
-    ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
-    EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
-    Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
-    Functors = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
-    MLDataDevices = "7e8f7934-dd98-4c1a-8fe8-92b47a384d40"
-    Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
-    ReverseDiff = "37e2e3b7-166d-5795-8a7a-e32c996b4267"
-    Setfield = "efcf1570-3423-57d1-acb7-fd33fddbac46"
-    Tracker = "9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c"
-
-[[deps.LuxLib]]
-deps = ["ArrayInterface", "CPUSummary", "ChainRulesCore", "DispatchDoctor", "EnzymeCore", "FastClosures", "Functors", "KernelAbstractions", "LinearAlgebra", "LuxCore", "MLDataDevices", "Markdown", "NNlib", "Preferences", "Random", "Reexport", "SciMLPublic", "Static", "StaticArraysCore", "Statistics", "UUIDs"]
-git-tree-sha1 = "6a6453d556f7bc3870d797657636b1ad5f45fd27"
-uuid = "82251201-b29d-42c6-8e01-566dec8acb11"
-version = "1.15.9"
-
-    [deps.LuxLib.extensions]
-    AppleAccelerateExt = "AppleAccelerate"
-    BLISBLASExt = "BLISBLAS"
-    CUDAExt = "CUDA"
-    CUDAForwardDiffExt = ["CUDA", "ForwardDiff"]
-    EnzymeExt = "Enzyme"
-    ForwardDiffExt = "ForwardDiff"
-    LoopVectorizationExt = ["LoopVectorization", "Polyester"]
-    MKLExt = "MKL"
-    OctavianExt = ["Octavian", "LoopVectorization"]
-    OneHotArraysExt = ["OneHotArrays"]
-    ReactantExt = ["Reactant", "ReactantCore"]
-    ReverseDiffExt = "ReverseDiff"
-    SLEEFPiratesExt = "SLEEFPirates"
-    TrackerAMDGPUExt = ["AMDGPU", "Tracker"]
-    TrackerExt = "Tracker"
-    cuDNNExt = ["CUDA", "cuDNN"]
-
-    [deps.LuxLib.weakdeps]
-    AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
-    AppleAccelerate = "13e28ba4-7ad8-5781-acae-3021b1ed3924"
-    BLISBLAS = "6f275bd8-fec0-4d39-945b-7e95a765fa1e"
-    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
-    Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
-    ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
-    LoopVectorization = "bdcacae8-1622-11e9-2a5c-532679323890"
-    MKL = "33e6dc65-8f57-5167-99aa-e5a354878fb2"
-    Octavian = "6fd5a793-0b7e-452c-907f-f8bfe9c57db4"
-    OneHotArrays = "0b1bfda6-eb8a-41d2-88d8-f5af5cad476f"
-    Polyester = "f517fe37-dbe3-4b94-8317-1923a5111588"
-    Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
-    ReactantCore = "a3311ec8-5e00-46d5-b541-4f83e724a433"
-    ReverseDiff = "37e2e3b7-166d-5795-8a7a-e32c996b4267"
-    SLEEFPirates = "476501e8-09a2-5ece-8869-fb82de89a1fa"
-    Tracker = "9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c"
-    cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
-
 [[deps.MLCore]]
 deps = ["DataAPI", "SimpleTraits", "Tables"]
 git-tree-sha1 = "73907695f35bc7ffd9f11f6c4f2ee8c1302084be"
@@ -1680,9 +1125,9 @@ version = "1.0.0"
 
 [[deps.MLDataDevices]]
 deps = ["Adapt", "Functors", "Preferences", "Random", "SciMLPublic"]
-git-tree-sha1 = "2dfe3b4b96c6ecbea7c798dfbe96d493fd7a1848"
+git-tree-sha1 = "39a69ca451c3e78b9a6a2e42ef894fdf7505e629"
 uuid = "7e8f7934-dd98-4c1a-8fe8-92b47a384d40"
-version = "1.17.8"
+version = "1.17.5"
 
     [deps.MLDataDevices.extensions]
     AMDGPUExt = "AMDGPU"
@@ -1769,9 +1214,9 @@ version = "2025.11.4"
 
 [[deps.NNlib]]
 deps = ["Adapt", "Atomix", "ChainRulesCore", "GPUArraysCore", "KernelAbstractions", "LinearAlgebra", "Random", "ScopedValues", "Statistics"]
-git-tree-sha1 = "78cd28dbd5f03f99ccaba45c987107adcb61c115"
+git-tree-sha1 = "6dc9ffc3a9931e6b988f913b49630d0fb986d0a8"
 uuid = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
-version = "0.9.34"
+version = "0.9.33"
 
     [deps.NNlib.extensions]
     NNlibAMDGPUExt = "AMDGPU"
@@ -1792,12 +1237,6 @@ version = "0.9.34"
     Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
     SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
     cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
-
-[[deps.NVML]]
-deps = ["CEnum", "CUDACore", "GPUToolbox", "Libdl"]
-git-tree-sha1 = "d041854ab4c16d1b1b6d8ba1092183745a7fe26a"
-uuid = "611af6d1-644e-4c5d-bd58-854d7d1254b9"
-version = "6.0.0"
 
 [[deps.NVTX]]
 deps = ["JuliaNVTXCallbacks_jll", "Libdl", "NVTX_jll"]
@@ -1833,17 +1272,11 @@ version = "0.1.5"
 uuid = "ca575930-c2e3-43a9-ace4-1e988b2c1908"
 version = "1.3.0"
 
-[[deps.ObjectFile]]
-deps = ["Reexport", "StructIO"]
-git-tree-sha1 = "22faba70c22d2f03e60fbc61da99c4ebfc3eb9ba"
-uuid = "d8793406-e978-5875-9003-1fc021f44a92"
-version = "0.5.0"
-
 [[deps.OneHotArrays]]
 deps = ["Adapt", "ChainRulesCore", "Compat", "GPUArraysCore", "LinearAlgebra", "NNlib"]
-git-tree-sha1 = "9510d7008275fc5b33fc72a73f8fddef0b5430c6"
+git-tree-sha1 = "bfe8e84c71972f77e775f75e6d8048ad3fdbe8bc"
 uuid = "0b1bfda6-eb8a-41d2-88d8-f5af5cad476f"
-version = "0.2.11"
+version = "0.2.10"
 
 [[deps.OpenBLAS_jll]]
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "Libdl"]
@@ -1915,9 +1348,9 @@ version = "0.2.0"
 
 [[deps.PrettyTables]]
 deps = ["Crayons", "LaTeXStrings", "Markdown", "PrecompileTools", "Printf", "REPL", "Reexport", "StringManipulation", "Tables"]
-git-tree-sha1 = "624de6279ab7d94fc9f672f0068107eb6619732c"
+git-tree-sha1 = "211530a7dc76ab59087f4d4d1fc3f086fbe87594"
 uuid = "08abe8d2-0d0c-5749-adfa-8a2ac140af0d"
-version = "3.3.2"
+version = "3.2.3"
 
     [deps.PrettyTables.extensions]
     PrettyTablesTypstryExt = "Typstry"
@@ -1963,12 +1396,6 @@ git-tree-sha1 = "c6ec94d2aaba1ab2ff983052cf6a606ca5985902"
 uuid = "e6cf234a-135c-5ec9-84dd-332b85af5143"
 version = "1.6.0"
 
-[[deps.ReactantCore]]
-deps = ["ExpressionExplorer", "MacroTools"]
-git-tree-sha1 = "5b9e0fe7fb2cf3794fd96ac32bf2732aa4bb9776"
-uuid = "a3311ec8-5e00-46d5-b541-4f83e724a433"
-version = "0.1.19"
-
 [[deps.RealDot]]
 deps = ["LinearAlgebra"]
 git-tree-sha1 = "9f0a1b71baaf7650f4fa8a1d168c7fb6ee41f0c9"
@@ -1997,9 +1424,9 @@ version = "1.0.1"
 
 [[deps.ScopedValues]]
 deps = ["HashArrayMappedTries", "Logging"]
-git-tree-sha1 = "67a144433c4ce877ee6d1ada69a124d6b1ecf7be"
+git-tree-sha1 = "ac4b837d89a58c848e85e698e2a2514e9d59d8f6"
 uuid = "7e506255-f358-4e82-b7e4-beb19740aa63"
-version = "1.6.2"
+version = "1.6.0"
 
 [[deps.Scratch]]
 deps = ["Dates"]
@@ -2051,9 +1478,9 @@ version = "0.1.2"
 
 [[deps.SpecialFunctions]]
 deps = ["IrrationalConstants", "LogExpFunctions", "OpenLibm_jll", "OpenSpecFun_jll"]
-git-tree-sha1 = "2700b235561b0335d5bef7097a111dc513b8655e"
+git-tree-sha1 = "5acc6a41b3082920f79ca3c759acbcecf18a8d78"
 uuid = "276daf66-3868-5448-9aa4-cd146d93841b"
-version = "2.7.2"
+version = "2.7.1"
 weakdeps = ["ChainRulesCore"]
 
     [deps.SpecialFunctions.extensions]
@@ -2064,12 +1491,6 @@ deps = ["Setfield", "Test"]
 git-tree-sha1 = "e08a62abc517eb79667d0a29dc08a3b589516bb5"
 uuid = "171d559e-b47b-412a-8079-5efa626c420e"
 version = "0.1.15"
-
-[[deps.Static]]
-deps = ["CommonWorldInvalidations", "IfElse", "PrecompileTools", "SciMLPublic"]
-git-tree-sha1 = "bb072715f158b59ad8819ff80da5ffa90cce6ceb"
-uuid = "aedffcd0-7271-4cad-89d0-dc628f76c6d3"
-version = "1.4.0"
 
 [[deps.StaticArrays]]
 deps = ["LinearAlgebra", "PrecompileTools", "Random", "StaticArraysCore"]
@@ -2117,9 +1538,9 @@ version = "0.4.4"
 
 [[deps.StructArrays]]
 deps = ["ConstructionBase", "DataAPI", "Tables"]
-git-tree-sha1 = "ad8002667372439f2e3611cfd14097e03fa4bccd"
+git-tree-sha1 = "a2c37d815bf00575332b7bd0389f771cb7987214"
 uuid = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
-version = "0.7.3"
+version = "0.7.2"
 weakdeps = ["Adapt", "GPUArraysCore", "KernelAbstractions", "LinearAlgebra", "SparseArrays", "StaticArrays"]
 
     [deps.StructArrays.extensions]
@@ -2128,11 +1549,6 @@ weakdeps = ["Adapt", "GPUArraysCore", "KernelAbstractions", "LinearAlgebra", "Sp
     StructArraysLinearAlgebraExt = "LinearAlgebra"
     StructArraysSparseArraysExt = "SparseArrays"
     StructArraysStaticArraysExt = "StaticArrays"
-
-[[deps.StructIO]]
-git-tree-sha1 = "c581be48ae1cbf83e899b14c07a807e1787512cc"
-uuid = "53d494c1-5632-5724-8f4c-31dff12d585f"
-version = "0.3.1"
 
 [[deps.StyledStrings]]
 uuid = "f489334b-da3d-4c2e-b8f0-e476e12c162b"
@@ -2226,26 +1642,6 @@ weakdeps = ["LLVM"]
     [deps.UnsafeAtomics.extensions]
     UnsafeAtomicsLLVM = ["LLVM"]
 
-[[deps.WeightInitializers]]
-deps = ["ConcreteStructs", "GPUArraysCore", "LinearAlgebra", "Random", "SpecialFunctions", "Statistics"]
-git-tree-sha1 = "2af44c69f5c37b7b1d14e262347a24ba349052d6"
-uuid = "d49dbf32-c5c2-4618-8acc-27bb2598ef2d"
-version = "1.3.3"
-
-    [deps.WeightInitializers.extensions]
-    AMDGPUExt = "AMDGPU"
-    CUDAExt = "CUDA"
-    ChainRulesCoreExt = "ChainRulesCore"
-    GPUArraysExt = "GPUArrays"
-    ReactantExt = "Reactant"
-
-    [deps.WeightInitializers.weakdeps]
-    AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
-    CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
-    ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
-    GPUArrays = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
-    Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
-
 [[deps.Zlib_jll]]
 deps = ["Libdl"]
 uuid = "83775a58-1f1d-513f-b197-d71354ab007a"
@@ -2274,46 +1670,6 @@ deps = ["ChainRulesCore", "MacroTools"]
 git-tree-sha1 = "434b3de333c75fc446aa0d19fc394edafd07ab08"
 uuid = "700de1a5-db45-46bc-99cf-38207098b444"
 version = "0.2.7"
-
-[[deps.cuBLAS]]
-deps = ["Adapt", "BFloat16s", "CEnum", "CUDACore", "CUDA_Runtime_Discovery", "CUDA_Runtime_jll", "GPUArrays", "GPUToolbox", "LLVM", "LinearAlgebra"]
-git-tree-sha1 = "5df9edbdfff9fed8b818535e7b86e92a85fc7709"
-uuid = "182d3088-87b7-4494-8cad-fc6afaa545bc"
-version = "6.0.0"
-weakdeps = ["EnzymeCore"]
-
-    [deps.cuBLAS.extensions]
-    EnzymeCoreExt = "EnzymeCore"
-
-[[deps.cuFFT]]
-deps = ["AbstractFFTs", "CEnum", "CUDACore", "CUDA_Runtime_Discovery", "CUDA_Runtime_jll", "GPUToolbox", "LinearAlgebra", "Reexport"]
-git-tree-sha1 = "c5de5ab272aae86658d3b05999b9ea7bc60503d0"
-uuid = "533571aa-0936-420e-b4be-9c66f5f626ca"
-version = "6.0.0"
-
-[[deps.cuRAND]]
-deps = ["CEnum", "CUDACore", "CUDA_Runtime_Discovery", "CUDA_Runtime_jll", "GPUToolbox", "Random", "Random123", "RandomNumbers"]
-git-tree-sha1 = "43d84e8d12e75c401d69d88475d304ca7a038afd"
-uuid = "20fd9a0b-12d5-4c2f-a8af-7c34e9e60431"
-version = "6.0.0"
-
-[[deps.cuSOLVER]]
-deps = ["CEnum", "CUDACore", "CUDA_Runtime_Discovery", "CUDA_Runtime_jll", "GPUToolbox", "LinearAlgebra", "SparseArrays", "cuBLAS", "cuSPARSE"]
-git-tree-sha1 = "4b15758b0667ba4b715252fe0dfae9dafae1b739"
-uuid = "887afef0-6a32-4de5-add4-7827692ba8fc"
-version = "6.0.0"
-
-[[deps.cuSPARSE]]
-deps = ["Adapt", "CEnum", "CUDACore", "CUDA_Runtime_Discovery", "CUDA_Runtime_jll", "GPUArrays", "GPUToolbox", "KernelAbstractions", "LinearAlgebra", "SparseArrays"]
-git-tree-sha1 = "f5d1fdae1053286374c80e5f6608a913aedad7ef"
-uuid = "b26da814-b3bc-49ef-b0ee-c816305aa060"
-version = "6.0.0"
-
-    [deps.cuSPARSE.extensions]
-    SparseMatricesCSRExt = "SparseMatricesCSR"
-
-    [deps.cuSPARSE.weakdeps]
-    SparseMatricesCSR = "a0a7dd2c-ebf4-11e9-1f05-cf50bc540ca1"
 
 [[deps.demumble_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
@@ -2372,40 +1728,11 @@ version = "17.7.0+0"
 # ╠═e04d1604-6622-4263-b3f7-9248657c6c7f
 # ╠═4877f866-b98f-46bf-9b51-235566b83bf8
 # ╠═d4dbafef-a2ef-4bc6-86f5-c3db0a36b96e
-# ╠═1ef9b5c6-8dd6-448a-9afe-7bc3b939ab72
-# ╠═3f32f44d-3479-4ffc-ae7e-363e8f28a47d
-# ╠═44b33fed-119d-4385-a9c8-3c94a9f814a2
-# ╠═e7debd35-07b4-4676-a3c2-365f5e588211
-# ╠═ed6b80bf-a6db-41b2-bca8-a260bdc2d707
-# ╠═a4614d4f-26fa-4dbd-9022-23da7910d264
-# ╠═7fd86a7c-d3fd-4dc3-9784-4b55ef0e9216
-# ╠═74a5177f-ad9a-4e2e-acb2-ea16d105e770
-# ╠═02d1a13f-e076-4b0a-b6e8-118540d8deec
-# ╠═b385ce59-28b9-411d-911e-bf79bacb76cf
-# ╠═387b9bfb-28bf-4fd6-8608-599c78ea8e91
-# ╠═73612870-4310-4791-a68f-fd25892a9c2a
-# ╠═2f24d41d-ae04-4e0d-b9d4-97d3814c905c
-# ╠═e4c55070-916d-48b9-b34d-a3ab34ad4062
-# ╠═671bf2d2-76eb-48e1-9396-f8e383425339
 # ╠═cdc3957f-381b-4946-80e6-a90e9f585044
 # ╠═6896023b-ed14-4378-9251-7cfba17c9137
-# ╠═a119c1d5-2819-4c72-aefa-bd0e2cfb8604
 # ╠═b3b09a8c-3bb0-45e8-a6c9-26598e17049f
-# ╠═8dc1484a-0fd6-4f09-8953-a9f30a50b266
-# ╠═278431a0-256d-4a8a-8795-238b3c6c1d2f
-# ╠═af63db60-b2a4-47a8-bb39-819f704270f2
-# ╠═5a6fe71d-1210-4c44-90c2-96321231991d
-# ╠═44113888-23fc-4166-abab-ae29d06a09ce
-# ╠═91ae0d18-7d9c-42f1-bb83-61789c41ae8a
-# ╠═010b27b4-c7c9-4180-b34b-ae327e85c95b
-# ╠═59e58140-8741-484c-95e4-e79214a0df77
-# ╠═f4099841-fc40-4c4f-84bf-5e79e8fd927e
-# ╠═c22f4459-c732-4437-84d7-16e774f667d2
-# ╠═f8e98ef1-b2e0-411d-a083-9027867668b9
 # ╠═773f4779-86fc-4eff-8db2-bc3284de274f
-# ╠═fa01e2d1-e197-44fa-9184-1521b6c2ec95
 # ╠═8c365a6b-52c0-47f8-93c4-98d4cbd07004
-# ╠═b3fd20d5-36dd-47ce-bd08-d26450e02638
 # ╟─c047f29c-0282-4c1d-a798-deb3be5389a8
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002

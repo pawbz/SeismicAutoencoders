@@ -4,1418 +4,928 @@
 using Markdown
 using InteractiveUtils
 
+# This Pluto notebook uses @bind for interactivity. When running this notebook outside of Pluto, the following 'mock version' of @bind gives bound variables a default value (instead of an error).
+macro bind(def, element)
+    #! format: off
+    return quote
+        local iv = try Base.loaded_modules[Base.PkgId(Base.UUID("6e696c72-6542-2067-7265-42206c756150"), "AbstractPlutoDingetjes")].Bonds.initial_value catch; b -> missing; end
+        local el = $(esc(element))
+        global $(esc(def)) = Core.applicable(Base.get, el) ? Base.get(el) : iv(el)
+        el
+    end
+    #! format: on
+end
+
 # ╔═╡ 10000001-0000-0000-0000-000000000001
+begin
+    using JLD2,
+        PlutoLinks,
+        PlutoPlotly,
+        PlutoUI,
+        Random,
+        Statistics
+	
+end
+
+# ╔═╡ 96817feb-6aa9-4f35-9277-9a4560e9a2a7
+using FFTW, Peaks, ColorSchemes, Colors, InlineStrings
+
+# ╔═╡ b30b5f82-cbeb-41aa-9a4f-212d6aafa760
+using Zygote
+
+# ╔═╡ e0c79630-dbe0-4110-b880-a9ee9e4e1186
+using Distances
+
+# ╔═╡ 206a2c26-b3cc-4e74-83e1-fa92aa0bdd10
+using PlutoHooks
+
+# ╔═╡ bdeb2eb2-6b5d-4677-837c-7072e3588430
 begin
     using ConcreteStructs,
         Dates,
         DSP,
         Enzyme,
         EnzymeCore,
-        JLD2,
         LinearAlgebra,
         Lux,
         MLUtils,
         NNlib,
         Optimisers,
-        PlutoPlotly,
-        Random,
         Reactant,
-        Statistics,
-        StatsBase,
-        InlineStrings,
-        Zygote
+        StatsBase
 end
-
-# ╔═╡ 330652f1-0754-48a4-9a0f-4fb9d6824222
-using Distances
 
 # ╔═╡ 10000002-0000-0000-0000-000000000001
 md"""
-# VQ-VAE v7 Architecture
+# VQ-VAE v8 Training
 
-Lux/Reactant single-pair RVQ VQ-VAE.  Each station pair trains an independent
-model, so there are no pair ids, pair-specific codebooks, or receiver-geometry
-conditioners in this version.
+Short orchestration notebook.  The v8 architecture notebook owns the model,
+training loop, RVQ, kNN, saving/loading, source-state averaging, and plotting
+helpers.  This notebook selects station pairs, starts training, and connects the
+trained source states to MFT.
 """
 
 # ╔═╡ 10000003-0000-0000-0000-000000000001
-begin
-    const activation = x -> NNlib.leakyrelu(x, 0.1f0)
 
-    function ensure_reactant_xla_flags!()
-        xla_flags = get(ENV, "XLA_FLAGS", "")
-        flag = "--xla_gpu_enable_cublaslt=true"
-        if !occursin(flag, xla_flags)
-            ENV["XLA_FLAGS"] = isempty(xla_flags) ? flag : "$(xla_flags) $(flag)"
-        end
-        return ENV["XLA_FLAGS"]
-    end
+    vqvae = @ingredients("/mnt/NAS/EQData/SeismicAutoencoders/VQVAE_architecture_v8.jl")
 
-    default_xdev(; force::Bool=true) = reactant_device(; force)
-    default_cdev() = cpu_device()
-end
+
+# ╔═╡ 22ef4df8-9962-4443-aa48-cbc4bd5ddb59
+ mft = @ingredients("/mnt/NAS/EQData/SeismicAutoencoders/MFT.jl")
 
 # ╔═╡ 10000004-0000-0000-0000-000000000001
-md"## Parameters"
+md"## Data and Pair Selection"
 
 # ╔═╡ 10000005-0000-0000-0000-000000000001
-Base.@kwdef struct VQVAE_Para
-    nt::Int
-    d::Int = 64
-    beta_commit::Float32 = 0.25f0
-    enc_kernels::Vector{Int} = [32, 16, 8, 4]
-    enc_filters::Vector{Int} = [8, 16, 32, 64]
-    enc_strides::Vector{Int} = [1, 1, 1, 1]
-    dec_kernels::Vector{Int} = [4, 8, 16]
-    dec_filters::Vector{Int} = [64, 48, 16, 1]
-    use_bn::Bool = false
-    K::Vector{Int} = [5]
-    ema_decay::Float32 = 0.99f0
-    epsilon::Float32 = 1f-5
-    dead_threshold::Int = 50
-    entropy_weight::Float32 = 0.01f0
-    reconstruction_loss::Symbol = :l2
-    interstation_distance::Union{Nothing,Float64} = nothing
-    velocity_range::Tuple{Float64,Float64} = (2.0, 4.0)
-    dt::Float64 = 1.0
-    seed::Int = 1234
+begin
+    data_filepath = "/mnt/NAS2/Sanket_data/California_TO_with_latlong/"
+    dt = 1.0
+    period_min = 3
+    period_max = 10
+    mft_nT = 20        # number of periods log-spaced between period_min and period_max
+    velocity_range = (1.0, 8.0)
+    mft_nperiods = 100
+    mft_max_modes = 6
+    bandwidth_factor = 0.15
+    zero_pad_factor = 4
+    use_latest_run_per_seed = true
+end
+
+# ╔═╡ 1000000c-0000-0000-0000-000000000004
+whitening_kernel_length = 64   # FIR tap count for spectral whitening (longer = sharper freq resolution)
+
+# ╔═╡ d5000001-0000-0000-0000-000000000001
+begin
+	spike_threshold   = 5.5   # bins exceeding this × median PSD are treated as spikes
+	spike_suppression = 0.25   # fraction of spike power to keep after suppression (0=zero, 1=no change)
+end
+
+# ╔═╡ 10000009-0000-0000-0000-000000000001
+md"## Hyperparameters"
+
+# ╔═╡ 1000000a-0000-0000-0000-000000000001
+vqvae_parameters = (;
+    d=24,
+    beta_commit=0.25f0,
+    K=[5],
+    ema_decay=0.99f0,
+    n_filters=32,
+    ratios=[2, 5],
+    n_residual_layers=3,
+    dilation_base=2,
+    residual_kernel_size=3,
+    enc_kernel_size=7,
+    dec_kernel_size=7,
+	p_stage2_shuffle=0.0,			
+    use_bn=false,
+    dead_threshold=50,
+    entropy_weight=0.1f0,
+    reconstruction_loss=:l1,
+)
+
+# ╔═╡ 1000000b-0000-0000-0000-000000000001
+training_para = vqvae.VQVAE_Training_Para(
+    batchsize=4096,
+    nepoch=100,
+    initial_learning_rate=0.001,
+    weight_decay=0.0,
+    Mnn_schedule=[(1, 128), (5, 256), (26, 256)],
+    warmup_epochs=0,
+	verbose = true,
+	knn_search_chunk_size_fraction = 0.25,
+    index_refresh_every=2,
+)
+
+# ╔═╡ 1000000c-0000-0000-0000-000000000003
+run_seeds = [1234, 1235]
+
+# ╔═╡ 1000000c-0000-0000-0000-000000000002
+training_device = vqvae.default_xdev(; force=true)
+
+# ╔═╡ 1000000c-0000-0000-0000-000000000001
+md"## Train"
+
+# ╔═╡ 1000000d-0000-0000-0000-000000000002
+@bind compile_button CounterButton("Compile selected pairs")
+
+# ╔═╡ 1000000d-0000-0000-0000-000000000001
+@bind train_button CounterButton("Train compiled pairs")
+
+# ╔═╡ 10000008-0000-0000-0000-000000000002
+begin
+    if !@isdefined(compiled_model_cache_v8)
+        const compiled_model_cache_v8 = Ref{Any}(nothing)
+    end
+    if !@isdefined(compiled_model_key_cache_v8)
+        const compiled_model_key_cache_v8 = Ref{Any}(nothing)
+    end
+end
+
+# ╔═╡ 1000000f-0000-0000-0000-000000000001
+md"## Inspect One Result"
+
+# ╔═╡ 10000015-0000-0000-0000-000000000001
+md"## Source-State Averages and MFT"
+
+# ╔═╡ baf864b2-8860-4486-b1b8-5967cb824c05
+velocity_range
+
+# ╔═╡ b00b61c7-81c6-467a-b8bd-9f9e2ebd4d0c
+result_title_context(result) = begin
+    pair = result.pair
+    distance_label = isnothing(result.data_bundle.distance) ?
+        "distance unavailable" : "$(round(Int, result.data_bundle.distance))km"
+    seed_label = hasproperty(result, :seed) ? " seed=$(result.seed)" : ""
+    "$(pair[1])-$(pair[2])$(seed_label) $(distance_label) $(period_min)-$(period_max)s"
+end
+
+# ╔═╡ 9c18f181-8d76-46a4-836d-c4fe2cad19c8
+function list_station_pairs(filepath::String)
+    files = readdir(filepath)
+    pairs = Set{Tuple{String,String}}()
+    for f in files
+        m = match(r"^([A-Za-z0-9]+)_([A-Za-z0-9]+)", basename(f))
+        m === nothing && continue
+        push!(pairs, (m.captures[1], m.captures[2]))
+    end
+    return sort!(collect(pairs), by=x -> (x[1], x[2]))
 end
 
 # ╔═╡ 10000006-0000-0000-0000-000000000001
-Base.@kwdef struct VQVAE_Training_Para
-    batchsize::Int = 256
-    nepoch::Int = 30
-    nprint::Int = 1
-    initial_learning_rate::Float64 = 0.001
-    weight_decay::Float64 = 0.0
-    stop_on_recon_loss::Union{Nothing,Float64} = nothing
-    Mnn::Union{Nothing,Int} = nothing
-    Mnn_schedule::Vector{Tuple{Int,Int}} = [(1, 5), (6, 10), (26, 25)]
-    warmup_epochs::Int = 5
-    index_refresh_every::Int = 1
-    autodiff_backend::Symbol = :auto
-    normalize_target::Bool = true
-    verbose::Bool = false
-    knn_search_chunk_size_fraction::Float64 = 0.5
-end
+available_pairs = list_station_pairs(data_filepath)
 
 # ╔═╡ 10000007-0000-0000-0000-000000000001
-md"## Array and Geometry Helpers"
+begin
+    isempty(available_pairs) && error("No station pairs found in $(data_filepath)")
+    pair_options = ["$(p[1])-$(p[2])" for p in available_pairs]
+    default_pair_names = pair_options[1:min(end, 1)]
+    
+end
+
+# ╔═╡ 0bf6c416-bf64-4b2a-b55e-623a4f9daae2
+@bind selected_pair_names confirm(MultiCheckBox(pair_options; default=default_pair_names))
+
+# ╔═╡ 272932ae-4c54-41a2-8c9a-e1cd4834150a
+selected_pair_names
 
 # ╔═╡ 10000008-0000-0000-0000-000000000001
-begin
-    flatten_batch(x::AbstractVector) = reshape(x, :, 1)
-    flatten_batch(x::AbstractMatrix) = x
-    flatten_batch(x::AbstractArray) = reshape(x, size(x, 1), :)
+selected_pairs = begin
+    isempty(selected_pair_names) && error("Select at least one station pair.")
+    [begin
+        parts = split(name, "-", limit=2)
+        length(parts) == 2 || error("Invalid pair name $(name).")
+        (String(parts[1]), String(parts[2]))
+    end for name in selected_pair_names]
+end
 
-    function waveform_to_conv3(x)
-        xf = flatten_batch(x)
-        return reshape(xf, size(xf, 1), 1, size(xf, 2))
-    end
+# ╔═╡ 10000008-0000-0000-0000-000000000005
+pairs_data = vqvae.load_pairs_data(selected_pairs;
+    filepath=data_filepath, seed=1234,
+    dt=dt, period_min=period_min, period_max=period_max)
 
-    function conv3_to_waveform(y)
-        if ndims(y) == 3 && size(y, 2) == 1
-            return reshape(y, size(y, 1), size(y, 3))
-        end
-        return reshape(y, size(y, 1), :)
-    end
+# ╔═╡ c0000002-0000-0000-0000-000000000002
+pairs_data_whitened_raw = map(pairs_data) do pd
+    fir = vqvae.compute_whitening_fir(pd.data.D_train, Float64(dt);
+        kernel_length=whitening_kernel_length, min_power_fraction=0.05)
+    D_train_w = Float32.(MLUtils.normalise(vqvae.apply_whitening_fir(pd.data.D_train, fir); dims=1))
+    D_test_w  = Float32.(MLUtils.normalise(vqvae.apply_whitening_fir(pd.data.D_test,  fir); dims=1))
+    D_ac_w = Float32.(MLUtils.normalise(vqvae.apply_whitening_fir(pd.data.D_ac_all, fir); dims=1))
+    D_c_w = Float32.(MLUtils.normalise(vqvae.apply_whitening_fir(pd.data.D_c_all, fir); dims=1))
+    D_all_w = Float32.(hcat(D_ac_w, D_c_w))
+    merge(pd, (;
+        data=merge(pd.data, (; D_train=D_train_w, D_test=D_test_w,
+            D_all=D_all_w, D_ac_all=D_ac_w, D_c_all=D_c_w)),
+        data_bundle=merge(pd.data_bundle, (;
+            D1fac_raw=pd.data_bundle.D1fac,
+            D1fc_raw=pd.data_bundle.D1fc,
+            D1fac_whitened=D_ac_w,
+            D1fc_whitened=D_c_w,
+            D1fac=D_ac_w,
+            D1fc=D_c_w,
+            whitening_fir=fir,
+        )),
+        whitening_fir=fir,
+    ))
+end
 
-    mse_loss(x, y) = mean(abs2, x .- y)
-
-    function replace_tuple(t::Tuple, i::Int, x)
-        return ntuple(j -> j == i ? x : t[j], length(t))
-    end
-
-    function compute_latent_window(para::VQVAE_Para)
-        isnothing(para.interstation_distance) && return (nothing, 1)
-        total_stride = prod(para.enc_strides)
-        total_stride > 0 || error("enc_strides must have positive product.")
-        vmin, vmax = para.velocity_range
-        0 < vmin < vmax || error("velocity_range must be (vmin, vmax) with 0 < vmin < vmax.")
-        para.dt > 0 || error("dt must be positive.")
-        distance = para.interstation_distance
-        t_fast = distance / vmax / para.dt
-        t_slow = distance / vmin / para.dt
-        lstart = round(Int, t_fast / total_stride) + 1
-        lend = round(Int, t_slow / total_stride) + 1
-        return (lstart, lend)
+# ╔═╡ d5000002-0000-0000-0000-000000000002
+pairs_data_whitened = map(pairs_data_whitened_raw) do pd
+    spike_bins, _P_half, _med = vqvae.detect_spectral_spikes(pd.data.D_train;
+        spike_threshold=spike_threshold)
+    if isempty(spike_bins)
+        merge(pd, (;
+            data_bundle=merge(pd.data_bundle, (;
+                D1fac_despiked=pd.data.D_ac_all,
+                D1fc_despiked=pd.data.D_c_all,
+                spike_bins=Int[],
+            )),
+        ))
+    else
+        @info "Spike suppression" pair=pd.pair n_spike_bins=length(spike_bins)
+        D_train_ds = Float32.(MLUtils.normalise(
+            vqvae.apply_spike_suppression(pd.data.D_train, spike_bins;
+                suppression_factor=spike_suppression); dims=1))
+        D_test_ds  = Float32.(MLUtils.normalise(
+            vqvae.apply_spike_suppression(pd.data.D_test,  spike_bins;
+                suppression_factor=spike_suppression); dims=1))
+        D_ac_ds = Float32.(MLUtils.normalise(
+            vqvae.apply_spike_suppression(pd.data.D_ac_all, spike_bins;
+                suppression_factor=spike_suppression); dims=1))
+        D_c_ds = Float32.(MLUtils.normalise(
+            vqvae.apply_spike_suppression(pd.data.D_c_all, spike_bins;
+                suppression_factor=spike_suppression); dims=1))
+        D_all_ds = Float32.(hcat(D_ac_ds, D_c_ds))
+        merge(pd, (;
+            data=merge(pd.data, (; D_train=D_train_ds, D_test=D_test_ds,
+                D_all=D_all_ds, D_ac_all=D_ac_ds, D_c_all=D_c_ds)),
+            data_bundle=merge(pd.data_bundle, (;
+                D1fac_despiked=D_ac_ds,
+                D1fc_despiked=D_c_ds,
+                D1fac=D_ac_ds,
+                D1fc=D_c_ds,
+                spike_bins=Int.(spike_bins),
+            )),
+            spike_bins=spike_bins,
+        ))
     end
 end
 
-# ╔═╡ 1000000a-0000-0000-0000-000000000001
-md"## Lux Encoder and Decoder"
+# ╔═╡ 66bc6645-a459-40fb-a871-2dd674e5bf9d
+pairs_data_whitened[1].data
 
-# ╔═╡ ef07d7ea-9aaa-4fed-b3f3-a6a2acc85650
-function make_encoder(para::VQVAE_Para)
-    length(para.enc_kernels) == length(para.enc_filters) ||
-        error("enc_kernels and enc_filters must have the same length.")
-    layers = Any[]
-    nin = 1
-    for (i, k) in enumerate(para.enc_kernels)
-        nout = para.enc_filters[i]
-        stride = i <= length(para.enc_strides) ? para.enc_strides[i] : 1
-        push!(layers, Conv((k,), nin => nout, activation; pad=SamePad(), stride=stride))
-        if para.use_bn && i < length(para.enc_kernels)
-            push!(layers, BatchNorm(nout))
-        end
-        nin = nout
+# ╔═╡ c0000003-0000-0000-0000-000000000003
+let
+    colors_raw = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                  "#8c564b", "#e377c2", "#7f7f7f"]
+    colors_whi = ["#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
+                  "#c49c94", "#f7b6d2", "#c7c7c7"]
+    colors_ds  = ["#ff9896", "#c5b0d5", "#8c564b", "#1f77b4", "#ff7f0e",
+                  "#2ca02c", "#d62728", "#9467bd"]
+    traces = [scatter()]
+    for (pi, (pd_raw, pd_whi, pd_ds)) in enumerate(zip(pairs_data, pairs_data_whitened_raw, pairs_data_whitened))
+        pair_label = "$(pd_raw.pair[1])-$(pd_raw.pair[2])"
+        X_raw = Float64.(pd_raw.data.D_train)
+        X_whi = Float64.(pd_whi.data.D_train)
+        X_ds  = Float64.(pd_ds.data.D_train)
+        nt = size(X_raw, 1)
+        fft_freqs = FFTW.fftfreq(nt, inv(Float64(dt)))
+        pos = fft_freqs .> 0
+        order = sortperm(1.0 ./ fft_freqs[pos])
+        periods_plot = (1.0 ./ fft_freqs[pos])[order]
+        P_raw = vec(mean(abs2.(FFTW.fft(X_raw, 1)); dims=2))
+        P_whi = vec(mean(abs2.(FFTW.fft(X_whi, 1)); dims=2))
+        P_ds  = vec(mean(abs2.(FFTW.fft(X_ds,  1)); dims=2))
+        norm = maximum(P_raw[pos])
+        ci = mod1(pi, length(colors_raw))
+        push!(traces, PlutoPlotly.scatter(
+            x=periods_plot, y=P_raw[pos][order]./norm, mode="lines",
+            line=PlutoPlotly.attr(color=colors_raw[ci], width=2),
+            name="$(pair_label) raw", legendgroup=pair_label))
+        push!(traces, PlutoPlotly.scatter(
+            x=periods_plot, y=P_whi[pos][order]./norm, mode="lines",
+            line=PlutoPlotly.attr(color=colors_whi[ci], width=1.5, dash="dash"),
+            name="$(pair_label) whitened", legendgroup=pair_label))
+        push!(traces, PlutoPlotly.scatter(
+            x=periods_plot, y=P_ds[pos][order]./norm, mode="lines",
+            line=PlutoPlotly.attr(color=colors_ds[ci], width=1.5, dash="dot"),
+            name="$(pair_label) despiked", legendgroup=pair_label))
     end
-    return Chain(layers...)
+    WideCell(PlutoPlotly.plot(traces, PlutoPlotly.Layout(
+        title="Average PSD: raw (solid) → whitened (dashed) → despiked (dotted)",
+        xaxis_title="Period (s)", yaxis_title="Power (avg across waveforms, normalized to raw max)",
+        yaxis_type="log",
+		xaxis=attr(range=(0, 100)),
+        height=420, margin=PlutoPlotly.attr(l=60, r=20, t=60, b=50),
+    )))
 end
 
-# ╔═╡ 0e5e3563-8738-4831-a9b5-16c6803743f7
-function infer_dec_upstrides(enc_strides::AbstractVector{<:Integer}, n_dec_layers::Int)
-    vals = Int.(reverse(collect(enc_strides)))
-    while length(vals) > n_dec_layers
-        vals[2] *= vals[1]
-        deleteat!(vals, 1)
-    end
-    while length(vals) < n_dec_layers
-        push!(vals, 1)
-    end
-    return vals
-end
+# ╔═╡ 10000008-0000-0000-0000-000000000003
+selected_pairs_key = (
+    pairs=Tuple(selected_pairs),
+    vqvae_parameters=vqvae_parameters,
+    training_batchsize=training_para.batchsize,
+    warmup_epochs=training_para.warmup_epochs,
+    index_refresh_every=training_para.index_refresh_every,
+    filepath=data_filepath,
+    dt=dt,
+    period_min=period_min,
+    period_max=period_max,
+)
 
-# ╔═╡ a0416f71-242a-44a7-b8f6-186726318611
-function make_decoder(para::VQVAE_Para, latent_len::Int)
-    length(para.dec_kernels) == length(para.dec_filters) - 1 ||
-        error("dec_kernels length must be dec_filters length - 1.")
-    upstrides = infer_dec_upstrides(para.enc_strides, length(para.dec_kernels))
-    bottleneck_len = para.nt
-    for stride in upstrides
-        bottleneck_len = cld(bottleneck_len, stride)
-    end
-    bottleneck_channels = para.dec_filters[1]
-
-    layers = Any[]
-    nin = bottleneck_channels
-    for (i, k) in enumerate(para.dec_kernels)
-        nout = para.dec_filters[i + 1]
-        stride = upstrides[i]
-        if i < length(para.dec_kernels)
-            push!(layers, ConvTranspose((k,), nin => nout, activation; stride, pad=SamePad()))
-            para.use_bn && push!(layers, BatchNorm(nout))
-        else
-            push!(layers, ConvTranspose((k,), nin => nout; stride, pad=SamePad()))
-        end
-        nin = nout
-    end
-    upchain = Chain(layers...)
-    linear = Dense(para.d, bottleneck_len * bottleneck_channels, activation)
-    return @compact(; linear, upchain, bottleneck_len, bottleneck_channels) do z
-        y = linear(z)
-        y3 = reshape(y, bottleneck_len, bottleneck_channels, size(y, 2))
-        out = upchain(y3)
-        wave = conv3_to_waveform(out)
-        @return wave
+# ╔═╡ 10000008-0000-0000-0000-000000000004
+compiled_model = let
+    if compile_button === missing || compile_button == 0
+        compiled_model_cache_v8[]
+    elseif selected_pairs_key != compiled_model_key_cache_v8[]
+        nt = size(pairs_data_whitened[1].data.D_train, 1)
+        n_train = minimum(size(pd.data.D_train, 2) for pd in pairs_data_whitened)
+        compiled_model_cache_v8[] = vqvae.compile_model(nt, n_train;
+            vqvae_parameters=vqvae_parameters,
+            training_para=training_para,
+            seed=1234,
+            device=training_device,
+        )
+        compiled_model_key_cache_v8[] = selected_pairs_key
+        compiled_model_cache_v8[]
+    else
+        @info "Using cached compiled model"
+        compiled_model_cache_v8[]
     end
 end
 
-# ╔═╡ 1000000c-0000-0000-0000-000000000001
-md"## RVQ State and Lookup"
+# ╔═╡ e0000001-0000-0000-0000-000000000001
 
-# ╔═╡ e75270cd-5842-4132-9028-559135b9401f
-function init_rvq_stage(rng::AbstractRNG, d::Int, K::Int)
-    embedding = randn(rng, Float32, d, K) .* (1f0 / max(K, 1))
-    stage_rng = MersenneTwister(rand(rng, UInt))
-    return (;
-        embedding=embedding,
-        ema_cluster_size=ones(Float32, K),
-        ema_dw=copy(embedding),
-        dead_count=zeros(Int32, K),
-        rng=Lux.replicate(stage_rng),
+    @bind ui_mft_mode Select(
+        ["joint" => "K1×K2 (all joint codes)", "marginal" => "K1+K2 (marginal decomposition)"];
+        default="joint"
     )
-end
 
-# ╔═╡ f31b1233-fdc3-4cef-8836-1122a1b3e7d4
-function init_rvq_state(rng::AbstractRNG, d::Int, K::Tuple)
-    return (; stages=ntuple(i -> init_rvq_stage(rng, d, K[i]), length(K)))
-end
 
-# ╔═╡ b1a7fdb4-7263-496e-8f9f-4d8a4429f351
-begin
-	function vq_distances(embedding, z)
-	    z_sq = sum(abs2, z; dims=1)
-	    e_sq = sum(abs2, embedding; dims=1)
-	    return e_sq' .+ z_sq .- 2f0 .* (embedding' * z)
-	end
-	
-	_argmin_col_indices(idx::AbstractArray{<:CartesianIndex}) = getindex.(idx, 1)
-	_argmin_col_indices(idx::AbstractArray) = idx
-end
+# ╔═╡ ebb34459-2adf-4b90-8e06-2db4215548c8
 
-# ╔═╡ f8da318e-6ff2-4442-a737-28ff9d8f340a
-function assignment_matrix(indices, K::Int)
-    codes = reshape(collect(1:K), K, 1)
-    return Float32.(codes .== reshape(indices, 1, :))
-end
 
-# ╔═╡ fe5ee63d-6944-4557-834e-8e21231485f0
-function vq_lookup(embedding, z)
-    dist = vq_distances(embedding, z)
-    idx_raw = vec(argmin(dist; dims=1))
-    indices = vec(_argmin_col_indices(idx_raw))
-    enc = assignment_matrix(indices, size(embedding, 2))
-    z_q = embedding * enc
-    return z_q, indices
-end
-
-# ╔═╡ e635aa3f-19de-4ce9-a478-c1252ddb7979
-function counts_and_sums(z, indices, K::Int)
-    enc = assignment_matrix(indices, K)
-    counts = vec(sum(enc; dims=2))
-    sums = z * enc'
-    return counts, sums
-end
-
-# ╔═╡ 5e71db90-a0d1-47a4-bb32-dba21163e029
-function update_rvq_stage_state(stage, z, indices, decay::Float32, epsilon::Float32, dead_threshold::Int)
-    K = size(stage.embedding, 2)
-    z_detached = EnzymeCore.ignore_derivatives(z)
-    counts, sums = counts_and_sums(z_detached, indices, K)
-    ema_cluster_size = decay .* stage.ema_cluster_size .+ (1f0 - decay) .* counts
-    n = sum(ema_cluster_size)
-    ema_cluster_size = (ema_cluster_size .+ epsilon) ./ (n + Float32(K) * epsilon) .* n
-    ema_dw = decay .* stage.ema_dw .+ (1f0 - decay) .* sums
-    embedding = ema_dw ./ reshape(max.(ema_cluster_size, epsilon), 1, :)
-
-    dead = counts .< 0.5f0
-    dead_count = ifelse.(dead, stage.dead_count .+ Int32(1), Int32(0))
-    reset = dead_count .>= Int32(dead_threshold)
-    N = max(size(z_detached, 2), 1)
-    rng = Lux.replicate(stage.rng)
-    donor_idx = [1 + mod(k - 1, N) for k in 1:K]
-    donors = z_detached[:, donor_idx]
-    donors = donors .+ randn_like(rng, donors) .* 0.01f0
-    reset_mask = reshape(Float32.(reset), 1, K)
-    keep_mask = 1f0 .- reset_mask
-    embedding = embedding .* keep_mask .+ donors .* reset_mask
-    ema_dw = ema_dw .* keep_mask .+ donors .* reset_mask
-    ema_cluster_size = ifelse.(reset, 1f0, ema_cluster_size)
-    dead_count = ifelse.(reset, Int32(0), dead_count)
-    return (; embedding=Float32.(embedding), ema_cluster_size=Float32.(ema_cluster_size),
-        ema_dw=Float32.(ema_dw), dead_count=Int32.(dead_count), rng), counts
-end
-
-# ╔═╡ 0652338c-5ab5-463d-8a4f-1f2314a01ba8
-function probs_entropy(counts)
-    total = max(sum(counts), 1f-8)
-    p = counts ./ total
-    psafe = clamp.(p, 1f-10, 1f0)
-    entropy = -sum(psafe .* log.(psafe))
-    entropy_loss = sum(psafe .* log.(psafe))
-    perplexity = exp(entropy)
-    return perplexity, entropy_loss, entropy
-end
-
-# ╔═╡ 66ddf04d-ee60-4a0b-9444-d09af23685ea
-begin
-	function rvq_quantize(z_e, rvq_state, K::Tuple; beta_commit::Float32, ema_decay::Float32,
-	    epsilon::Float32, dead_threshold::Int, training::Bool)
-	    residual = z_e
-	    z_q_total = zero(z_e)
-	    stages = rvq_state.stages
-	    new_stages = stages
-	    all_indices = ()
-	    commit_loss = 0f0
-	    entropy_loss = 0f0
-	    perplexity_total = 0f0
-	    stage_perplexities = ()
-	
-	    for s in eachindex(K)
-	        stage = stages[s]
-	        z_q_detached, indices = EnzymeCore.ignore_derivatives(vq_lookup(stage.embedding, residual))
-	        if !training
-	            all_indices = (all_indices..., reshape(indices, 1, :))
-	        end
-	
-	        counts = if training
-	            new_stage, counts_local = update_rvq_stage_state(stage, residual, indices,
-	                ema_decay, epsilon, dead_threshold)
-	            new_stages = replace_tuple(new_stages, s, new_stage)
-	            counts_local
-	        else
-	            counts_and_sums(EnzymeCore.ignore_derivatives(residual), indices, K[s])[1]
-	        end
-	
-	        z_q = residual .+ EnzymeCore.ignore_derivatives(z_q_detached .- residual)
-	        z_q_total = z_q_total .+ z_q
-	        residual = residual .- EnzymeCore.ignore_derivatives(z_q_detached)
-	        commit_loss += beta_commit * mse_loss(residual .+ EnzymeCore.ignore_derivatives(z_q_detached),
-	            EnzymeCore.ignore_derivatives(z_q_detached))
-	        perplexity, stage_entropy_loss, _ = probs_entropy(counts)
-	        perplexity_total += perplexity
-	        if !training
-	            stage_perplexities = (stage_perplexities..., perplexity)
-	        end
-	        entropy_loss += stage_entropy_loss
-	    end
-	
-	    nstage = Float32(length(K))
-	    stage_indices = training ? nothing : vcat(all_indices...)
-	    coarse_indices = training ? nothing : all_indices[1]
-	    return (; z_q=z_q_total,
-	        stage_indices,
-	        coarse_indices=coarse_indices,
-	        commit_loss=commit_loss / nstage,
-	        entropy_loss=entropy_loss / nstage,
-	        perplexity=perplexity_total / nstage,
-	        stage_perplexities=(training ? nothing : stage_perplexities)), (; stages=new_stages)
-	end
-	
-	function prepare_rvq_payload(z_e, rvq_state, K::Tuple; ema_decay::Float32,
-	    epsilon::Float32, dead_threshold::Int, training::Bool)
-	    residual = z_e
-	    stages = rvq_state.stages
-	    new_stages = stages
-	    z_q_stages = ()
-	    counts_stages = ()
-	    entropy_loss = 0f0
-	    perplexity_total = 0f0
-	
-	    for s in eachindex(K)
-	        stage = stages[s]
-	        z_q_detached, indices = vq_lookup(stage.embedding, residual)
-	        z_q_stages = (z_q_stages..., Float32.(z_q_detached))
-	
-	        counts = if training
-	            new_stage, counts_local = update_rvq_stage_state(stage, residual, indices,
-	                ema_decay, epsilon, dead_threshold)
-	            new_stages = replace_tuple(new_stages, s, new_stage)
-	            counts_local
-	        else
-	            counts_and_sums(residual, indices, K[s])[1]
-	        end
-	
-	        counts_stages = (counts_stages..., Float32.(counts))
-	        residual = residual .- z_q_detached
-	        perplexity, stage_entropy_loss, _ = probs_entropy(counts)
-	        perplexity_total += perplexity
-	        entropy_loss += stage_entropy_loss
-	    end
-	
-	    nstage = Float32(length(K))
-	    payload = (;
-	        z_q_stages,
-	        counts_stages,
-	        entropy_loss=Float32(entropy_loss / nstage),
-	        perplexity=Float32(perplexity_total / nstage),
-	    )
-	    return payload, (; stages=new_stages)
-	end
-	
-	function rvq_quantize_precomputed(z_e, payload, K::Tuple; beta_commit::Float32)
-	    residual = z_e
-	    z_q_total = zero(z_e)
-	    commit_loss = 0f0
-	
-	    for s in eachindex(K)
-	        z_q_detached = EnzymeCore.ignore_derivatives(payload.z_q_stages[s])
-	        z_q = residual .+ EnzymeCore.ignore_derivatives(z_q_detached .- residual)
-	        z_q_total = z_q_total .+ z_q
-	        commit_loss += beta_commit * mse_loss(residual, z_q_detached)
-	        residual = residual .- z_q_detached
-	    end
-	
-	    nstage = Float32(length(K))
-	    return (; z_q=z_q_total,
-	        stage_indices=nothing,
-	        coarse_indices=nothing,
-	        commit_loss=commit_loss / nstage,
-	        entropy_loss=EnzymeCore.ignore_derivatives(payload.entropy_loss),
-	        perplexity=EnzymeCore.ignore_derivatives(payload.perplexity),
-	        stage_perplexities=nothing)
-	end
-end
+# ╔═╡ d1eec798-b7aa-4387-9a1e-71064e2660fd
+analysis_settings = (;
+    dt,
+    period_min,
+    period_max,
+    mft_nperiods,
+    mft_max_modes,
+    velocity_range,
+    bandwidth_factor,
+    zero_pad_factor,
+    use_latest_run_per_seed,
+)
 
 # ╔═╡ 1000000e-0000-0000-0000-000000000001
-md"## VQ-VAE Model"
-
-# ╔═╡ 1000000f-0000-0000-0000-000000000001
-begin
-	@concrete struct VQVAE <: AbstractLuxContainerLayer{(:encoder, :pre_vq, :decoder)}
-	    encoder <: AbstractLuxLayer
-	    pre_vq <: AbstractLuxLayer
-	    decoder <: AbstractLuxLayer
-	    K::Tuple
-	    d::Int
-	    latent_len::Int
-	    latent_time_start::Union{Nothing,Int}
-	    latent_time_end::Int
-	    beta_commit::Float32
-	    ema_decay::Float32
-	    epsilon::Float32
-	    dead_threshold::Int
-	end
-	
-	function Lux.initialparameters(rng::AbstractRNG, m::VQVAE)
-	    return (;
-	        encoder=Lux.initialparameters(rng, m.encoder),
-	        pre_vq=Lux.initialparameters(rng, m.pre_vq),
-	        decoder=Lux.initialparameters(rng, m.decoder),
-	    )
-	end
-	
-	function Lux.initialstates(rng::AbstractRNG, m::VQVAE)
-	    return (;
-	        encoder=Lux.initialstates(rng, m.encoder),
-	        pre_vq=Lux.initialstates(rng, m.pre_vq),
-	        decoder=Lux.initialstates(rng, m.decoder),
-	        rvq=init_rvq_state(rng, m.d, m.K),
-	    )
-	end
-	
-	function encoder_latents(m::VQVAE, x, ps, st)
-	    feat, st_enc = m.encoder(waveform_to_conv3(x), ps.encoder, st.encoder)
-	    L, C, B = size(feat)
-	    L == m.latent_len || error("Expected latent_len=$(m.latent_len), got $L.")
-	    feat_selected = isnothing(m.latent_time_start) ? feat :
-	        feat[m.latent_time_start:m.latent_time_end, :, :]
-	    Lsel = size(feat_selected, 1)
-	    feat_flat = reshape(permutedims(feat_selected, (2, 1, 3)), C * Lsel, B)
-	    z_e, st_pre = m.pre_vq(feat_flat, ps.pre_vq, st.pre_vq)
-	    return (; feat, feat_flat, z_e), (; encoder=st_enc, pre_vq=st_pre)
-	end
-	
-	function encode(m::VQVAE, ps, st, x; beta_commit::Float32=m.beta_commit, training::Bool=false)
-	    lat, st_lat = encoder_latents(m, x, ps, st)
-	    q, st_rvq = rvq_quantize(lat.z_e, st.rvq, m.K; beta_commit,
-	        ema_decay=m.ema_decay, epsilon=m.epsilon,
-	        dead_threshold=m.dead_threshold, training)
-	    st_new = (; encoder=st_lat.encoder, pre_vq=st_lat.pre_vq, decoder=st.decoder, rvq=st_rvq)
-	    return merge(lat, q), st_new
-	end
-
-	function encode_z_e_inference(m::VQVAE, ps, st, x)
-	    st = Lux.testmode(st)
-	    enc, _ = encode(m, ps, st, x; training=false)
-	    return enc.z_e
-	end
-
-    function encode_z_e_training(m::VQVAE, ps, st, x)
-        lat, _ = encoder_latents(m, x, ps, st)
-        return lat.z_e
+train_results = @use_memo([]) do
+    if train_button === missing || train_button == 0
+        nothing
+    elseif isnothing(compiled_model)
+        error("Compile model before training.")
+    else
+        vqvae.train_selected_pairs(
+            pairs_data_whitened, compiled_model;
+            seeds=run_seeds,
+            training_para=training_para,
+            save_root=joinpath(data_filepath, "SavedModels", "vqvae_v8"),
+            device=training_device,
+            analysis_settings,
+        )
     end
-
-	function decode_from_latents(m::VQVAE, ps, st, result)
-	    xhat, st_dec = m.decoder(result.z_q, ps.decoder, st.decoder)
-	    return merge(result, (; xhat)), merge(st, (; decoder=st_dec))
-	end
-
-	function (m::VQVAE)(x, ps, st; beta_commit::Float32=m.beta_commit, training::Bool=true)
-	    enc, st_enc = encode(m, ps, st, x; beta_commit, training)
-	    return decode_from_latents(m, ps, st_enc, enc)
-	end
-
-    function forward_with_precomputed_vq(m::VQVAE, x, ps, st, payload;
-        beta_commit::Float32=m.beta_commit)
-        lat, st_lat = encoder_latents(m, x, ps, st)
-        q = rvq_quantize_precomputed(lat.z_e, payload, m.K; beta_commit)
-        st_mid = (; encoder=st_lat.encoder, pre_vq=st_lat.pre_vq,
-            decoder=st.decoder, rvq=st.rvq)
-        return decode_from_latents(m, ps, st_mid, merge(lat, q))
-    end
-	
-	codebook_size(m::VQVAE) = m.K[1]
-	num_rvq_stages(m::VQVAE) = length(m.K)
-	get_codebook(st, stage::Int=1) = Array(st.rvq.stages[stage].embedding)
-	get_codebooks(st) = [Array(stage.embedding) for stage in st.rvq.stages]
 end
 
 # ╔═╡ 10000010-0000-0000-0000-000000000001
-function get_vqvae(para::VQVAE_Para; rng=Random.default_rng(), device=identity)
-    isempty(para.K) && error("K must contain at least one RVQ stage size.")
-    all(>(1), para.K) || error("All K entries must be > 1.")
-    Random.seed!(rng, para.seed)
+result_pair_options = if isnothing(train_results)
+    String[]
+else
+    unique(["$(result.pair[1])-$(result.pair[2])" for result in train_results])
+end
 
-    encoder = make_encoder(para)
-    ps_enc, st_enc = Lux.setup(rng, encoder)
-    dummy = randn(rng, Float32, para.nt, 2)
-    enc_dummy, _ = encoder(waveform_to_conv3(dummy), ps_enc, Lux.testmode(st_enc))
-    latent_len, enc_channels, _ = size(enc_dummy)
+# ╔═╡ 3c23d4cb-4bf9-4b4b-a57f-fefdc8f29cf1
+selected_result_pair_ui = @bind selected_result_pair_label Select(
+    isempty(result_pair_options) ? ["No training results"] : result_pair_options
+)
 
-    latent_time_start, latent_time_end = compute_latent_window(para)
-    if isnothing(latent_time_start)
-        latent_time_end = latent_len
-        pre_vq_in = latent_len * enc_channels
+# ╔═╡ 928d4238-216b-4f62-a4d7-62075275252b
+selected_result_pair_ui
+
+# ╔═╡ 3ef20afc-4c62-4aab-b96f-4e170f8d96dc
+result_seed_options = if isnothing(train_results) || isempty(result_pair_options)
+    String[]
+else
+    sort(unique([
+        string(result.seed)
+        for result in train_results
+        if "$(result.pair[1])-$(result.pair[2])" == selected_result_pair_label
+    ]))
+end
+
+# ╔═╡ 3ef20afc-4c62-4aab-b96f-4e170f8d96dd
+selected_result_seed_ui = @bind selected_result_seed_label Select(
+    isempty(result_seed_options) ? ["No trained seeds"] : result_seed_options
+)
+
+# ╔═╡ 3ef20afc-4c62-4aab-b96f-4e170f8d96de
+selected_result_seed_ui
+
+# ╔═╡ ea4761ee-461d-4429-a13a-e872ae52cc66
+selected_result_seed_ui
+
+# ╔═╡ f41c2e62-efbf-47c8-8b7e-adf828ffde4f
+selected_result = begin
+    if isnothing(train_results) || isempty(result_seed_options)
+        nothing
     else
-        latent_time_start <= latent_time_end ||
-            error("latent_time_start=$(latent_time_start) must be <= latent_time_end=$(latent_time_end).")
-        latent_time_start >= 1 && latent_time_end <= latent_len ||
-            error("latent-time interval [$latent_time_start, $latent_time_end] is out of latent length $latent_len.")
-        pre_vq_in = (latent_time_end - latent_time_start + 1) * enc_channels
+        idx = findfirst(result -> "$(result.pair[1])-$(result.pair[2])" == selected_result_pair_label &&
+            string(result.seed) == selected_result_seed_label, train_results)
+        isnothing(idx) ? nothing : train_results[idx]
     end
-
-    pre_vq = Dense(pre_vq_in, para.d)
-    decoder = make_decoder(para, latent_len)
-    ps_dec, st_dec = Lux.setup(rng, decoder)
-    dec_dummy, _ = decoder(randn(rng, Float32, para.d, 2), ps_dec, Lux.testmode(st_dec))
-    size(dec_dummy, 1) == para.nt ||
-        error("Decoder geometry mismatch: output length $(size(dec_dummy, 1)) != nt $(para.nt). Adjust decoder strides/kernels.")
-    model = VQVAE(encoder, pre_vq, decoder, Tuple(Int.(para.K)),
-        para.d, latent_len, latent_time_start, latent_time_end,
-        para.beta_commit, para.ema_decay,
-        para.epsilon, para.dead_threshold)
-    ps, st = Lux.setup(rng, model)
-    ps, st = (ps, st) |> device
-
-    loss_history = (;
-        train_objective=Float32[],
-        train_target_mse=Float32[],
-        train_commit=Float32[],
-        train_entropy=Float32[],
-        train_perplexity=Float32[],
-        test_recon_mse=Float32[],
-        epoch_time_s=Float32[],
-        throughput=Float32[],
-    )
-    @info "VQ-VAE v7 geometry" nt=para.nt d=para.d latent_len K=para.K enc_channels interstation_distance=para.interstation_distance latent_time_start latent_time_end
-    return model, ps, st, loss_history
 end
 
 # ╔═╡ 10000011-0000-0000-0000-000000000001
-md"## Losses and kNN Targets"
-
-# ╔═╡ 13634a6c-abda-4084-9b5b-f6761fd728ad
-begin
-	function vqvae_loss(model, ps, st, x, target, para::VQVAE_Para; training::Bool)
-	    result, st_new = model(x, ps, st; beta_commit=para.beta_commit, training)
-	    recon_loss = mse_loss(result.xhat, target)
-	    total = recon_loss + result.commit_loss + para.entropy_weight * result.entropy_loss
-	    return total, st_new, (; result, recon_loss,
-	        commit_loss=result.commit_loss, entropy_loss=result.entropy_loss,
-	        perplexity=result.perplexity, stage_perplexities=result.stage_perplexities)
-	end
-	
-	function vqvae_precomputed_loss(model, ps, st, batch, para::VQVAE_Para)
-	    result, st_new = forward_with_precomputed_vq(
-	        model, batch.x, ps, st, batch.vq_payload; beta_commit=para.beta_commit
-	    )
-	    recon_loss = mse_loss(result.xhat, batch.target)
-	    total = recon_loss + result.commit_loss + para.entropy_weight * result.entropy_loss
-	    return total, st_new, (; result, recon_loss,
-	        commit_loss=result.commit_loss, entropy_loss=result.entropy_loss,
-	        perplexity=result.perplexity, stage_perplexities=result.stage_perplexities)
-	end
+if isnothing(selected_result)
+    md"Compile selected pairs, then press **Train compiled pairs** to create v8 runs."
+else
+    WideCell(vqvae.plot_training_dashboard(selected_result.loss_history;
+        title="VQ-VAE v8 Training Dashboard ($(result_title_context(selected_result)))"))
 end
-
-# ╔═╡ 8950cf6d-f5d2-4bcc-90ab-12ecf79f7c35
-
-
-# ╔═╡ 91a4fb9f-f5d4-406f-b384-282d8a48257f
-begin
-	@concrete struct VQVAELoss
-	    para
-	end
-	function (l::VQVAELoss)(model, ps, st, batch)
-	    return vqvae_precomputed_loss(model, ps, st, batch, l.para)
-	end
-end
-
-# ╔═╡ 86dfe031-7e05-402b-8916-cc2d2758e6b4
-begin
-	mutable struct LatentIndex
-	    embeddings::Matrix{Float32}
-	    neighbor_ids::Matrix{Int}
-	    dist_matrix::Matrix{Float32}
-	    perm_scratch::Vector{Vector{Int}}
-	    Mnn::Int
-	end
-	LatentIndex(Mnn::Int) = LatentIndex(zeros(Float32, 0, 0), zeros(Int, Mnn, 0), zeros(Float32, 0, 0), Vector{Int}[], Mnn)
-end
-
-# ╔═╡ 092511ab-104e-4577-8cf5-dc6deeb73ac7
-function _l2_normalize_columns!(X::AbstractMatrix{Float32})
-    for j in axes(X, 2)
-        nrm = sqrt(sum(abs2, view(X, :, j)))
-        X[:, j] ./= Float32(nrm + 1f-8)
-    end
-    return X
-end
-
-# ╔═╡ b1e8b57a-0fa3-492a-a3a1-036423f41373
-function rebuild_latent_index!(idx::LatentIndex, model, ps, st, X;
-    Mnn::Int=idx.Mnn, device=identity, cdev=default_cdev(), encode_compiled=nothing,
-    knn_search_chunk_size_fraction::Float64=1.0)
-    X_cpu = Float32.(cdev(flatten_batch(X)))
-    _, N = size(X_cpu)
-    Mnn >= 1 || error("Mnn must be >= 1.")
-    N >= Mnn + 1 || error("Need at least Mnn + 1 samples; got N=$N and Mnn=$Mnn.")
-    D = model.d
-    chunk_size = max(Mnn + 1, round(Int, knn_search_chunk_size_fraction * N))
-    approximate = chunk_size < N
-    if isnothing(encode_compiled) && device isa ReactantDevice
-        error("A compiled encoder is required to rebuild the latent index on a Reactant device. Ensure encode_z_e_inference compiles successfully.")
-    end
-    embeddings = Matrix{Float32}(undef, D, N)
-    ps_dev = device(ps)
-    st_eval = Lux.testmode(device(st))
-    embedding_start = time()
-    if isnothing(encode_compiled)
-        enc, _ = encode(model, ps_dev, st_eval, device(X_cpu); training=false)
-        embeddings .= Float32.(cdev(enc.z_e))
-    else
-        z_dev = encode_compiled(model, ps_dev, st_eval, device(X_cpu))
-        embeddings .= Float32.(cdev(z_dev))
-    end
-    embedding_time = time() - embedding_start
-    normalize_start = time()
-    _l2_normalize_columns!(embeddings)
-    normalize_time = time() - normalize_start
-    knn_start = time()
-    nthreads = Threads.nthreads() + 1
-    neighbor_ids = Matrix{Int}(undef, Mnn, N)
-    if approximate
-        # Partition a random permutation of 1:N into chunks of chunk_size.
-        # Every query in the same chunk shares the same candidate set → one
-        # Distances.pairwise! call per chunk (chunk_size×chunk_size dot products)
-        # instead of N individual BLAS calls.
-        perm = MLUtils.randperm(N)
-        # candidate_ids[:,j] = chunk_size candidate indices for query j (self at end)
-        candidate_ids = Matrix{Int}(undef, chunk_size, N)
-        # score buffer: chunk_size × N; each column holds intra-chunk cosine sims for j
-        if size(idx.dist_matrix) != (chunk_size, N)
-            idx.dist_matrix = Matrix{Float32}(undef, chunk_size, N)
-        end
-        chunk_emb    = Matrix{Float32}(undef, D, chunk_size)           # preallocated, reused per chunk
-        chunk_scores = Matrix{Float32}(undef, chunk_size, chunk_size)   # preallocated, reused per chunk
-        num_chunks = cld(N, chunk_size)
-        for ci in 1:num_chunks
-            chunk_start = (ci - 1) * chunk_size + 1
-            chunk_end   = min(ci * chunk_size, N)
-            chunk       = view(perm, chunk_start:chunk_end)
-            nc          = length(chunk)   # may be < chunk_size for the last chunk
-            # gather embeddings for this chunk's members
-            chunk_emb_view = view(chunk_emb, :, 1:nc)
-            chunk_emb_view .= view(embeddings, :, chunk)
-            # pairwise cosine similarities within chunk: nc × nc (L2-normalised → dot product)
-            chunk_scores_view = view(chunk_scores, 1:nc, 1:nc)
-            Distances.pairwise!(CosineDist(), chunk_scores_view, chunk_emb_view; dims=2)
-            # fill candidate_ids and dist_matrix columns for each member of this chunk
-            for (li, j) in enumerate(chunk)
-                cands = view(candidate_ids, :, j)
-                cands[1:nc] .= chunk
-                # pad short last chunk by wrapping within the same chunk
-                for fi in nc+1:chunk_size
-                    cands[fi] = chunk[mod1(fi, nc)]
-                end
-                # copy distances from the pairwise matrix; self-distance (0.0) is at position li
-                scores = view(idx.dist_matrix, :, j)
-                scores[1:nc] .= view(chunk_scores_view, :, li)
-                scores[li] = Inf32              # exclude self (CosineDist(x,x) == 0)
-                scores[nc+1:chunk_size] .= Inf32   # padded slots never selected
-            end
-        end
-        if length(idx.perm_scratch) != nthreads || (!isempty(idx.perm_scratch) && length(idx.perm_scratch[1]) != chunk_size)
-            idx.perm_scratch = [collect(1:chunk_size) for _ in 1:nthreads]
-        end
-        Threads.@threads for j in 1:N
-            # CosineDist: smaller = more similar; exclude self (+Inf) and padding (+Inf)
-            top_k = partialsortperm!(idx.perm_scratch[Threads.threadid()],
-                view(idx.dist_matrix, 1:chunk_size, j), 1:Mnn; rev=false)
-            neighbor_ids[:, j] .= view(candidate_ids, top_k, j)
-        end
-    else
-        if size(idx.dist_matrix) != (N, N)
-            idx.dist_matrix = Matrix{Float32}(undef, N, N)
-        end
-        if length(idx.perm_scratch) != nthreads || (!isempty(idx.perm_scratch) && length(idx.perm_scratch[1]) != N)
-            idx.perm_scratch = [collect(1:N) for _ in 1:nthreads]
-        end
-        mul!(idx.dist_matrix, embeddings', embeddings)
-        for j in 1:N; idx.dist_matrix[j, j] = -Inf32; end   # zero diagonal before threaded read
-        Threads.@threads for j in 1:N
-            top_k = partialsortperm!(idx.perm_scratch[Threads.threadid()],
-                view(idx.dist_matrix, :, j), 1:Mnn; rev=true)
-            neighbor_ids[:, j] .= top_k
-        end
-    end
-    knn_time = time() - knn_start
-    @debug "Latent index rebuild breakdown" N D Mnn chunk_size approximate julia_threads=Threads.nthreads() embedding_time_s=round(embedding_time; digits=3) normalize_time_s=round(normalize_time; digits=3) knn_time_s=round(knn_time; digits=3)
-    idx.embeddings = embeddings
-    idx.neighbor_ids = neighbor_ids
-    idx.Mnn = Mnn
-    return idx
-end
-
-# ╔═╡ 2f88be66-ffea-4d0e-8ea5-65a39b7d10db
-function build_ensemble_targets(X, idx::LatentIndex, batch_indices::AbstractVector{<:Integer};
-    Mnn::Int=idx.Mnn)
-    X_cpu = Float32.(flatten_batch(X))
-    T = size(X_cpu, 1)
-    targets = Matrix{Float32}(undef, T, length(batch_indices))
-    @inbounds for (b, i_raw) in enumerate(batch_indices)
-        nbrs = idx.neighbor_ids[1:Mnn, Int(i_raw)]
-        col = view(targets, :, b)
-        fill!(col, 0f0)
-        for j in nbrs
-            col .+= view(X_cpu, :, j)
-        end
-        col ./= Float32(Mnn)
-    end
-    return targets
-end
-
-# ╔═╡ 2ee07196-8b28-418c-a0d4-40866584bc6f
-function ensemble_phase(epoch::Int, training_para::VQVAE_Training_Para)
-    post_epoch = epoch - training_para.warmup_epochs
-    post_epoch <= 0 && return (; post_epoch=0, Mnn=0)
-    phase = training_para.Mnn_schedule[1]
-    for candidate in training_para.Mnn_schedule
-        candidate[1] <= post_epoch || break
-        phase = candidate
-    end
-    return (; post_epoch, Mnn=phase[2])
-end
-
-# ╔═╡ 5c9d71d1-c6a6-4968-814d-66506a78b516
-max_Mnn(training_para::VQVAE_Training_Para) =
-    isnothing(training_para.Mnn) ? maximum(p[2] for p in training_para.Mnn_schedule) : training_para.Mnn
 
 # ╔═╡ 10000013-0000-0000-0000-000000000001
-md"## Training"
-
-# ╔═╡ 5e716b73-ab88-4b84-a8bf-dd064dc82fd8
-function make_batches(X_cpu::AbstractMatrix{Float32}, batchsize::Int; shuffle::Bool=true)
-    N = size(X_cpu, 2)
-    ids = collect(1:N)
-    shuffle && Random.shuffle!(ids)
-    batches = NamedTuple[]
-    for start_idx in 1:batchsize:(N - batchsize + 1)
-        batch_ids = ids[start_idx:start_idx + batchsize - 1]
-        push!(batches, (; indices=batch_ids, x=X_cpu[:, batch_ids]))
-    end
-    return batches
+if isnothing(selected_result)
+    md""
+else
+    WideCell(vqvae.plot_codebook_heatmap(selected_result.st; stage=1,
+        title="RVQ Stage 1 Codebook ($(result_title_context(selected_result)))"))
 end
 
-# ╔═╡ 2d6639d1-ae40-46d0-a811-e1fd34a23613
-begin
-	function batch_with_target(batch, X_cpu, idx::Union{Nothing,LatentIndex},
-	    epoch::Int, training_para::VQVAE_Training_Para; device=identity)
-	    phase = ensemble_phase(epoch, training_para)
-	    target = if phase.post_epoch == 0 || isnothing(idx)
-	        batch.x
-	    else
-	        build_ensemble_targets(X_cpu, idx, batch.indices; Mnn=phase.Mnn)
-	    end
-	    return (; x=device(batch.x), target=device(Float32.(target)))
-	end
-	
-	function make_batch_target(batch, X_cpu, idx::Union{Nothing,LatentIndex},
-	    epoch::Int, training_para::VQVAE_Training_Para, ensemble_targets_cpu::Union{Nothing,AbstractMatrix}=nothing)
-	    phase = ensemble_phase(epoch, training_para)
-	    if phase.post_epoch == 0 || isnothing(idx)
-	        return batch.x
-	    end
-	    if !isnothing(ensemble_targets_cpu)
-	        return ensemble_targets_cpu[:, batch.indices]
-	    end
-	    return build_ensemble_targets(X_cpu, idx, batch.indices; Mnn=phase.Mnn)
-	end
-	
-	function replace_train_state_states(train_state, states)
-	    return Training.TrainState(
-	        train_state.cache,
-	        train_state.objective_function,
-	        train_state.allocator_cache,
-	        train_state.model,
-	        train_state.parameters,
-	        states,
-	        train_state.optimizer,
-	        train_state.optimizer_state,
-	        train_state.step,
-	    )
-	end
-	
-	function prepare_vq_training_batch(model, ps, st, batch, X_cpu, idx::Union{Nothing,LatentIndex},
-	    epoch::Int, para::VQVAE_Para, training_para::VQVAE_Training_Para;
-	    device=identity, cdev=default_cdev(), encode_compiled=nothing,
-	    ensemble_targets_cpu=nothing)
-	    target_start = time()
-	    target_cpu = make_batch_target(batch, X_cpu, idx, epoch, training_para, ensemble_targets_cpu)
-	    target_time = time() - target_start
-	    pack_start = time()
-	    if training_para.normalize_target
-	        target_cpu = Float32.(MLUtils.normalise(target_cpu; dims=1))
-	    end
-	    bdev = (; x=device(batch.x), target=device(Float32.(target_cpu)))
-	    pack_time = time() - pack_start
-	    payload_start = time()
-	    if isnothing(encode_compiled)
-	        ps_cpu = cdev(ps)
-	        st_cpu = Lux.testmode(cdev(st))
-	        lat, _ = encoder_latents(model, batch.x, ps_cpu, st_cpu)
-	        z_e_cpu = lat.z_e
-	        rvq_cpu = st_cpu.rvq
-	    else
-	        z_e_cpu = Float32.(cdev(encode_compiled(model, ps, Lux.testmode(st), device(batch.x))))
-	        rvq_cpu = cdev(st.rvq)
-	    end
-	    payload_cpu, rvq_cpu = prepare_rvq_payload(z_e_cpu, rvq_cpu, model.K;
-	        ema_decay=para.ema_decay,
-	        epsilon=para.epsilon,
-	        dead_threshold=para.dead_threshold,
-	        training=true)
-	    st_dev = merge(st, (; rvq=device(rvq_cpu)))
-	    payload_time = time() - payload_start
-	    return merge(bdev, (; vq_payload=device(payload_cpu))), st_dev, (; target_time, pack_time, payload_time)
-	end
+# ╔═╡ 10000014-0000-0000-0000-000000000001
+if isnothing(selected_result)
+    md""
+else
+    WideCell(vqvae.plot_reconstruction_examples(
+        selected_result.model,
+        selected_result.ps,
+        selected_result.st,
+        selected_result.data.D_ac_all;
+        nsamples=8,
+        dt=dt,
+        device=training_device,
+        title="Acausal Reconstruction Examples ($(result_title_context(selected_result)))",
+    ))
 end
 
-# ╔═╡ cf13347d-e1fa-4ec1-86dc-38299825f65b
-begin
-	function recon_mse_inference(model, ps, st, x; normalize_target::Bool=false)
-	    target = normalize_target ? Float32.(MLUtils.normalise(x; dims=1)) : x
-	    result, _ = model(x, ps, Lux.testmode(st); training=false)
-	    return mse_loss(result.xhat, target)
-	end
-	
-	function record_train_metrics!(loss_history, train_m, test_recon_mse::Real,
-	    epoch_time::Real, throughput::Real)
-	    push!(loss_history.train_objective, train_m.total)
-	    push!(loss_history.train_target_mse, train_m.recon_loss)
-	    push!(loss_history.train_commit, train_m.commit_loss)
-	    push!(loss_history.train_entropy, train_m.entropy_loss)
-	    push!(loss_history.train_perplexity, train_m.perplexity)
-	    push!(loss_history.test_recon_mse, Float32(test_recon_mse))
-	    push!(loss_history.epoch_time_s, Float32(epoch_time))
-	    push!(loss_history.throughput, Float32(throughput))
-	    return loss_history
-	end
+# ╔═╡ 13c7f289-d698-453f-a9b1-65bf2c87f465
+if isnothing(selected_result)
+    md""
+else
+    WideCell(vqvae.plot_reconstruction_examples(
+        selected_result.model,
+        selected_result.ps,
+        selected_result.st,
+        selected_result.data.D_c_all;
+        nsamples=8,
+        dt=dt,
+        device=training_device,
+        title="Causal Reconstruction Examples ($(result_title_context(selected_result)))",
+    ))
 end
 
-# ╔═╡ 7ec9f7d7-d311-4a53-9c7c-cb07dfd8c093
-function maybe_compile_inference(model, ps, st, sample_x, training_para::VQVAE_Training_Para;
-    device=identity, sample_batch_x=nothing, compile_latent_index::Bool=true,
-    compile_train_encoder::Bool=true)
-    start = time()
-    st_eval = Lux.testmode(st)
-    encode_z_e_compiled = if compile_latent_index
-        try
-            @compile encode_z_e_inference(model, ps, st_eval, sample_x)
-        catch err
-            error("Reactant @compile failed for latent-index encoder. Cannot rebuild latent index without compiled encoder path: $(err)")
-        end
+# ╔═╡ 10000016-0000-0000-0000-000000000001
+state_averages = if isnothing(selected_result)
+    nothing
+else
+    vqvae.source_state_averages(
+        selected_result.model,
+        selected_result.ps,
+        selected_result.st,
+        selected_result.data;
+        device=training_device,
+    )
+end
+
+# ╔═╡ 10000019-0000-0000-0000-000000000001
+if isnothing(state_averages)
+    md""
+else
+    _hist_labels = hasproperty(state_averages, :combo_labels) ? state_averages.combo_labels : nothing
+    WideCell(vqvae.plot_cluster_histogram(state_averages.counts_ac, state_averages.counts_c;
+        title="Source State Usage ($(result_title_context(selected_result)))",
+        labels=_hist_labels))
+end
+
+# ╔═╡ c19d4c52-4a33-11f1-a3fa-677e8b10e883
+display_averages = if isnothing(state_averages)
+    nothing
+else
+    _mode = @isdefined(ui_mft_mode) ? ui_mft_mode : "joint"
+    _K = selected_result.para.K
+    if _mode == "marginal" && hasproperty(state_averages, :combo_labels) && length(_K) >= 2
+        K1, K2 = _K[1], _K[2]
+        dec_ac = vqvae.marginal_decomposition(
+            state_averages.acausal, state_averages.counts_ac; K1, K2)
+        dec_c = vqvae.marginal_decomposition(
+            state_averages.causal, state_averages.counts_c; K1, K2)
+        W = reshape(state_averages.counts_ac, K1, K2)
+        W2 = reshape(state_averages.counts_c, K1, K2)
+        (; acausal=hcat(dec_ac.stage1_waves, dec_ac.stage2_waves),
+           causal=hcat(dec_c.stage1_waves, dec_c.stage2_waves),
+           counts_ac=vcat(vec(sum(W; dims=2)), vec(sum(W; dims=1))),
+           counts_c=vcat(vec(sum(W2; dims=2)), vec(sum(W2; dims=1))),
+           labels=vcat(dec_ac.stage1_labels, dec_ac.stage2_labels))
     else
-        nothing
+        combo_labels = hasproperty(state_averages, :combo_labels) ?
+            state_averages.combo_labels : string.(1:size(state_averages.acausal, 2))
+        (; acausal=state_averages.acausal, causal=state_averages.causal,
+           counts_ac=state_averages.counts_ac, counts_c=state_averages.counts_c,
+           labels=combo_labels)
     end
-    st_payload = Lux.testmode(st)
-    train_sample = isnothing(sample_batch_x) ? sample_x : sample_batch_x
-    encode_z_e_train_compiled = if compile_train_encoder
-        try
-            @compile encode_z_e_training(model, ps, st_payload, train_sample)
-        catch err
-            error("Reactant @compile failed for training-batch encoder. Cannot prepare VQ payload efficiently: $(err)")
-        end
-    else
-        nothing
-    end
-    @info "Reactant inference compile complete" N=size(sample_x, 2) batch_N=size(train_sample, 2) compile_time_s=round(time() - start; digits=3) encode_compiled=!isnothing(encode_z_e_compiled) train_encode_compiled=!isnothing(encode_z_e_train_compiled)
-    return (; encode_z_e=encode_z_e_compiled, encode_z_e_train=encode_z_e_train_compiled)
-end
-
-# ╔═╡ 3442ef19-bf2f-4ebf-94fd-bce4dd378745
-begin
-	enzyme_training_backend() = AutoEnzyme(mode=EnzymeCore.set_runtime_activity(EnzymeCore.Reverse))
-	
-	function training_backend(training_para::VQVAE_Training_Para, device)
-	    backend = training_para.autodiff_backend
-	    if backend === :auto
-	        backend = device isa ReactantDevice ? :enzyme : :zygote
-	    end
-	    backend === :zygote && return AutoZygote()
-	    backend === :enzyme && return enzyme_training_backend()
-	    error("Unsupported autodiff_backend=$(training_para.autodiff_backend). Use :auto, :zygote, or :enzyme.")
-	end
-end
-
-# ╔═╡ 10000015-0000-0000-0000-000000000001
-md"## Data Loading and Pair Loop"
-
-# ╔═╡ 566e6a4c-1153-4c6c-bf2b-385478f684c4
-function taper(x)
-    w = cat(tukey(size(x, 1), 0.1), dims=ndims(x))
-    return w .* x
-end
-
-# ╔═╡ a1e5a8cb-0bd1-44b8-8cd4-c95a667d830d
-function get_acausal_causal(pair::String, filepath::String)
-    matches = filter(x -> occursin(pair, basename(x)), readdir(filepath, join=true))
-    isempty(matches) && error("No JLD2 file matching pair $(pair) found in $(filepath).")
-    jldfile = load(matches[1])
-    correlations = haskey(jldfile, "correlations") ? jldfile["correlations"] : jldfile["D"][1]
-    headers = haskey(jldfile, "headers") ? jldfile["headers"] : nothing
-    distance = haskey(jldfile, "dist") ? Float64(jldfile["dist"]) :
-        (haskey(jldfile, "Distances") ? Float64(jldfile["Distances"][1]) : nothing)
-    return (; correlations, headers, distance)
-end
-
-# ╔═╡ 0b79d043-0805-43b3-80d7-f64d2018525f
-function split_causal_acausal(X::AbstractMatrix, zero_lag::Bool, max_lag=nothing)
-    nt, ntr = size(X)
-    !isodd(nt) && error("nt should be odd.")
-    center = div(nt + 1, 2)
-    half = div(nt - 1, 2)
-    N = isnothing(max_lag) ? half : max(0, min(half, max_lag))
-    X_acausal = reverse(X[center-N:center-1, :], dims=1)
-    X_causal = X[center+1:center+N, :]
-    if zero_lag
-        return vcat(zeros(1, ntr), Array(X_acausal)), vcat(zeros(1, ntr), Array(X_causal))
-    end
-    return Array(X_acausal), Array(X_causal)
-end
-
-# ╔═╡ 4b8ffb0f-23b0-443d-b4c7-12a3ed4ac76d
-function build_training_bundle(pair::Tuple{String,String}; filepath::String, dt::Real=1.0,
-    period_min::Real=10, period_max::Real=50)
-    pair_name = join(pair, "_")
-    raw = get_acausal_causal(pair_name, filepath)
-    D1 = normalise(raw.correlations, dims=1)
-    D1ac, D1c = split_causal_acausal(D1, true)
-    responsetype = Bandpass(inv(period_max), inv(period_min))
-    designmethod = Butterworth(2)
-    digfilter = digitalfilter(responsetype, designmethod; fs=inv(dt))
-    D1fac = filtfilt(digfilter, taper(D1ac))
-    D1fc = filtfilt(digfilter, taper(D1c))
-    D1fac = Float32.(normalise(D1fac[2:end, :], dims=1))
-    D1fc = Float32.(normalise(D1fc[2:end, :], dims=1))
-    return (; pair, D1=Float32.(D1), D1fac, D1fc, distance=raw.distance)
-end
-
-# ╔═╡ 8dd1c50c-587c-471d-bc80-cd77012302a9
-function make_pooled_split(D1fac, D1fc; at=0.9, shuffle=true)
-    D_all = Float32.(hcat(D1fac, D1fc))
-    nw = size(D_all, 2)
-    idx = collect(1:nw)
-    shuffle && Random.shuffle!(idx)
-    ntrain = round(Int, at * nw)
-    train_idx = idx[1:ntrain]
-    test_idx = idx[ntrain+1:end]
-    return (; D_train=D_all[:, train_idx], D_test=D_all[:, test_idx],
-        D_all, D_ac_all=Float32.(D1fac), D_c_all=Float32.(D1fc))
-end
-
-# ╔═╡ 7e26f064-6a32-41ce-b416-90a04adfbcc9
-function pair_run_dir(save_root::String, pair, timestamp=now())
-    pair_str = join(pair, "_")
-    run_tag = Dates.format(timestamp, "yyyymmdd_HHMMSS")
-    return joinpath(save_root, pair_str, run_tag)
-end
-
-# ╔═╡ a6066ca6-1350-4c54-9857-99d195873e6c
-function save_vqvae_run(run_dir; model, ps, st, para, training_para, loss_history, pair, data_bundle)
-    mkpath(run_dir)
-    cdev = default_cdev()
-    jldsave(joinpath(run_dir, "model_state.jld2");
-        ps=cdev(ps), st=cdev(st), codebooks=get_codebooks(cdev(st)))
-    jldsave(joinpath(run_dir, "parameters.jld2");
-        vqvae_para=para, training_para=training_para, pair=pair,
-        distance=data_bundle.distance)
-    jldsave(joinpath(run_dir, "loss_history.jld2"); loss_history)
-    @info "Saved v7 VQ-VAE run" run_dir
-    return run_dir
 end
 
 # ╔═╡ 10000017-0000-0000-0000-000000000001
-md"## Analysis and Plotting"
-
-# ╔═╡ 2f151b20-b956-404d-8fee-1e9cddfd6b62
-function get_cluster_percentages(model, ps, st, x; stage::Int=1, return_labels::Bool=false,
-    device=identity, cdev=default_cdev())
-    x_cpu = Float32.(cdev(flatten_batch(x)))
-    res, _ = encode(model, cdev(ps), Lux.testmode(cdev(st)), x_cpu; training=false)
-    idx = vec(Array(cdev(res.stage_indices[stage, :])))
-    K = model.K[stage]
-    counts = zeros(Float32, K)
-    for k in idx
-        counts[Int(k)] += 1f0
-    end
-    pct = counts ./ max(sum(counts), 1f-8) .* 100f0
-    labels = string.(1:K)
-    return return_labels ? (; percentages=pct, labels) : pct
+if isnothing(state_averages)
+    md""
+else
+    WideCell(vqvae.plot_state_average_matrix(display_averages.acausal;
+        title="Acausal Source-State Averages ($(result_title_context(selected_result)))",
+        dt=dt, reverse_time=false))
 end
 
-# ╔═╡ b478bec8-14f6-4d78-89e5-2e76414c4d46
-function select_state_indices_from_codes(ci::AbstractMatrix{<:Integer}, state_tuple::Tuple)
-    mask = trues(size(ci, 2))
-    Tlocal = min(length(state_tuple), size(ci, 1))
-    for t in 1:Tlocal
-        mask .&= vec(ci[t, :]) .== state_tuple[t]
-    end
-    return findall(mask)
+# ╔═╡ 10000018-0000-0000-0000-000000000001
+if isnothing(state_averages)
+    md""
+else
+    WideCell(vqvae.plot_state_average_matrix(display_averages.causal;
+        title="Causal Source-State Averages ($(result_title_context(selected_result)))",
+        dt=dt, reverse_time=false))
 end
 
-# ╔═╡ 615f47c0-d72c-41f8-914e-7608b3b8c6d2
-function cluster_averages_from_codes(x_cpu, ci; K::Int, stage::Int=1)
-    nt = size(x_cpu, 1)
-    out = zeros(Float32, nt, K)
-    counts = zeros(Int, K)
-    labels = vec(ci[stage, :])
-    for j in eachindex(labels)
-        k = Int(labels[j])
-        out[:, k] .+= x_cpu[:, j]
-        counts[k] += 1
-    end
-    for k in 1:K
-        counts[k] > 0 && (out[:, k] ./= counts[k])
-    end
-    return (; averages=out, counts)
-end
+# ╔═╡ b11c9e24-6593-497c-a706-146619251e36
+if isnothing(selected_result) || isnothing(state_averages)
+    md""
+else
+    let
+        cluster_avg_ac = normalise(display_averages.acausal, dims=1)
+        cluster_avg_c = normalise(display_averages.causal, dims=1)
+        nth = size(cluster_avg_ac, 1)
+        t_neg = [-(nth - i + 1) * dt for i in 1:nth]
+        t_pos = [i * dt for i in 1:nth]
+        t_full = [t_neg; t_pos]
 
-# ╔═╡ db53da0e-96ce-4a75-bcfc-32fdc4ffe064
-function encoded_cache(model, ps, st, data; device=identity, cdev=default_cdev())
-    ps_cpu = cdev(ps)
-    st_eval = Lux.testmode(cdev(st))
-    res_ac, _ = encode(model, ps_cpu, st_eval, Float32.(cdev(data.D_ac_all)); training=false)
-    res_c, _ = encode(model, ps_cpu, st_eval, Float32.(cdev(data.D_c_all)); training=false)
-    return (;
-        stage_ac=Array(cdev(res_ac.stage_indices)),
-        stage_c=Array(cdev(res_c.stage_indices)),
-        coarse_ac=Array(cdev(res_ac.coarse_indices)),
-        coarse_c=Array(cdev(res_c.coarse_indices)),
-    )
-end
+        global_avg_ac = normalise(vec(mean(selected_result.data.D_ac_all; dims=2)), dims=1)
+        global_avg_c = normalise(vec(mean(selected_result.data.D_c_all; dims=2)), dims=1)
+        global_full = [reverse(global_avg_ac); global_avg_c]
+        global_ac0 = global_avg_ac .- mean(global_avg_ac)
+        global_c0 = global_avg_c .- mean(global_avg_c)
+        global_ncc = dot(global_ac0, global_c0) / ((norm(global_ac0) * norm(global_c0)) + 1f-8)
 
-# ╔═╡ 4f2b1382-c158-417b-9fc0-1b8d04d90ed2
-function codebook_cross_analysis(model, ps, st, D_ac, D_c; device=identity, cdev=default_cdev())
-    cache = encoded_cache(model, ps, st, (; D_ac_all=D_ac, D_c_all=D_c); device, cdev)
-    K = model.K[1]
-    idx_ac = vec(cache.coarse_ac)
-    idx_c = vec(cache.coarse_c)
-    nw = min(length(idx_ac), length(idx_c))
-    confusion = zeros(Float32, K, K)
-    for i in 1:nw
-        confusion[idx_ac[i], idx_c[i]] += 1f0
-    end
-    confusion ./= max(sum(confusion), 1f-8)
-    agreement = mean(idx_ac[1:nw] .== idx_c[1:nw])
-    pct_ac = get_cluster_percentages(model, ps, st, D_ac; device, cdev)
-    pct_c = get_cluster_percentages(model, ps, st, D_c; device, cdev)
-    return (; pct_ac, pct_c, confusion, agreement, labels=string.(1:K), cache)
-end
-
-# ╔═╡ c974342d-4bcc-4175-9d71-8f9cfbb7105a
-function source_state_averages(model, ps, st, data; device=identity, cdev=default_cdev())
-    cache = encoded_cache(model, ps, st, data; device, cdev)
-    K = model.K[1]
-    ac = cluster_averages_from_codes(Float32.(cdev(data.D_ac_all)), cache.coarse_ac; K)
-    c = cluster_averages_from_codes(Float32.(cdev(data.D_c_all)), cache.coarse_c; K)
-    return (; acausal=ac.averages, causal=c.averages,
-        counts_ac=ac.counts, counts_c=c.counts, cache)
-end
-
-# ╔═╡ 70a460bf-b3e4-4e7c-aa4d-2674a450379a
-function plot_training_dashboard(loss_history; title="VQ-VAE v7 Training")
-    epochs = collect(1:length(loss_history.train_target_mse))
-    traces = [
-        PlutoPlotly.scatter(x=epochs, y=loss_history.train_objective, mode="lines", name="train_objective"),
-        PlutoPlotly.scatter(x=epochs, y=loss_history.train_target_mse, mode="lines", name="train_target_mse"),
-        PlutoPlotly.scatter(x=epochs, y=loss_history.test_recon_mse, mode="lines", name="test_recon_mse"),
-        PlutoPlotly.scatter(x=epochs, y=loss_history.train_perplexity, mode="lines", name="Train perplexity", yaxis="y2"),
-    ]
-    layout = Layout(title=title, xaxis_title="Epoch",
-        yaxis=attr(title="Loss", type="log"),
-        yaxis2=attr(title="Perplexity", overlaying="y", side="right"),
-        width=900, height=500, plot_bgcolor="white", paper_bgcolor="white")
-    return PlutoPlotly.plot(traces, layout)
-end
-
-# ╔═╡ 2168a07c-e17a-4e94-bec7-5f881a5b5f09
-function plot_codebook_heatmap(st; stage::Int=1, kmax::Int=20,
-    title="RVQ stage $(stage) codebook")
-    E = get_codebook(st, stage)
-    ksel = 1:min(kmax, size(E, 2))
-    trace = PlutoPlotly.heatmap(z=E[:, ksel], x=string.(ksel), y=string.(1:size(E, 1)), zmid=0)
-    return PlutoPlotly.plot([trace], Layout(title=title,
-        xaxis_title="Code", yaxis_title="Embedding dim", width=850, height=550))
-end
-
-# ╔═╡ d7d22b36-79b6-41d6-b9ce-403d34d4165b
-function plot_codebook_confusion(confusion; title="Codebook Confusion", labels=nothing)
-    K = size(confusion, 1)
-    labels = isnothing(labels) ? string.(1:K) : labels
-    trace = PlutoPlotly.heatmap(z=confusion, x=labels, y=labels, colorscale="Blues")
-    return PlutoPlotly.plot([trace], Layout(title=title, xaxis_title="Causal code",
-        yaxis_title="Acausal code", width=750, height=700))
-end
-
-# ╔═╡ 93982359-07a8-4259-8c14-f51794a462f9
-function plot_state_average_matrix(avg; title::String, dt::Real=1.0, reverse_time::Bool=false)
-    nt, nstates = size(avg)
-    t = collect(1:nt) .* dt
-    traces = AbstractTrace[]
-    for k in 1:nstates
-        y = reverse_time ? reverse(avg[:, k]) : avg[:, k]
-        push!(traces, PlutoPlotly.scatter(x=t, y=y .+ (k - 1) * 2.5,
-            mode="lines", name="state $k"))
-    end
-    return PlutoPlotly.plot(traces, Layout(title=title, xaxis_title="Time (s)",
-        yaxis_title="State + offset", width=900, height=max(400, 70 * nstates)))
-end
-
-function plot_cluster_histogram(counts_ac, counts_c; title="Cluster Usage")
-    K = length(counts_ac)
-    total_ac = max(sum(counts_ac), 1)
-    total_c  = max(sum(counts_c),  1)
-    pct_ac = 100f0 .* counts_ac ./ total_ac
-    pct_c  = 100f0 .* counts_c  ./ total_c
-    xlabels = string.(1:K)
-    traces = [
-        PlutoPlotly.bar(x=xlabels, y=pct_ac, name="Acausal",
-            marker=attr(color="rgba(31,119,180,0.7)")),
-        PlutoPlotly.bar(x=xlabels, y=pct_c,  name="Causal",
-            marker=attr(color="rgba(214,39,40,0.7)")),
-    ]
-    layout = Layout(
-        title=attr(text=title, font=attr(size=18)),
-        barmode="group", height=400, width=700,
-        xaxis=attr(title="Source state"),
-        yaxis=attr(title="Usage (%)"),
-        plot_bgcolor="white", paper_bgcolor="white",
-    )
-    return PlutoPlotly.plot(traces, layout)
-end
-
-# ╔═╡ f140b608-0c12-4c5e-8dad-1ac81f6e2d99
-function plot_reconstruction_examples(model, ps, st, X; nsamples::Int=8, dt::Real=1.0,
-    device=identity, cdev=default_cdev(), title="Reconstruction examples")
-    X_cpu = Float32.(cdev(flatten_batch(X)))
-    ids = sort(randperm(size(X_cpu, 2))[1:min(nsamples, size(X_cpu, 2))])
-    res, _ = model(X_cpu[:, ids], cdev(ps), Lux.testmode(cdev(st)); training=false)
-    recon = Float32.(cdev(res.xhat))
-    t = collect(1:size(X_cpu, 1)) .* dt
-    traces = AbstractTrace[]
-    for (j, id) in enumerate(ids)
-        offset = (j - 1) * 4
-        push!(traces, PlutoPlotly.scatter(x=t, y=X_cpu[:, id] .+ offset, mode="lines",
-            name="raw", showlegend=j == 1, line=attr(color="black", width=1)))
-        push!(traces, PlutoPlotly.scatter(x=t, y=recon[:, j] .+ offset, mode="lines",
-            name="recon", showlegend=j == 1, line=attr(color="red", width=2)))
-    end
-    return PlutoPlotly.plot(traces, Layout(title=title, xaxis_title="Time (s)",
-        yaxis_title="Trace + offset", width=900, height=650))
-end
-
-# ╔═╡ 11834c5a-4618-11f1-a096-01b9cbdd6fab
-function update(model, ps, st, loss_history, train_data, test_data,
-    para::VQVAE_Para, training_para::VQVAE_Training_Para=VQVAE_Training_Para();
-    device=identity, cdev=default_cdev())
-
-    train_x_cpu = Float32.(cdev(flatten_batch(train_data)))
-    test_x_cpu = Float32.(cdev(flatten_batch(test_data)))
-    opt = Optimisers.AdamW(; eta=Float64(training_para.initial_learning_rate),
-        lambda=Float64(training_para.weight_decay))
-    train_state = Training.TrainState(model, ps, Lux.trainmode(st), opt)
-    loss_fn = VQVAELoss(para)
-    ad_backend = training_backend(training_para, device)
-    idx = LatentIndex(max_Mnn(training_para))
-    last_index_Mnn = 0
-    ensemble_targets_cpu = nothing
-    size(train_x_cpu, 2) >= training_para.batchsize ||
-        error("Training set N=$(size(train_x_cpu, 2)) is smaller than batchsize=$(training_para.batchsize). Reactant training uses fixed full batches.")
-    test_eval_x_cpu = test_x_cpu[:, 1:min(512, size(test_x_cpu, 2))]
-    @info "Compiling initial Reactant training helpers" N=size(train_x_cpu, 2) batchsize=training_para.batchsize
-    inference_compiled = maybe_compile_inference(
-        model, ps, st,
-        device(train_x_cpu),
-        training_para;
-        device,
-        sample_batch_x=device(train_x_cpu[:, 1:training_para.batchsize]),
-        compile_latent_index=false,
-        compile_train_encoder=true,
-    )
-
-    for epoch in 1:training_para.nepoch
-        phase = ensemble_phase(epoch, training_para)
-        if phase.post_epoch > 0 &&
-           (phase.Mnn != last_index_Mnn || mod(phase.post_epoch - 1, training_para.index_refresh_every) == 0)
-            if isnothing(inference_compiled.encode_z_e)
-                latent_compiled = maybe_compile_inference(
-                    train_state.model, train_state.parameters, train_state.states,
-                    device(train_x_cpu),
-                    training_para;
-                    device,
-                    sample_batch_x=device(train_x_cpu[:, 1:training_para.batchsize]),
-                    compile_latent_index=true,
-                    compile_train_encoder=false,
-                )
-                inference_compiled = (;
-                    encode_z_e=latent_compiled.encode_z_e,
-                    encode_z_e_train=inference_compiled.encode_z_e_train,
-                )
-            end
-            index_start = time()
-            rebuild_latent_index!(idx, train_state.model, train_state.parameters, train_state.states, train_x_cpu;
-                Mnn=phase.Mnn, device, cdev,
-                encode_compiled=inference_compiled.encode_z_e,
-                knn_search_chunk_size_fraction=training_para.knn_search_chunk_size_fraction)
-            latent_index_time = time() - index_start
-            target_cache_start = time()
-            ensemble_targets_cpu = build_ensemble_targets(train_x_cpu, idx, 1:size(train_x_cpu, 2); Mnn=phase.Mnn)
-            target_cache_time = time() - target_cache_start
-            last_index_Mnn = phase.Mnn
-            training_para.verbose && @info "Rebuilt latent index" epoch post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn latent_index_time_s=round(latent_index_time; digits=3) ensemble_target_cache_time_s=round(target_cache_time; digits=3)
+        combo_labels_local = string.(1:size(cluster_avg_ac, 2))
+        ncomb = length(combo_labels_local)
+        traces = AbstractTrace[]
+        colors = begin
+            nc = max(ncomb, 1)
+            cs = ColorSchemes.rainbow
+            [Colors.hex(get(cs, (i - 1) / max(1, nc - 1))) for i in 1:nc]
         end
 
-        batches = make_batches(train_x_cpu, training_para.batchsize)
-        start = time()
-        total_seen = 0
-        last_loss = NaN32
-        last_recon = NaN32
-        last_commit = NaN32
-        last_entropy = NaN32
-        last_perplexity = NaN32
-        epoch_counts = zeros(Float32, sum(para.K))   # accumulated codebook counts across all batches
-        prep_time = 0.0
-        target_time = 0.0
-        pack_time = 0.0
-        payload_time = 0.0
-        state_swap_time = 0.0
-        step_time = 0.0
-        metric_sync_time = 0.0
-        for (batch_idx, batch) in enumerate(batches)
-            prep_start = time()
-            bdev, st_updated, prep_stats = prepare_vq_training_batch(
-                train_state.model, train_state.parameters, train_state.states,
-                batch, train_x_cpu, phase.post_epoch == 0 ? nothing : idx,
-                epoch, para, training_para; device, cdev,
-                encode_compiled=inference_compiled.encode_z_e_train,
-                ensemble_targets_cpu=ensemble_targets_cpu
-            )
-            prep_time += time() - prep_start
-            target_time += prep_stats.target_time
-            pack_time += prep_stats.pack_time
-            payload_time += prep_stats.payload_time
-            state_swap_start = time()
-            train_state = replace_train_state_states(train_state, st_updated)
-            state_swap_time += time() - state_swap_start
-            step_start = time()
-            (_, loss, stats, train_state) = Training.single_train_step!(
-                ad_backend, loss_fn, bdev, train_state; return_gradients=Val(false)
-            )
-            # Reactant's compiled step overwrites ts.states with the XLA-traced st (which
-            # has the old rvq frozen in). Re-inject the CPU-side EMA-updated rvq so it
-            # survives into the next batch's prepare_vq_training_batch call.
-            train_state = replace_train_state_states(train_state,
-                merge(train_state.states, (; rvq=st_updated.rvq)))
-            step_time += time() - step_start
-            total_seen += size(batch.x, 2)
-            # accumulate per-stage EMA cluster sizes for epoch-level perplexity
-            offset = 0
-            for stage in st_updated.rvq.stages
-                cs = Float32.(cdev(stage.ema_cluster_size))
-                epoch_counts[offset+1:offset+length(cs)] .+= cs
-                offset += length(cs)
-            end
-            if batch_idx == length(batches)
-                metric_sync_start = time()
-                batch_metrics = cdev((;
-                    loss,
-                    recon_loss=stats.recon_loss,
-                    commit_loss=stats.commit_loss,
-                    entropy_loss=stats.entropy_loss,
-                ))
-                metric_sync_time += time() - metric_sync_start
-                last_loss = Float32(batch_metrics.loss)
-                isnan(last_loss) && error("NaN loss encountered.")
-                last_recon = Float32(batch_metrics.recon_loss)
-                last_commit = Float32(batch_metrics.commit_loss)
-                last_entropy = Float32(batch_metrics.entropy_loss)
+        total_ac = size(selected_result.data.D_ac_all, 2)
+        total_c = size(selected_result.data.D_c_all, 2)
+        amp_peak = maximum(abs.(vcat(vec(cluster_avg_ac), vec(cluster_avg_c), global_full)))
+        vertical_spacing = amp_peak * 2.5 + 1f-3
+
+        for combo_idx in 1:ncomb
+            c = colors[mod1(combo_idx, length(colors))]
+            a = cluster_avg_ac[:, combo_idx]
+            b = cluster_avg_c[:, combo_idx]
+            full_k = [reverse(a); b]
+            a0 = a .- mean(a)
+            b0 = b .- mean(b)
+            ncc = dot(a0, b0) / ((norm(a0) * norm(b0)) + 1f-8)
+            pct_ac = 100 * state_averages.counts_ac[combo_idx] / max(total_ac, 1)
+            pct_c = 100 * state_averages.counts_c[combo_idx] / max(total_c, 1)
+            legend_label = "State $(combo_labels_local[combo_idx]) (ac: $(round(pct_ac; digits=1))%, c: $(round(pct_c; digits=1))%, corr=$(round(ncc; digits=3)))"
+            offset = (combo_idx - 1) * vertical_spacing
+			  push!(traces, PlutoPlotly.scatter(x=t_full, y=global_full .+ offset, mode="lines",
+                name=combo_idx == 1 ? "Global mean (corr=$(round(global_ncc; digits=3)))" : "Global mean",
+                showlegend=combo_idx == 1,
+                line=attr(color="black", width=3, opacity=0.1)))
+            push!(traces, PlutoPlotly.scatter(x=t_full, y=full_k .+ offset, mode="lines",
+                name=legend_label, line=attr(color=c, width=2)))
+          
+        end
+
+        shapes = let distance = selected_result.data_bundle.distance
+            if isnothing(distance)
+                []
+            else
+                vmin, vmax = velocity_range
+                t_fast = distance / vmax
+                t_slow = distance / vmin
+                vcat([
+                    attr(type="line", x0=t, x1=t, y0=0, y1=1, yref="paper",
+                        line=attr(color="rgba(0,0,0,0.25)", width=1, dash="dash"))
+                    for t in (-t_slow, -t_fast, t_fast, t_slow)
+                ])
             end
         end
-        epoch_time = time() - start
-        throughput = total_seen / max(epoch_time, 1e-8)
-        # epoch perplexity from accumulated counts across all batches
-        nstages = length(para.K)
-        epoch_perplexity = 0f0
-        offset = 0
-        for k in para.K
-            stage_counts = epoch_counts[offset+1:offset+k]
-            p = stage_counts ./ max(sum(stage_counts), 1f-8)
-            psafe = clamp.(p, 1f-10, 1f0)
-            epoch_perplexity += exp(-sum(psafe .* log.(psafe)))
-            offset += k
-        end
-        last_perplexity = epoch_perplexity / nstages
-        train_m = (;
-            total=last_loss,
-            recon_loss=last_recon,
-            commit_loss=last_commit,
-            entropy_loss=last_entropy,
-            perplexity=last_perplexity,
+
+        layout = Layout(
+            title=attr(text="Source State Average Waveforms ($(result_title_context(selected_result)))",
+                font=attr(size=18, family="Computer Modern, serif")),
+            height=500*div(ncomb,5), width=900,
+            xaxis=attr(title="Lag (s)", zeroline=true, zerolinecolor="rgba(0,0,0,0.3)"),
+            yaxis=attr(title="Amplitude"),
+            plot_bgcolor="white", paper_bgcolor="white",
+            legend=attr(x=0.5, xanchor="center", y=-0.2, orientation="h",
+                font=attr(size=12, family="Computer Modern, serif")),
+            shapes=shapes,
         )
-        test_recon_mse = recon_mse_inference(
-            train_state.model, cdev(train_state.parameters), cdev(train_state.states), test_eval_x_cpu;
-            normalize_target=training_para.normalize_target)
-        record_train_metrics!(loss_history, train_m, test_recon_mse, epoch_time, throughput)
+        WideCell(PlutoPlotly.plot(traces, layout))
+    end
+end
 
-        if mod(epoch, training_para.nprint) == 0
-            r(x) = round(x; digits=4)
-            objective_str = "$(r(train_m.recon_loss)) + $(r(train_m.commit_loss)) + $(r(train_m.entropy_loss)) = $(r(train_m.total))"
-            @info "Epoch $epoch" objective="mse+commit+entropy = $objective_str" test_recon_mse=r(test_recon_mse) perplexity=r(train_m.perplexity) post_warmup_epoch=phase.post_epoch Mnn=phase.Mnn throughput=round(throughput; digits=1) epoch_time_s=round(epoch_time; digits=3)
-            if training_para.verbose
-                @info "Epoch timing breakdown" epoch post_warmup_epoch=phase.post_epoch prep_time_s=round(prep_time; digits=3) target_time_s=round(target_time; digits=3) pack_time_s=round(pack_time; digits=3) payload_time_s=round(payload_time; digits=3) state_swap_time_s=round(state_swap_time; digits=3) step_time_s=round(step_time; digits=3) metric_sync_time_s=round(metric_sync_time; digits=3) other_time_s=round(epoch_time - prep_time - state_swap_time - step_time - metric_sync_time; digits=3)
+# ╔═╡ 86843302-bb3b-494c-afe4-b9a43fcc0e7c
+if isnothing(selected_result) || isnothing(state_averages)
+    md""
+else
+    let
+    cluster_avg_ac = display_averages.acausal
+	    cluster_avg_c = display_averages.causal
+	    combo_labels = string.(1:size(cluster_avg_ac, 2))
+    labels = string.(combo_labels)
+    n = length(labels)
+
+    function norm_corr_matrix(A)
+        # A: (nt, n); returns (n, n) normalized correlation matrix
+        C = Matrix{Float32}(undef, n, n)
+        cols = [begin v = vec(A[:, i]); v .- mean(v) end for i in 1:n]
+        norms = [norm(c) + 1f-8 for c in cols]
+        for i in 1:n, j in 1:n
+            C[i, j] = dot(cols[i], cols[j]) / (norms[i] * norms[j])
+        end
+        C
+    end
+
+    C_ac = norm_corr_matrix(cluster_avg_ac)
+    C_c  = norm_corr_matrix(cluster_avg_c)
+    trace_ac = PlutoPlotly.heatmap(
+        z=C_ac, x=labels, y=labels,
+        colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
+        colorbar=attr(title="Corr", len=0.9, x=0.46),
+        xaxis="x1", yaxis="y1",
+    )
+    trace_c = PlutoPlotly.heatmap(
+        z=C_c, x=labels, y=labels,
+        colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
+        colorbar=attr(title="Corr", len=0.9, x=1.01),
+        xaxis="x2", yaxis="y2",
+    )
+
+    sz = max(350, n * 40)
+    layout = Layout(
+        title=attr(text="State-State Normalised Correlation ($(result_title_context(selected_result)))",
+            font=attr(size=16)),
+        grid=attr(rows=1, columns=2, pattern="independent"),
+        annotations=[
+            attr(text="Acausal", x=0.22, xref="paper", y=1.05, yref="paper",
+                 showarrow=false, font=attr(size=14)),
+            attr(text="Causal",  x=0.78, xref="paper", y=1.05, yref="paper",
+                 showarrow=false, font=attr(size=14)),
+        ],
+        xaxis=attr(title="State", tickangle=-45),
+        yaxis=attr(title="State"),
+        xaxis2=attr(title="State", tickangle=-45),
+        yaxis2=attr(title="State"),
+        width=900, height=sz + 80,
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=attr(t=80, b=80, l=80, r=80),
+    )
+    WideCell(PlutoPlotly.plot([trace_ac, trace_c], layout))
+    end
+end
+
+# ╔═╡ 4057ac26-f7b5-4c26-8a5e-4796de1be81f
+selected_pair_results = begin
+    if isnothing(train_results) || isempty(result_pair_options)
+        []
+    else
+        sort([
+            result for result in train_results
+            if "$(result.pair[1])-$(result.pair[2])" == selected_result_pair_label
+        ], by=result -> hasproperty(result, :seed) ? result.seed : 0)
+    end
+end
+
+# ╔═╡ 20ae1f67-cfaa-487d-8d94-a5f7b97b45fd
+all_seed_state_averages = let
+    if isempty(selected_pair_results)
+        nothing
+    else
+        [
+            vqvae.source_state_averages(
+                result.model,
+                result.ps,
+                result.st,
+                result.data;
+                device=training_device,
+            )
+            for result in selected_pair_results
+        ]
+    end
+end
+
+# ╔═╡ fd286392-4902-11f1-964f-65a304aae057
+mft_analysis = let
+if isnothing(all_seed_state_averages) || isempty(all_seed_state_averages)
+    nothing
+else
+    _mode = @isdefined(ui_mft_mode) ? ui_mft_mode : "joint"
+    ac_traces = mft.SeismicTrace[]
+    c_traces = mft.SeismicTrace[]
+    labels = String[]
+
+    for (result, averages) in zip(selected_pair_results, all_seed_state_averages)
+        dist = result.data_bundle.distance
+        seed_label = hasproperty(result, :seed) ? string(result.seed) : "seed?"
+        _K = result.para.K
+
+        if _mode == "marginal" && hasproperty(averages, :combo_labels) && length(_K) >= 2
+            K1, K2 = _K[1], _K[2]
+            dec_ac = vqvae.marginal_decomposition(
+                averages.acausal, averages.counts_ac; K1, K2)
+            dec_c  = vqvae.marginal_decomposition(
+                averages.causal,  averages.counts_c;  K1, K2)
+
+            for k in 1:K1
+                push!(ac_traces, mft.SeismicTrace(data=vec(dec_ac.stage1_waves[:, k]), dt=dt, distance=dist))
+                push!(c_traces,  mft.SeismicTrace(data=vec(dec_c.stage1_waves[:, k]),  dt=dt, distance=dist))
+                push!(labels, "seed $(seed_label) | $(dec_ac.stage1_labels[k])")
+            end
+            for k in 1:K2
+                push!(ac_traces, mft.SeismicTrace(data=vec(dec_ac.stage2_waves[:, k]), dt=dt, distance=dist))
+                push!(c_traces,  mft.SeismicTrace(data=vec(dec_c.stage2_waves[:, k]),  dt=dt, distance=dist))
+                push!(labels, "seed $(seed_label) | $(dec_ac.stage2_labels[k])")
+            end
+            push!(ac_traces, mft.SeismicTrace(data=vec(dec_ac.grand_mean), dt=dt, distance=dist))
+            push!(c_traces,  mft.SeismicTrace(data=vec(dec_c.grand_mean),  dt=dt, distance=dist))
+            push!(labels, "seed $(seed_label) | Grand mean")
+        else
+            nstates = size(averages.acausal, 2)
+            combo_labels = hasproperty(averages, :combo_labels) ?
+                averages.combo_labels : string.(1:nstates)
+            for i in 1:nstates
+                push!(ac_traces, mft.SeismicTrace(data=vec(averages.acausal[:, i]), dt=dt, distance=dist))
+                push!(c_traces,  mft.SeismicTrace(data=vec(averages.causal[:, i]),  dt=dt, distance=dist))
+                push!(labels, "seed $(seed_label) | $(combo_labels[i])")
             end
         end
-        if !isnothing(training_para.stop_on_recon_loss) && train_m.recon_loss < training_para.stop_on_recon_loss
-            @info "Early stopping" epoch train_target_mse=train_m.recon_loss threshold=training_para.stop_on_recon_loss
-            break
-        end
     end
-    return train_state.parameters, train_state.states, loss_history
+
+    mft_periods = exp10.(range(log10(Float64(period_min)), log10(Float64(period_max)); length=mft_nperiods))
+    mft.analyze_causal_acausal_branches(
+        c_traces, ac_traces, mft_periods;
+        state_labels=labels,
+		max_modes=6,
+        velocity_range=velocity_range,
+        bandwidth_factor=bandwidth_factor,
+        zero_pad_factor=zero_pad_factor,
+    )
+end
 end
 
-# ╔═╡ 8049c795-3466-4992-a617-686614b7ef47
-function train_one_pair(pair::Tuple{<:AbstractString,<:AbstractString}; filepath::String,
-    vqvae_parameters::NamedTuple, training_para::VQVAE_Training_Para,
-    save_root::String=joinpath(filepath, "SavedModels", "vqvae_v7"),
-    seed::Int=1234, dt::Real=1.0, period_min::Real=10, period_max::Real=50,
-    device=nothing)
-    ensure_reactant_xla_flags!()
-    pair = (String(pair[1]), String(pair[2]))
-    xdev = isnothing(device) ? default_xdev(; force=true) : device
-    cdev = default_cdev()
-    rng = Xoshiro(seed)
-    setup_start = time()
-    @info "Loading and preprocessing v7 pair" pair
-    bundle = build_training_bundle(pair; filepath, dt, period_min, period_max)
-    @info "Loaded v7 pair bundle" pair time_s=round(time() - setup_start; digits=3) distance=bundle.distance D1fac_size=size(bundle.D1fac) D1fc_size=size(bundle.D1fc)
-    split_start = time()
-    data = make_pooled_split(bundle.D1fac, bundle.D1fc)
-    @info "Built v7 train/test split" pair time_s=round(time() - split_start; digits=3) train_size=size(data.D_train) test_size=size(data.D_test)
-    model_start = time()
-    para = VQVAE_Para(; merge(vqvae_parameters,
-        (; nt=size(data.D_train, 1), interstation_distance=bundle.distance, dt=Float64(dt), seed))...)
-    model, ps, st, loss_history = get_vqvae(para; rng, device=xdev)
-    @info "Initialized v7 model" pair time_s=round(time() - model_start; digits=3)
-    train_start = time()
-    @info "Starting v7 update loop" pair
-    ps, st, loss_history = update(model, ps, st, loss_history,
-        data.D_train, data.D_test, para, training_para; device=xdev, cdev)
-    @info "Finished v7 update loop" pair time_s=round(time() - train_start; digits=3)
-    run_dir = pair_run_dir(save_root, pair)
-    save_vqvae_run(run_dir; model, ps, st, para, training_para, loss_history, pair, data_bundle=bundle)
-    return (; pair, run_dir, model, ps, st, para, training_para, loss_history, data, data_bundle=bundle)
+# ╔═╡ 1000001a-0000-0000-0000-000000000001
+if isnothing(mft_analysis)
+    md""
+else
+    @bind ui_period Slider(mft_analysis.periods; default=mean(mft_analysis.periods), show_value=true)
 end
 
-# ╔═╡ a848319e-7bda-4844-a916-2bbdef1d5417
-function train_selected_pairs(selected_pairs; kwargs...)
-    results = Any[]
-    for pair in selected_pairs
-        @info "Training v7 pair" pair
-        push!(results, train_one_pair(pair; kwargs...))
-    end
-    return results
+# ╔═╡ 1000001b-0000-0000-0000-000000000001
+if isnothing(mft_analysis)
+    md""
+else
+    WideCell(mft.plot_filtered_traces_by_period(
+        mft_analysis;
+        period=ui_period,
+        correlation_threshold=nothing,
+        normalize_each=true,
+        scale=0.7,
+        spacing=2.2,
+        title="MFT Filtered Source-State Traces ($(replace(result_title_context(selected_result), r" seed=[^ ]+" => " all seeds")); period=$(ui_period)s)",
+    ))
 end
+
+# ╔═╡ 1000001c-0000-0000-0000-000000000001
+if isnothing(mft_analysis)
+    md""
+else
+    WideCell(mft.plot_branch_correlation(
+        mft_analysis;
+        title="MFT Branch Correlation ($(replace(result_title_context(selected_result), r" seed=[^ ]+" => " all seeds")))",
+    ))
+end
+
+# ╔═╡ b48757f3-a9f1-4ff4-b714-de58221a1660
+WideCell(mft.plot_all_highcorr_groupvelocity_picks(mft_analysis; correlation_threshold=0.1, title=string("Group Velocity Picks ", replace(result_title_context(selected_result), r" seed=[^ ]+" => " all seeds"))))
+
+# ╔═╡ 52edc77f-d951-40a2-bae7-ed04e2c778ce
+WideCell(mft.plot_all_highcorr_groupvelocity_picks(mft_analysis; correlation_threshold=0.0, pair_and_average=true, title=string("Group Velocity Picks ", replace(result_title_context(selected_result), r" seed=[^ ]+" => " all seeds")), velocity_tolerance_fraction=0.1))
+
+# ╔═╡ 30265164-1bdf-493d-bbc4-6ef227a4fbfb
+consensus = mft.consensus_group_velocity_picks(
+    mft_analysis;
+    correlation_threshold=0.0,
+    velocity_tolerance_fraction=0.1,
+    cluster_tolerance_fraction=nothing,  # default: same as velocity_tolerance_fraction
+    max_candidates=5,
+    selection_mode=:low_velocity,
+    min_candidate_periods=3,
+    max_smooth_jump_fraction=0.08,
+    max_gap_periods=1,
+)
+
+# ╔═╡ 3207b4be-2278-4e89-afb7-205bcfdb839e
+WideCell(mft.plot_consensus_groupvelocity_picks(mft_analysis, consensus;
+    correlation_threshold=0.0,
+    velocity_tolerance_fraction=0.1,
+    title=string("Consensus Group Velocity Picks ", replace(result_title_context(selected_result), r" seed=[^ ]+" => " all seeds")),
+))
+
+# ╔═╡ 084f1241-bd18-49cd-911c-5eb396c0a364
+mft_analysis_global = let
+if isempty(selected_pair_results)
+    nothing
+else
+    global_avg_ac = vec(mean(hcat([vec(mean(result.data.D_ac_all; dims=2)) for result in selected_pair_results]...); dims=2))
+    global_avg_c  = vec(mean(hcat([vec(mean(result.data.D_c_all;  dims=2)) for result in selected_pair_results]...); dims=2))
+    dist = selected_pair_results[1].data_bundle.distance
+    mft_periods = exp10.(range(log10(Float64(period_min)), log10(Float64(period_max)); length=mft_nperiods))
+
+    mft.analyze_causal_acausal_branches(
+        [mft.SeismicTrace(data=global_avg_c,  dt=dt, distance=dist)],
+        [mft.SeismicTrace(data=global_avg_ac, dt=dt, distance=dist)],
+        mft_periods;
+        state_labels=["Global average"],
+        max_modes=6,
+        velocity_range=velocity_range,
+        bandwidth_factor=bandwidth_factor,
+        zero_pad_factor=zero_pad_factor,
+    )
+end
+end
+
+# ╔═╡ 124f7e8b-8d6a-4a25-af36-e78eb323f03b
+consensus_global = mft.consensus_group_velocity_picks(
+    mft_analysis_global;
+    correlation_threshold=0.0,
+    velocity_tolerance_fraction=0.1,
+    cluster_tolerance_fraction=nothing,  # default: same as velocity_tolerance_fraction
+    max_candidates=5,
+    selection_mode=:low_velocity,
+    min_candidate_periods=3,
+    max_smooth_jump_fraction=0.08,
+    max_gap_periods=1,
+)
+
+# ╔═╡ bc80aea7-5748-44c6-a0d4-f260e2a29c42
+WideCell(mft.plot_consensus_groupvelocity_picks(mft_analysis_global, consensus_global;
+    correlation_threshold=0.0,
+    velocity_tolerance_fraction=0.1,
+    title=string("Consensus Group Velocity Picks ", replace(result_title_context(selected_result), r" seed=[^ ]+" => " all seeds")),
+))
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
 [deps]
+ColorSchemes = "35d6a980-a343-548e-a6ea-1d62b119f2f4"
+Colors = "5ae59095-9a9b-59fe-a467-6f913c188581"
 ConcreteStructs = "2569d6c7-a4a2-43d3-a901-331e8e4be471"
 DSP = "717857b8-e6f2-59f4-9121-6e50c889abd2"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+Distances = "b4f34e82-e78d-54a5-968a-f98e89d6e8f7"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 InlineStrings = "842dd82b-1e85-43dc-bf29-5d0ee9dffc48"
 JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
@@ -1423,7 +933,12 @@ Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
 MLUtils = "f1d291b0-491e-4a28-83b9-f70985020b54"
 NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
 Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
+Peaks = "18e31ff7-3703-566c-8e60-38913d67486b"
+PlutoHooks = "0ff47ea0-7a50-410d-8455-4348d5de0774"
+PlutoLinks = "0ff47ea0-7a50-410d-8455-4348d5de0420"
 PlutoPlotly = "8e989ff0-3d88-8e9f-f020-2b208a939ff0"
+PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
@@ -1431,17 +946,25 @@ StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 
 [compat]
+ColorSchemes = "~3.31.0"
+Colors = "~0.13.1"
 ConcreteStructs = "~0.2.3"
 DSP = "~0.8.4"
-Enzyme = "~0.13.138"
-EnzymeCore = "~0.8.19"
+Distances = "~0.10.12"
+Enzyme = "~0.13.140"
+EnzymeCore = "~0.8.20"
+FFTW = "~1.10.0"
 InlineStrings = "~1.4.5"
 JLD2 = "~0.6.4"
 Lux = "~1.31.4"
 MLUtils = "~0.4.8"
 NNlib = "~0.9.34"
 Optimisers = "~0.4.7"
+Peaks = "~0.6.2"
+PlutoHooks = "~0.1.0"
+PlutoLinks = "~0.1.8"
 PlutoPlotly = "~0.6.5"
+PlutoUI = "~0.7.80"
 Reactant = "~0.2.254"
 StatsBase = "~0.34.10"
 Zygote = "~0.7.10"
@@ -1453,12 +976,12 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.12.4"
 manifest_format = "2.0"
-project_hash = "74a02a238cbd7860fd6b2f4f16967c245fce5b3a"
+project_hash = "8cb90654adf0941e6c6fad17197e16431bdb3f8d"
 
 [[deps.ADTypes]]
-git-tree-sha1 = "f7304359109c768cf32dc5fa2d371565bb63b68a"
+git-tree-sha1 = "bbc22a9a08a0ef6460041086d8a7b27940ed4ffd"
 uuid = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
-version = "1.21.0"
+version = "1.22.0"
 weakdeps = ["ChainRulesCore", "ConstructionBase", "EnzymeCore"]
 
     [deps.ADTypes.extensions]
@@ -1687,6 +1210,12 @@ git-tree-sha1 = "34d9873079e4cb3d0c62926a225136824677073f"
 uuid = "55437552-ac27-4d47-9aa3-63184e8fd398"
 version = "1.0.0"
 
+[[deps.CodeTracking]]
+deps = ["InteractiveUtils", "REPL", "UUIDs"]
+git-tree-sha1 = "cfb7a2e89e245a9d5016b70323db412b3a7438d5"
+uuid = "da1fd8a2-8d9e-5ec2-8556-3022fb5608a2"
+version = "3.0.2"
+
 [[deps.CodecZlib]]
 deps = ["TranscodingStreams", "Zlib_jll"]
 git-tree-sha1 = "962834c22b66e32aa10f7611c08c8ca4e20749a9"
@@ -1745,6 +1274,11 @@ weakdeps = ["Dates", "LinearAlgebra"]
 
     [deps.Compat.extensions]
     CompatLinearAlgebraExt = "LinearAlgebra"
+
+[[deps.Compiler]]
+git-tree-sha1 = "382d79bfe72a406294faca39ef0c3cef6e6ce1f1"
+uuid = "807dbc54-b67e-4c79-8afb-eafe4df6f2e1"
+version = "0.1.1"
 
 [[deps.CompilerSupportLibraries_jll]]
 deps = ["Artifacts", "Libdl"]
@@ -1870,6 +1404,17 @@ weakdeps = ["ChainRulesCore", "EnzymeCore"]
     DispatchDoctorChainRulesCoreExt = "ChainRulesCore"
     DispatchDoctorEnzymeCoreExt = "EnzymeCore"
 
+[[deps.Distances]]
+deps = ["LinearAlgebra", "Statistics", "StatsAPI"]
+git-tree-sha1 = "c7e3a542b999843086e2f29dac96a618c105be1d"
+uuid = "b4f34e82-e78d-54a5-968a-f98e89d6e8f7"
+version = "0.10.12"
+weakdeps = ["ChainRulesCore", "SparseArrays"]
+
+    [deps.Distances.extensions]
+    DistancesChainRulesCoreExt = "ChainRulesCore"
+    DistancesSparseArraysExt = "SparseArrays"
+
 [[deps.Distributed]]
 deps = ["Random", "Serialization", "Sockets"]
 uuid = "8ba89e20-285c-5b6f-9357-94700520ee1b"
@@ -1892,9 +1437,9 @@ version = "1.0.7"
 
 [[deps.Enzyme]]
 deps = ["CEnum", "EnzymeCore", "Enzyme_jll", "GPUCompiler", "InteractiveUtils", "LLVM", "Libdl", "LinearAlgebra", "ObjectFile", "PrecompileTools", "Preferences", "Printf", "Random", "SparseArrays"]
-git-tree-sha1 = "d6dd65421104fa9f7d5cc37283a998937f359a39"
+git-tree-sha1 = "78704dd8d84c93a7f2ac5af0bbb95d26763ec9b9"
 uuid = "7da242da-08ed-463a-9acd-ee780be4f1d9"
-version = "0.13.138"
+version = "0.13.140"
 weakdeps = ["ADTypes", "BFloat16s", "ChainRulesCore", "GPUArraysCore", "LogExpFunctions", "SpecialFunctions", "StaticArrays"]
 
     [deps.Enzyme.extensions]
@@ -1906,9 +1451,9 @@ weakdeps = ["ADTypes", "BFloat16s", "ChainRulesCore", "GPUArraysCore", "LogExpFu
     EnzymeStaticArraysExt = "StaticArrays"
 
 [[deps.EnzymeCore]]
-git-tree-sha1 = "24bbb6fc8fb87eb71c1f8d00184a60fc22c63903"
+git-tree-sha1 = "c6ee69ee502060982d12dbaaf3d8fcb4e835a0d1"
 uuid = "f151be2c-9106-41f4-ab19-57ee4f262869"
-version = "0.8.19"
+version = "0.8.20"
 weakdeps = ["Adapt", "ChainRulesCore"]
 
     [deps.EnzymeCore.extensions]
@@ -1917,9 +1462,9 @@ weakdeps = ["Adapt", "ChainRulesCore"]
 
 [[deps.Enzyme_jll]]
 deps = ["Artifacts", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
-git-tree-sha1 = "4c22000e08aaa862526d9a41cfb7003e4002e653"
+git-tree-sha1 = "d3ad8f5eca369ac8803ff7db660028d47debc75d"
 uuid = "7cc45869-7501-5eee-bdea-0790c847d4ef"
-version = "0.0.256+0"
+version = "0.0.258+0"
 
 [[deps.ExceptionUnwrapping]]
 deps = ["Test"]
@@ -1968,9 +1513,9 @@ version = "0.3.2"
 
 [[deps.FileIO]]
 deps = ["Pkg", "Requires", "UUIDs"]
-git-tree-sha1 = "6522cfb3b8fe97bec632252263057996cbd3de20"
+git-tree-sha1 = "8e9c059d6857607253e837730dbf780b6b151acd"
 uuid = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
-version = "1.18.0"
+version = "1.19.0"
 weakdeps = ["HTTP"]
 
     [deps.FileIO.extensions]
@@ -2048,11 +1593,23 @@ git-tree-sha1 = "2eaa69a7cab70a52b9687c8bf950a5a93ec895ae"
 uuid = "076d061b-32b6-4027-95e0-9a2c6f6d7e74"
 version = "0.2.0"
 
+[[deps.Hyperscript]]
+deps = ["Test"]
+git-tree-sha1 = "179267cfa5e712760cd43dcae385d7ea90cc25a4"
+uuid = "47d2ed2b-36de-50cf-bf87-49c2cf4b8b91"
+version = "0.0.5"
+
 [[deps.HypertextLiteral]]
 deps = ["Tricks"]
 git-tree-sha1 = "7134810b1afce04bbc1045ca1985fbe81ce17653"
 uuid = "ac1192a8-f4b3-4bfe-ba22-af5b92cd3ab2"
 version = "0.9.5"
+
+[[deps.IOCapture]]
+deps = ["Logging", "Random"]
+git-tree-sha1 = "0ee181ec08df7d7c911901ea38baf16f755114dc"
+uuid = "b5f81e59-6552-4d32-b1f0-c071b021bf89"
+version = "1.0.0"
 
 [[deps.IRTools]]
 deps = ["InteractiveUtils", "MacroTools"]
@@ -2137,15 +1694,21 @@ version = "1.7.1"
 
 [[deps.JSON]]
 deps = ["Dates", "Logging", "Parsers", "PrecompileTools", "StructUtils", "UUIDs", "Unicode"]
-git-tree-sha1 = "67c6f1f085cb2671c93fe34244c9cccde30f7a26"
+git-tree-sha1 = "fe23330af47b8ab4e135b2ff65f7398c3a2bfc65"
 uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-version = "1.5.0"
+version = "1.5.2"
 
     [deps.JSON.extensions]
     JSONArrowExt = ["ArrowTypes"]
 
     [deps.JSON.weakdeps]
     ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
+
+[[deps.JuliaInterpreter]]
+deps = ["CodeTracking", "InteractiveUtils", "Random", "UUIDs"]
+git-tree-sha1 = "58927c485919bf17ea308d9d82156de1adf4b006"
+uuid = "aa1ae85d-cabe-5617-a682-6adf51b2e16a"
+version = "0.10.12"
 
 [[deps.JuliaSyntaxHighlighting]]
 deps = ["StyledStrings"]
@@ -2172,9 +1735,9 @@ weakdeps = ["EnzymeCore", "LinearAlgebra", "SparseArrays"]
 
 [[deps.LLVM]]
 deps = ["CEnum", "LLVMExtra_jll", "Libdl", "PrecompileTools", "Preferences", "Printf", "Unicode"]
-git-tree-sha1 = "f1b04cbf4be550fabad4bbc38c3b18ba5bdf53a6"
+git-tree-sha1 = "85592339c4363f40863f0b61f9cba80b885070c3"
 uuid = "929cbde3-209d-540e-8aea-75f648917ca0"
-version = "9.7.0"
+version = "9.7.1"
 weakdeps = ["BFloat16s"]
 
     [deps.LLVM.extensions]
@@ -2267,6 +1830,12 @@ deps = ["Dates", "Logging"]
 git-tree-sha1 = "f00544d95982ea270145636c181ceda21c4e2575"
 uuid = "e6f89c97-d47a-5376-807f-9c37f3926c36"
 version = "1.2.0"
+
+[[deps.LoweredCodeUtils]]
+deps = ["CodeTracking", "Compiler", "JuliaInterpreter"]
+git-tree-sha1 = "5d4278f755440f70648d80cc6225f51e78e94094"
+uuid = "6f1432cf-f94c-5a45-995e-cdbf5db27b0b"
+version = "3.5.1"
 
 [[deps.Lux]]
 deps = ["ADTypes", "Adapt", "ArrayInterface", "ChainRulesCore", "ConcreteStructs", "DiffResults", "DispatchDoctor", "EnzymeCore", "FastClosures", "ForwardDiff", "Functors", "GPUArraysCore", "LinearAlgebra", "LuxCore", "LuxLib", "MLDataDevices", "MacroTools", "Markdown", "NNlib", "Optimisers", "PrecompileTools", "Preferences", "Random", "ReactantCore", "Reexport", "SciMLPublic", "Setfield", "Static", "StaticArraysCore", "Statistics", "UUIDs", "WeightInitializers"]
@@ -2380,6 +1949,11 @@ version = "1.15.9"
     SLEEFPirates = "476501e8-09a2-5ece-8869-fb82de89a1fa"
     Tracker = "9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c"
     cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
+
+[[deps.MIMEs]]
+git-tree-sha1 = "c64d943587f7187e751162b3b84445bbbd79f691"
+uuid = "6c6e2e6c-3030-632d-7369-2d6c69616d65"
+version = "1.1.0"
 
 [[deps.MKL_jll]]
 deps = ["Artifacts", "IntelOpenMP_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "oneTBB_jll"]
@@ -2594,9 +2168,23 @@ version = "0.12.3"
 
 [[deps.Parsers]]
 deps = ["Dates", "PrecompileTools", "UUIDs"]
-git-tree-sha1 = "7d2f8f21da5db6a806faf7b9b292296da42b2810"
+git-tree-sha1 = "5d5e0a78e971354b1c7bff0655d11fdc1b0e12c8"
 uuid = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
-version = "2.8.3"
+version = "2.8.4"
+
+[[deps.Peaks]]
+deps = ["SIMD"]
+git-tree-sha1 = "a9b6680fb7fb097fb6eb1210c35549218d73da84"
+uuid = "18e31ff7-3703-566c-8e60-38913d67486b"
+version = "0.6.2"
+
+    [deps.Peaks.extensions]
+    MakieExt = "Makie"
+    PlotsExt = "RecipesBase"
+
+    [deps.Peaks.weakdeps]
+    Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
+    RecipesBase = "3cdcf5f2-1ef4-517c-9805-6587b60abb01"
 
 [[deps.Pkg]]
 deps = ["Artifacts", "Dates", "Downloads", "FileWatching", "LibGit2", "Libdl", "Logging", "Markdown", "Printf", "Random", "SHA", "TOML", "Tar", "UUIDs", "p7zip_jll"]
@@ -2625,6 +2213,18 @@ version = "0.8.23"
     IJulia = "7073ff75-c697-5162-941a-fcdaad2a7d2a"
     JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 
+[[deps.PlutoHooks]]
+deps = ["InteractiveUtils", "Markdown", "UUIDs"]
+git-tree-sha1 = "844a829c8dc9fd0fe62eced22bc2d0dfd66a3f51"
+uuid = "0ff47ea0-7a50-410d-8455-4348d5de0774"
+version = "0.1.0"
+
+[[deps.PlutoLinks]]
+deps = ["FileWatching", "InteractiveUtils", "Markdown", "PlutoHooks", "Revise", "UUIDs"]
+git-tree-sha1 = "aea4eede5ab3ee188906d0cf3bbfa36eb543dccc"
+uuid = "0ff47ea0-7a50-410d-8455-4348d5de0420"
+version = "0.1.8"
+
 [[deps.PlutoPlotly]]
 deps = ["AbstractPlutoDingetjes", "Artifacts", "ColorSchemes", "Colors", "Dates", "Downloads", "HypertextLiteral", "InteractiveUtils", "LaTeXStrings", "Markdown", "Pkg", "PlotlyBase", "PrecompileTools", "Reexport", "ScopedValues", "Scratch", "TOML"]
 git-tree-sha1 = "8acd04abc9a636ef57004f4c2e6f3f6ed4611099"
@@ -2638,6 +2238,12 @@ version = "0.6.5"
     [deps.PlutoPlotly.weakdeps]
     PlotlyKaleido = "f2990250-8cf9-495f-b13a-cce12b45703c"
     Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+
+[[deps.PlutoUI]]
+deps = ["AbstractPlutoDingetjes", "Base64", "ColorTypes", "Dates", "Downloads", "FixedPointNumbers", "Hyperscript", "HypertextLiteral", "IOCapture", "InteractiveUtils", "Logging", "MIMEs", "Markdown", "Random", "Reexport", "URIs", "UUIDs"]
+git-tree-sha1 = "fbc875044d82c113a9dee6fc14e16cf01fd48872"
+uuid = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
+version = "0.7.80"
 
 [[deps.Polynomials]]
 deps = ["LinearAlgebra", "OrderedCollections", "Setfield", "SparseArrays"]
@@ -2805,9 +2411,25 @@ git-tree-sha1 = "62389eeff14780bfe55195b7204c0d8738436d64"
 uuid = "ae029012-a4dd-5104-9daa-d747884805df"
 version = "1.3.1"
 
+[[deps.Revise]]
+deps = ["CodeTracking", "FileWatching", "InteractiveUtils", "JuliaInterpreter", "LibGit2", "LoweredCodeUtils", "OrderedCollections", "Preferences", "REPL", "UUIDs"]
+git-tree-sha1 = "5f4f629c085b87e71125eec6773f5f872c74a47a"
+uuid = "295af30f-e4ad-537b-8983-00126c2a3abe"
+version = "3.14.2"
+weakdeps = ["Distributed"]
+
+    [deps.Revise.extensions]
+    DistributedExt = "Distributed"
+
 [[deps.SHA]]
 uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 version = "0.7.0"
+
+[[deps.SIMD]]
+deps = ["PrecompileTools"]
+git-tree-sha1 = "e24dc23107d426a096d3eae6c165b921e74c18e4"
+uuid = "fdea26ae-647d-5447-a871-4b548cad5224"
+version = "3.7.2"
 
 [[deps.SciMLPublic]]
 git-tree-sha1 = "0ba076dbdce87ba230fff48ca9bca62e1f345c9b"
@@ -2816,9 +2438,9 @@ version = "1.0.1"
 
 [[deps.ScopedValues]]
 deps = ["HashArrayMappedTries", "Logging"]
-git-tree-sha1 = "ac4b837d89a58c848e85e698e2a2514e9d59d8f6"
+git-tree-sha1 = "67a144433c4ce877ee6d1ada69a124d6b1ecf7be"
 uuid = "7e506255-f358-4e82-b7e4-beb19740aa63"
-version = "1.6.0"
+version = "1.6.2"
 
 [[deps.Scratch]]
 deps = ["Dates"]
@@ -2897,9 +2519,9 @@ version = "1.0.4"
 
 [[deps.Static]]
 deps = ["CommonWorldInvalidations", "IfElse", "PrecompileTools", "SciMLPublic"]
-git-tree-sha1 = "49440414711eddc7227724ae6e570c7d5559a086"
+git-tree-sha1 = "bb072715f158b59ad8819ff80da5ffa90cce6ceb"
 uuid = "aedffcd0-7271-4cad-89d0-dc628f76c6d3"
-version = "1.3.1"
+version = "1.4.0"
 
 [[deps.StaticArrays]]
 deps = ["LinearAlgebra", "PrecompileTools", "Random", "StaticArraysCore"]
@@ -2966,9 +2588,9 @@ version = "0.3.1"
 
 [[deps.StructUtils]]
 deps = ["Dates", "UUIDs"]
-git-tree-sha1 = "86f5831495301b2a1387476cb30f86af7ab99194"
+git-tree-sha1 = "dd974aefe288ef2898733aecf40858dc86742d74"
 uuid = "ec057cc2-7a8d-4b58-b3b3-92acb9f63b42"
-version = "2.8.0"
+version = "2.8.1"
 
     [deps.StructUtils.extensions]
     StructUtilsMeasurementsExt = ["Measurements"]
@@ -3177,69 +2799,79 @@ version = "17.7.0+0"
 
 # ╔═╡ Cell order:
 # ╠═10000001-0000-0000-0000-000000000001
-# ╠═330652f1-0754-48a4-9a0f-4fb9d6824222
+# ╠═96817feb-6aa9-4f35-9277-9a4560e9a2a7
+# ╠═b30b5f82-cbeb-41aa-9a4f-212d6aafa760
+# ╠═e0c79630-dbe0-4110-b880-a9ee9e4e1186
+# ╠═206a2c26-b3cc-4e74-83e1-fa92aa0bdd10
+# ╠═bdeb2eb2-6b5d-4677-837c-7072e3588430
 # ╟─10000002-0000-0000-0000-000000000001
 # ╠═10000003-0000-0000-0000-000000000001
-# ╠═10000004-0000-0000-0000-000000000001
+# ╠═22ef4df8-9962-4443-aa48-cbc4bd5ddb59
+# ╟─10000004-0000-0000-0000-000000000001
 # ╠═10000005-0000-0000-0000-000000000001
 # ╠═10000006-0000-0000-0000-000000000001
 # ╠═10000007-0000-0000-0000-000000000001
+# ╠═0bf6c416-bf64-4b2a-b55e-623a4f9daae2
+# ╠═272932ae-4c54-41a2-8c9a-e1cd4834150a
 # ╠═10000008-0000-0000-0000-000000000001
-# ╟─1000000a-0000-0000-0000-000000000001
-# ╠═ef07d7ea-9aaa-4fed-b3f3-a6a2acc85650
-# ╠═0e5e3563-8738-4831-a9b5-16c6803743f7
-# ╠═a0416f71-242a-44a7-b8f6-186726318611
-# ╠═1000000c-0000-0000-0000-000000000001
-# ╠═e75270cd-5842-4132-9028-559135b9401f
-# ╠═f31b1233-fdc3-4cef-8836-1122a1b3e7d4
-# ╠═b1a7fdb4-7263-496e-8f9f-4d8a4429f351
-# ╠═fe5ee63d-6944-4557-834e-8e21231485f0
-# ╠═f8da318e-6ff2-4442-a737-28ff9d8f340a
-# ╠═e635aa3f-19de-4ce9-a478-c1252ddb7979
-# ╠═5e71db90-a0d1-47a4-bb32-dba21163e029
-# ╠═0652338c-5ab5-463d-8a4f-1f2314a01ba8
-# ╠═66ddf04d-ee60-4a0b-9444-d09af23685ea
+# ╠═10000008-0000-0000-0000-000000000005
+# ╠═1000000c-0000-0000-0000-000000000004
+# ╠═d5000001-0000-0000-0000-000000000001
+# ╠═c0000002-0000-0000-0000-000000000002
+# ╠═d5000002-0000-0000-0000-000000000002
+# ╠═c0000003-0000-0000-0000-000000000003
+# ╟─10000009-0000-0000-0000-000000000001
+# ╠═1000000a-0000-0000-0000-000000000001
+# ╠═1000000b-0000-0000-0000-000000000001
+# ╠═1000000c-0000-0000-0000-000000000003
+# ╠═1000000c-0000-0000-0000-000000000002
+# ╟─1000000c-0000-0000-0000-000000000001
+# ╠═1000000d-0000-0000-0000-000000000002
+# ╠═1000000d-0000-0000-0000-000000000001
+# ╠═10000008-0000-0000-0000-000000000002
+# ╠═10000008-0000-0000-0000-000000000003
+# ╠═10000008-0000-0000-0000-000000000004
 # ╠═1000000e-0000-0000-0000-000000000001
-# ╠═1000000f-0000-0000-0000-000000000001
-# ╠═10000010-0000-0000-0000-000000000001
+# ╠═66bc6645-a459-40fb-a871-2dd674e5bf9d
+# ╟─1000000f-0000-0000-0000-000000000001
+# ╟─10000010-0000-0000-0000-000000000001
+# ╠═3c23d4cb-4bf9-4b4b-a57f-fefdc8f29cf1
+# ╠═928d4238-216b-4f62-a4d7-62075275252b
+# ╠═3ef20afc-4c62-4aab-b96f-4e170f8d96dc
+# ╠═3ef20afc-4c62-4aab-b96f-4e170f8d96dd
+# ╠═3ef20afc-4c62-4aab-b96f-4e170f8d96de
+# ╠═f41c2e62-efbf-47c8-8b7e-adf828ffde4f
+# ╠═4057ac26-f7b5-4c26-8a5e-4796de1be81f
 # ╠═10000011-0000-0000-0000-000000000001
-# ╠═13634a6c-abda-4084-9b5b-f6761fd728ad
-# ╠═8950cf6d-f5d2-4bcc-90ab-12ecf79f7c35
-# ╠═91a4fb9f-f5d4-406f-b384-282d8a48257f
-# ╠═86dfe031-7e05-402b-8916-cc2d2758e6b4
-# ╠═092511ab-104e-4577-8cf5-dc6deeb73ac7
-# ╠═b1e8b57a-0fa3-492a-a3a1-036423f41373
-# ╠═2f88be66-ffea-4d0e-8ea5-65a39b7d10db
-# ╠═2ee07196-8b28-418c-a0d4-40866584bc6f
-# ╠═5c9d71d1-c6a6-4968-814d-66506a78b516
 # ╠═10000013-0000-0000-0000-000000000001
-# ╠═5e716b73-ab88-4b84-a8bf-dd064dc82fd8
-# ╠═2d6639d1-ae40-46d0-a811-e1fd34a23613
-# ╠═cf13347d-e1fa-4ec1-86dc-38299825f65b
-# ╠═7ec9f7d7-d311-4a53-9c7c-cb07dfd8c093
-# ╠═3442ef19-bf2f-4ebf-94fd-bce4dd378745
-# ╠═10000015-0000-0000-0000-000000000001
-# ╠═566e6a4c-1153-4c6c-bf2b-385478f684c4
-# ╠═a1e5a8cb-0bd1-44b8-8cd4-c95a667d830d
-# ╠═0b79d043-0805-43b3-80d7-f64d2018525f
-# ╠═4b8ffb0f-23b0-443d-b4c7-12a3ed4ac76d
-# ╠═8dd1c50c-587c-471d-bc80-cd77012302a9
-# ╠═7e26f064-6a32-41ce-b416-90a04adfbcc9
-# ╠═a6066ca6-1350-4c54-9857-99d195873e6c
-# ╠═8049c795-3466-4992-a617-686614b7ef47
-# ╠═a848319e-7bda-4844-a916-2bbdef1d5417
+# ╠═10000014-0000-0000-0000-000000000001
+# ╟─13c7f289-d698-453f-a9b1-65bf2c87f465
+# ╟─10000015-0000-0000-0000-000000000001
+# ╠═10000016-0000-0000-0000-000000000001
+# ╠═20ae1f67-cfaa-487d-8d94-a5f7b97b45fd
 # ╠═10000017-0000-0000-0000-000000000001
-# ╠═2f151b20-b956-404d-8fee-1e9cddfd6b62
-# ╠═b478bec8-14f6-4d78-89e5-2e76414c4d46
-# ╠═615f47c0-d72c-41f8-914e-7608b3b8c6d2
-# ╠═db53da0e-96ce-4a75-bcfc-32fdc4ffe064
-# ╠═4f2b1382-c158-417b-9fc0-1b8d04d90ed2
-# ╠═c974342d-4bcc-4175-9d71-8f9cfbb7105a
-# ╠═70a460bf-b3e4-4e7c-aa4d-2674a450379a
-# ╠═2168a07c-e17a-4e94-bec7-5f881a5b5f09
-# ╠═d7d22b36-79b6-41d6-b9ce-403d34d4165b
-# ╠═93982359-07a8-4259-8c14-f51794a462f9
-# ╠═f140b608-0c12-4c5e-8dad-1ac81f6e2d99
-# ╠═11834c5a-4618-11f1-a096-01b9cbdd6fab
+# ╠═10000018-0000-0000-0000-000000000001
+# ╠═baf864b2-8860-4486-b1b8-5967cb824c05
+# ╠═b11c9e24-6593-497c-a706-146619251e36
+# ╟─86843302-bb3b-494c-afe4-b9a43fcc0e7c
+# ╟─10000019-0000-0000-0000-000000000001
+# ╠═b00b61c7-81c6-467a-b8bd-9f9e2ebd4d0c
+# ╠═9c18f181-8d76-46a4-836d-c4fe2cad19c8
+# ╠═e0000001-0000-0000-0000-000000000001
+# ╠═fd286392-4902-11f1-964f-65a304aae057
+# ╠═ebb34459-2adf-4b90-8e06-2db4215548c8
+# ╠═084f1241-bd18-49cd-911c-5eb396c0a364
+# ╠═1000001a-0000-0000-0000-000000000001
+# ╠═1000001b-0000-0000-0000-000000000001
+# ╠═1000001c-0000-0000-0000-000000000001
+# ╠═ea4761ee-461d-4429-a13a-e872ae52cc66
+# ╠═b48757f3-a9f1-4ff4-b714-de58221a1660
+# ╠═52edc77f-d951-40a2-bae7-ed04e2c778ce
+# ╠═30265164-1bdf-493d-bbc4-6ef227a4fbfb
+# ╠═124f7e8b-8d6a-4a25-af36-e78eb323f03b
+# ╠═3207b4be-2278-4e89-afb7-205bcfdb839e
+# ╠═bc80aea7-5748-44c6-a0d4-f260e2a29c42
+# ╠═c19d4c52-4a33-11f1-a3fa-677e8b10e883
+# ╠═d1eec798-b7aa-4387-9a1e-71064e2660fd
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
