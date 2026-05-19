@@ -36,9 +36,6 @@ using FFTW, StatsBase, Peaks
 # ╔═╡ 75e66ac1-57bf-468d-ab55-ada1d5e9ef91
 using DSP
 
-# ╔═╡ c7d47e38-e24f-4b40-b3a4-bc894188a750
-mft = @ingredients("/mnt/NAS/EQData/SeismicAutoencoders/MFT.jl")
-
 # ╔═╡ b00fd94f-291e-46d8-84ff-48f8606c2a1e
 md"""
 # Trained VQ-VAE Source-State MFT Tomography
@@ -51,8 +48,24 @@ not load model weights, raw CCF data, or use GPU/Reactant.
 
 # ╔═╡ dcbf026e-957a-4b9b-9757-bd0638a25b26
 begin
-    saved_root = "/mnt/NAS2/Sanket_data/California_TO_with_latlong/SavedModels/vqvae_v8"
+    saved_root = "/mnt/NAS2/Sanket_data/California_TO_with_latlong/SavedModels/vqvae_v8_K=[5, 3]"
+# saved_root = 
+	# "/mnt/NAS2/Sanket_data/California_XJ_13032026/SavedModels/vqvae_v8_K=[5, 3]"
+# 
+	# saved_root = 
+	# 	"/mnt/NAS2/Sanket_data/California_2013_BK_CI_20032026/SavedModels/vqvae_v8"
 end
+
+# ╔═╡ f842f93e-16e8-4ec9-9c7f-c63d1f18c9f9
+@bind reload_saved_artifacts_button CounterButton("Reload saved source-state artifacts")
+
+# ╔═╡ b584dc56-8127-402c-98d0-1da3135f8f9a
+md"""
+## Appendix
+"""
+
+# ╔═╡ c7d47e38-e24f-4b40-b3a4-bc894188a750
+mft = @ingredients("/mnt/NAS/EQData/SeismicAutoencoders/MFT.jl")
 
 # ╔═╡ d50d63be-d58b-4704-8211-ed7875e04857
 md"## Saved Runs"
@@ -64,9 +77,6 @@ function _parse_seed_timestamp(run_dir::String)
     m === nothing && return (; seed=missing, timestamp=name)
     return (; seed=parse(Int, m.captures[1]), timestamp=m.captures[2])
 end
-
-# ╔═╡ f842f93e-16e8-4ec9-9c7f-c63d1f18c9f9
-@bind reload_saved_artifacts_button CounterButton("Reload saved source-state artifacts")
 
 # ╔═╡ e4499887-1a64-4eaa-a599-4ed4941a7b2d
 md"## Load Saved Source-State Averages"
@@ -102,38 +112,22 @@ function _load_saved_source_state_averages(run)
         assignment_table_ac_columns=haskey(d, "assignment_table_ac_columns") ? String.(d["assignment_table_ac_columns"]) : String[],
         assignment_table_c_columns=haskey(d, "assignment_table_c_columns") ? String.(d["assignment_table_c_columns"]) : String[],
         analysis_settings=d["analysis_settings"],
-        psd_dt=d["psd_dt"],
-        psd_periods=d["psd_periods"],
-        psd_frequencies=d["psd_frequencies"],
-        psd_acausal_states=d["psd_acausal_states"],
-        psd_causal_states=d["psd_causal_states"],
-        psd_global_ac=d["psd_global_ac"],
-        psd_global_c=d["psd_global_c"],
-        psd_window_mean_ac=d["psd_window_mean_ac"],
-        psd_window_mean_c=d["psd_window_mean_c"],
-        psd_state_window_mean_ac=d["psd_state_window_mean_ac"],
-        psd_state_window_mean_c=d["psd_state_window_mean_c"],
-        psd_state_window_counts_ac=d["psd_state_window_counts_ac"],
-        psd_state_window_counts_c=d["psd_state_window_counts_c"],
-        preprocessing_stage_names=String.(d["preprocessing_stage_names"]),
-        global_avg_raw_ac=d["global_avg_raw_ac"],
-        global_avg_raw_c=d["global_avg_raw_c"],
-        global_avg_whitened_ac=d["global_avg_whitened_ac"],
-        global_avg_whitened_c=d["global_avg_whitened_c"],
-        global_avg_despiked_ac=d["global_avg_despiked_ac"],
-        global_avg_despiked_c=d["global_avg_despiked_c"],
-        psd_window_mean_raw_ac=d["psd_window_mean_raw_ac"],
-        psd_window_mean_raw_c=d["psd_window_mean_raw_c"],
-        psd_window_mean_whitened_ac=d["psd_window_mean_whitened_ac"],
-        psd_window_mean_whitened_c=d["psd_window_mean_whitened_c"],
-        psd_window_mean_despiked_ac=d["psd_window_mean_despiked_ac"],
-        psd_window_mean_despiked_c=d["psd_window_mean_despiked_c"],
-        psd_global_raw_ac=d["psd_global_raw_ac"],
-        psd_global_raw_c=d["psd_global_raw_c"],
-        psd_global_whitened_ac=d["psd_global_whitened_ac"],
-        psd_global_whitened_c=d["psd_global_whitened_c"],
-        psd_global_despiked_ac=d["psd_global_despiked_ac"],
-        psd_global_despiked_c=d["psd_global_despiked_c"],
+        global_avg_raw_ac=haskey(d, "global_avg_raw_ac") ? d["global_avg_raw_ac"] : Float32[],
+        global_avg_raw_c=haskey(d, "global_avg_raw_c") ? d["global_avg_raw_c"] : Float32[],
+        global_avg_whitened_ac=haskey(d, "global_avg_whitened_ac") ? d["global_avg_whitened_ac"] : Float32[],
+        global_avg_whitened_c=haskey(d, "global_avg_whitened_c") ? d["global_avg_whitened_c"] : Float32[],
+        marginal_stage1_ac=haskey(d, "marginal_stage1_ac") ? Float32.(d["marginal_stage1_ac"]) : Float32[;;],
+        marginal_stage1_c=haskey(d, "marginal_stage1_c") ? Float32.(d["marginal_stage1_c"]) : Float32[;;],
+        marginal_stage2_ac=haskey(d, "marginal_stage2_ac") ? Float32.(d["marginal_stage2_ac"]) : Float32[;;],
+        marginal_stage2_c=haskey(d, "marginal_stage2_c") ? Float32.(d["marginal_stage2_c"]) : Float32[;;],
+        marginal_stage1_labels=haskey(d, "marginal_stage1_labels") ? String.(d["marginal_stage1_labels"]) : String[],
+        marginal_stage2_labels=haskey(d, "marginal_stage2_labels") ? String.(d["marginal_stage2_labels"]) : String[],
+        codebook_stage1_waves=haskey(d, "codebook_stage1_waves") ? Float32.(d["codebook_stage1_waves"]) : Float32[;;],
+        codebook_stage1_labels=haskey(d, "codebook_stage1_labels") ? String.(d["codebook_stage1_labels"]) : String[],
+        codebook_stage2_waves=haskey(d, "codebook_stage2_waves") ? Float32.(d["codebook_stage2_waves"]) : Float32[;;],
+        codebook_stage2_labels=haskey(d, "codebook_stage2_labels") ? String.(d["codebook_stage2_labels"]) : String[],
+        codebook_joint_waves=haskey(d, "codebook_joint_waves") ? Float32.(d["codebook_joint_waves"]) : Float32[;;],
+        codebook_joint_labels=haskey(d, "codebook_joint_labels") ? String.(d["codebook_joint_labels"]) : String[],
         whitening_fir=d["whitening_fir"],
         spike_bins=d["spike_bins"],
         distance=d["distance"],
@@ -148,6 +142,15 @@ end
 
 # ╔═╡ eec83733-193d-4f52-9a75-e6f1d03c7aa5
 md"## MFT By Receiver Pair"
+
+# ╔═╡ 2c887c9a-4a41-4d07-a295-f5c14cfdd110
+function _mean_global_branch(items, branch::Symbol)
+    vectors = [Float64.(vec(getproperty(item, branch))) for item in items]
+    isempty(vectors) && return Float64[]
+    n = minimum(length.(vectors))
+    n == 0 && return Float64[]
+    return vec(mean(hcat((v[1:n] for v in vectors)...); dims=2))
+end
 
 # ╔═╡ b350e7a5-ae7e-46ca-a246-d60b66a68e17
 md"## Geometry-Aware Tomography Candidate Mixes"
@@ -169,106 +172,8 @@ end
 # ╔═╡ e89d81cb-8596-4364-8241-01578fb81c6b
 md"## Quick Plots"
 
-# ╔═╡ b1b909cb-b1a2-4bb3-80ce-329bc4180f22
-function _column_normalise(X)
-    Xf = Float64.(X)
-    return mapslices(x -> begin
-        n = norm(x)
-        n > 0 ? x ./ n : x
-    end, Xf; dims=1)
-end
-
-# ╔═╡ a9f48ca7-90de-43da-910a-2fd26c224973
-function _vector_normalise(x)
-    xf = Float64.(vec(x))
-    n = norm(xf)
-    return n > 0 ? xf ./ n : xf
-end
-
-# ╔═╡ e42e1c5e-3c20-4c64-a7a3-94c2dd7dbef8
-function _ncc(a, b)
-    a0 = Float64.(vec(a)) .- mean(a)
-    b0 = Float64.(vec(b)) .- mean(b)
-    return dot(a0, b0) / ((norm(a0) * norm(b0)) + 1e-8)
-end
-
-# ╔═╡ a4e94c0e-0524-4aae-a105-1d30b941aaf8
-_compact_number(x) = @sprintf("%g", Float64(x))
-
-# ╔═╡ ea9d425c-4285-4868-9a65-677e5dc7e7da
-function plot_saved_source_state_waveforms(item; dt, velocity_range, period_min, period_max)
-    isnothing(item) && return PlutoPlotly.plot(PlutoPlotly.scatter(x=[0], y=[0], text=["No saved run selected"]))
-    cluster_avg_ac = _column_normalise(item.acausal)
-    cluster_avg_c = _column_normalise(item.causal)
-    nth = size(cluster_avg_ac, 1)
-    t_neg = [-(nth - i + 1) * dt for i in 1:nth]
-    t_pos = [i * dt for i in 1:nth]
-    t_full = [t_neg; t_pos]
-
-    global_avg_ac = _vector_normalise(item.global_avg_ac)
-    global_avg_c = _vector_normalise(item.global_avg_c)
-    global_full = [reverse(global_avg_ac); global_avg_c]
-    global_ncc = _ncc(global_avg_ac, global_avg_c)
-
-    combo_labels_local = item.combo_labels
-    ncomb = size(cluster_avg_ac, 2)
-    traces = AbstractTrace[]
-    colors = begin
-        nc = max(ncomb, 1)
-        cs = ColorSchemes.rainbow
-        [Colors.hex(get(cs, (i - 1) / max(1, nc - 1))) for i in 1:nc]
-    end
-
-    total_ac = sum(item.counts_ac)
-    total_c = sum(item.counts_c)
-    amp_peak = maximum(abs.(vcat(vec(cluster_avg_ac), vec(cluster_avg_c), global_full)))
-    vertical_spacing = amp_peak * 2.5 + 1e-3
-
-    for combo_idx in 1:ncomb
-        c = colors[mod1(combo_idx, length(colors))]
-        a = cluster_avg_ac[:, combo_idx]
-        b = cluster_avg_c[:, combo_idx]
-        full_k = [reverse(a); b]
-        ncc = _ncc(a, b)
-        pct_ac = 100 * item.counts_ac[combo_idx] / max(total_ac, 1)
-        pct_c = 100 * item.counts_c[combo_idx] / max(total_c, 1)
-        state_label = combo_idx <= length(combo_labels_local) ? combo_labels_local[combo_idx] : string(combo_idx)
-        legend_label = "State $(state_label) (ac: $(round(pct_ac; digits=1))%, c: $(round(pct_c; digits=1))%, corr=$(round(ncc; digits=3)))"
-        offset = (combo_idx - 1) * vertical_spacing
-        push!(traces, PlutoPlotly.scatter(x=t_full, y=global_full .+ offset, mode="lines",
-            name=combo_idx == 1 ? "Global mean (corr=$(round(global_ncc; digits=3)))" : "Global mean",
-            showlegend=combo_idx == 1,
-            line=attr(color="rgba(0,0,0,0.18)", width=3)))
-        push!(traces, PlutoPlotly.scatter(x=t_full, y=full_k .+ offset, mode="lines",
-            name=legend_label, line=attr(color=c, width=2)))
-    end
-
-    shapes = if isnothing(item.distance)
-        []
-    else
-        vmin, vmax = velocity_range
-        t_fast = item.distance / vmax
-        t_slow = item.distance / vmin
-        [attr(type="line", x0=t, x1=t, y0=0, y1=1, yref="paper",
-              line=attr(color="rgba(0,0,0,0.25)", width=1, dash="dash"))
-         for t in (-t_slow, -t_fast, t_fast, t_slow)]
-    end
-
-    distance_label = isnothing(item.distance) ? "distance unavailable" : "$(round(Int, item.distance))km"
-    title = "Source State Average Waveforms ($(item.pair_label) seed=$(item.seed) $(distance_label) $(_compact_number(period_min))-$(_compact_number(period_max))s)"
-    return PlutoPlotly.plot(traces, PlutoPlotly.Layout(
-        title=attr(text=title, font=attr(size=18, family="Computer Modern, serif")),
-        height=500 * max(1, cld(ncomb, 5)),
-        width=900,
-        xaxis=attr(title="Lag (s)", zeroline=true, zerolinecolor="rgba(0,0,0,0.3)"),
-        yaxis=attr(title="Amplitude"),
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        legend=attr(x=0.5, xanchor="center", y=-0.2, orientation="h",
-            font=attr(size=12, family="Computer Modern, serif")),
-        shapes=shapes,
-    ))
-end
+# ╔═╡ c3000001-0000-0000-0000-000000000001
+md"## Codebook Waveform MFT"
 
 # ╔═╡ b4c9a332-7e9f-4933-b12f-7c13f6d5f112
 function _read_saved_analysis_settings(run_dir::String)
@@ -301,13 +206,16 @@ function discover_vqvae_runs(saved_root::String)
 end
 
 # ╔═╡ ed704922-12f0-475b-b628-19a9c37bca7a
-all_saved_runs = discover_vqvae_runs(saved_root)
+begin
+	reload_saved_artifacts_button
+	all_saved_runs = discover_vqvae_runs(saved_root)
+end
 
 # ╔═╡ e216a473-6433-4658-b2b7-a4eaa670cc5e
 begin
     pair_options = sort(unique([run.pair_label for run in all_saved_runs]))
     default_pair_names = pair_options[1:min(end, 8)]
-    @bind selected_pair_names confirm(MultiCheckBox(pair_options; default=default_pair_names))
+    @bind selected_pair_names confirm(MultiCheckBox(pair_options; default=[]))
 end
 
 # ╔═╡ d8d742f8-b6d4-44e0-bf11-29ff4d22e117
@@ -386,6 +294,45 @@ selected_source_state_item = begin
     end
 end
 
+# ╔═╡ c3000006-0000-0000-0000-000000000001
+let
+    item = selected_source_state_item
+    if isnothing(item)
+        md""
+    else
+        has_joint  = !isempty(item.codebook_joint_waves)
+        has_stage2 = !isempty(item.codebook_stage2_waves)
+        opts = ["stage1"]
+        has_stage2  && push!(opts, "stage2")
+        has_joint   && push!(opts, "joint (K1×K2)")
+        @bind ui_codebook_mode Select(opts; default=last(opts))
+    end
+end
+
+# ╔═╡ b2000001-0000-0000-0000-000000000001
+if isnothing(selected_source_state_item)
+    md""
+else
+    WideCell(mft.plot_cluster_histogram(
+        selected_source_state_item.counts_ac,
+        selected_source_state_item.counts_c;
+        labels=selected_source_state_item.combo_labels,
+        title="Source State Usage ($(selected_source_state_item.pair_label) seed=$(selected_source_state_item.seed))",
+    ))
+end
+
+# ╔═╡ b2000002-0000-0000-0000-000000000001
+if isnothing(selected_source_state_item)
+    md""
+else
+    WideCell(mft.plot_state_ncc_heatmap(
+        selected_source_state_item.acausal,
+        selected_source_state_item.causal;
+        labels=selected_source_state_item.combo_labels,
+        title="State-State NCC ($(selected_source_state_item.pair_label) seed=$(selected_source_state_item.seed))",
+    ))
+end
+
 # ╔═╡ eb76dfcf-b8ce-445d-a152-52eb8a6f94a7
 analysis_settings = begin
     isempty(selected_runs) && error("Select at least one saved run.")
@@ -412,6 +359,33 @@ end
 
 # ╔═╡ 067d2587-8eb1-41c3-95f8-9f785171f2ce
 mft_periods = exp10.(range(log10(Float64(period_min)), log10(Float64(period_max)); length=mft_nperiods))
+
+# ╔═╡ 61b6bba8-38c5-43a4-9d32-a95b1b7ccfd8
+global_average_mft_analyses = let
+    analyses = Dict{String,Any}()
+    for pair_label in pair_labels
+        items = [item for item in run_source_state_averages if item.pair_label == pair_label]
+        isempty(items) && continue
+        ref_item = first(items)
+        global_c = _mean_global_branch(items, :global_avg_c)
+        global_ac = _mean_global_branch(items, :global_avg_ac)
+        (isempty(global_c) || isempty(global_ac)) && continue
+        n = min(length(global_c), length(global_ac))
+        c_trace = mft.SeismicTrace(data=global_c[1:n], dt=dt, distance=ref_item.distance)
+        ac_trace = mft.SeismicTrace(data=global_ac[1:n], dt=dt, distance=ref_item.distance)
+        analyses[pair_label] = mft.analyze_causal_acausal_branches(
+            c_trace, ac_trace, mft_periods;
+            max_modes=mft_max_modes,
+            velocity_range=velocity_range,
+            bandwidth_factor=bandwidth_factor,
+            zero_pad_factor=zero_pad_factor,
+        )
+    end
+    analyses
+end
+
+# ╔═╡ a55f4597-feda-4c04-ae53-75a082be08ed
+global_average_mft_analyses[selected_plot_pair]
 
 # ╔═╡ c61a6cfe-b14e-4aa9-a711-450e35a3a9bd
 pair_mft_analyses = let
@@ -443,12 +417,22 @@ pair_mft_analyses = let
 end
 
 # ╔═╡ 5064e2e2-1272-48ad-a417-02772071be86
-WideCell(mft.plot_all_highcorr_groupvelocity_picks(pair_mft_analyses[selected_plot_pair]; correlation_threshold=0.0, pair_and_average=true, title=string("Group Velocity Picks "), velocity_tolerance_fraction=0.1))
+WideCell(mft.plot_all_highcorr_groupvelocity_picks(
+    pair_mft_analyses[selected_plot_pair];
+    correlation_threshold=0.0,
+    pair_and_average=true,
+    title=string("Group Velocity Picks "),
+    velocity_tolerance_fraction=0.1,
+    reference_results=haskey(global_average_mft_analyses, selected_plot_pair) ? [global_average_mft_analyses[selected_plot_pair]] : mft.BranchAnalysisResult[],
+    reference_labels=["Global avg"],
+))
 
 # ╔═╡ c04cb032-ff13-4dfe-9338-70c5ce785db2
  WideCell(mft.plot_branch_correlation(
         pair_mft_analyses[selected_plot_pair];
-        title="MFT Branch Correlation"))
+        title="MFT Branch Correlation",
+        reference_results=haskey(global_average_mft_analyses, selected_plot_pair) ? [global_average_mft_analyses[selected_plot_pair]] : mft.BranchAnalysisResult[],
+        reference_labels=["Global average"]))
 
 # ╔═╡ a7c6d7af-cec7-4c4c-adb6-e2b370a49042
 pair_consensus = Dict(pair_label => mft.consensus_group_velocity_picks(
@@ -462,6 +446,19 @@ pair_consensus = Dict(pair_label => mft.consensus_group_velocity_picks(
     max_smooth_jump_fraction=0.08,
     max_gap_periods=1,
 ) for (pair_label, analysis) in pair_mft_analyses)
+
+# ╔═╡ e3767110-37f7-4e37-a01f-93f72dcda465
+if isempty(pair_labels) || !(selected_plot_pair in keys(pair_mft_analyses))
+    md""
+else
+    WideCell(mft.plot_consensus_groupvelocity_picks(
+        pair_mft_analyses[selected_plot_pair],
+        pair_consensus[selected_plot_pair];
+        correlation_threshold=0.0,
+        velocity_tolerance_fraction=0.10,
+        title="Trained VQ-VAE source-state consensus $(selected_plot_pair)",
+    ))
+end
 
 # ╔═╡ ec938992-7a8a-45e0-b38e-4ba40bc7dfdc
 md"Computed MFT consensus candidates for **$(length(pair_consensus))** receiver pairs."
@@ -499,24 +496,34 @@ tomography_candidate_mixes = mft.tomography_candidate_mixes(
 # ╔═╡ d8609990-6852-40c4-81e5-59474f5ebd7c
 candidate_mix_table(tomography_candidate_mixes; n=30)
 
-# ╔═╡ e3767110-37f7-4e37-a01f-93f72dcda465
-if isempty(pair_labels) || !(selected_plot_pair in keys(pair_mft_analyses))
-    md""
+# ╔═╡ b2000003-0000-0000-0000-000000000001
+if haskey(pair_mft_analyses, selected_plot_pair)
+    @bind ui_period_trained Slider(pair_mft_analyses[selected_plot_pair].periods;
+        default=mean(pair_mft_analyses[selected_plot_pair].periods), show_value=true)
 else
-    WideCell(mft.plot_consensus_groupvelocity_picks(
-        pair_mft_analyses[selected_plot_pair],
-        pair_consensus[selected_plot_pair];
-        correlation_threshold=0.0,
-        velocity_tolerance_fraction=0.10,
-        title="Trained VQ-VAE source-state consensus $(selected_plot_pair)",
+    md""
+end
+
+# ╔═╡ b2000004-0000-0000-0000-000000000001
+if haskey(pair_mft_analyses, selected_plot_pair)
+    WideCell(mft.plot_filtered_traces_by_period(
+        pair_mft_analyses[selected_plot_pair];
+        period=ui_period_trained,
+        correlation_threshold=nothing,
+        normalize_each=true,
+        scale=0.7,
+        spacing=2.2,
+        title="MFT Filtered Traces ($(selected_plot_pair); period=$(round(ui_period_trained; digits=2))s)",
     ))
+else
+    md""
 end
 
 # ╔═╡ c753f15f-12ab-4f54-92f2-59d96197f85c
 if isnothing(selected_source_state_item)
     md""
 else
-    WideCell(plot_saved_source_state_waveforms(
+    WideCell(mft.plot_source_state_waveforms(
         selected_source_state_item;
         dt=dt,
         velocity_range=velocity_range,
@@ -560,45 +567,85 @@ dist=  selected_source_state_item.distance
 end
 
 
-# ╔═╡ aa37837d-6ba8-4356-acfa-452e10b03a50
-function plot_top_tomography_mixes(mixes, pairs; n::Int=25)
-    traces = [PlutoPlotly.scatter()]
-    isempty(mixes) && return PlutoPlotly.plot(PlutoPlotly.scatter(x=[0], y=[0], text=["No mixes"]))
-    top = mixes[1:min(n, length(mixes))]
-    all_vels = Float64[]
-    colors = [Colors.hex(get(ColorSchemes.viridis, (i - 1) / max(1, length(top) - 1))) for i in 1:length(top)]
-    for (i, mix) in enumerate(top)
-        valid = findall(v -> isfinite(v) && v > 0.0, mix.group_velocities)
-        isempty(valid) && continue
-        append!(all_vels, mix.group_velocities[valid])
-        pair = pairs[mix.pair_index]
-        push!(traces, PlutoPlotly.scatter(
-            x=pair.consensus.periods[valid],
-            y=mix.group_velocities[valid],
-            mode="lines+markers",
-            name=mix.label,
-            line=attr(color=colors[i], width=2),
-            marker=attr(size=6, color=colors[i]),
-            customdata=[[mix.total_score, mix.neighbor_agreement, mix.coverage_count] for _ in valid],
-            hovertemplate="%{fullData.name}<br>Period: %{x:.2f} s<br>v_g: %{y:.3f} km/s<br>Score: %{customdata[0]:.3f}<br>Neighbor agree: %{customdata[1]:.3f}<br>Periods: %{customdata[2]}<extra></extra>",
-        ))
+# ╔═╡ c3000002-0000-0000-0000-000000000001
+codebook_mft_analysis = let
+    item = selected_source_state_item
+    isnothing(item) && error("Select a saved run above.")
+
+    has_joint  = !isempty(item.codebook_joint_waves)
+    has_stage1 = !isempty(item.codebook_stage1_waves)
+    has_stage2 = !isempty(item.codebook_stage2_waves)
+    (has_stage1 || has_joint) || error("No codebook waves in artifact. Re-save this run.")
+
+    mode = @isdefined(ui_codebook_mode) ? String(ui_codebook_mode) : (has_joint ? "joint (K1×K2)" : "stage1")
+
+    waves, labels = if mode == "joint (K1×K2)" && has_joint
+        item.codebook_joint_waves, item.codebook_joint_labels
+    elseif mode == "stage2" && has_stage2
+        item.codebook_stage2_waves, item.codebook_stage2_labels
+    else
+        item.codebook_stage1_waves, item.codebook_stage1_labels
     end
-    isempty(all_vels) && return PlutoPlotly.plot(PlutoPlotly.scatter(x=[0], y=[0], text=["No valid velocities"]))
-    return PlutoPlotly.plot(traces, PlutoPlotly.Layout(
-        title="Top trained-VQ-VAE tomography candidate mixes",
-        xaxis=attr(title="Period (s)", type="linear", range=[period_min, period_max]),
-        yaxis=attr(title="Group velocity (km/s)", range=[0.9 * minimum(all_vels), 1.1 * maximum(all_vels)]),
-        width=1200,
-        height=720,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        legend=attr(x=1.02, y=1.0),
-        margin=attr(l=80, r=180, t=70, b=70),
-    ))
+
+    dist = item.distance
+    traces = [mft.SeismicTrace(data=Float64.(waves[:, k]), dt=dt, distance=dist)
+              for k in 1:length(labels)]
+
+    global_ac = Float64.(vec(item.global_avg_ac))
+    global_c  = Float64.(vec(item.global_avg_c))
+    n_ref = min(length(global_ac), length(global_c))
+    reference_result = mft.analyze_causal_acausal_branches(
+        mft.SeismicTrace(data=global_c[1:n_ref], dt=dt, distance=dist),
+        mft.SeismicTrace(data=global_ac[1:n_ref], dt=dt, distance=dist),
+        mft_periods;
+        max_modes=mft_max_modes,
+        velocity_range=velocity_range,
+        bandwidth_factor=bandwidth_factor,
+        zero_pad_factor=zero_pad_factor,
+    )
+
+    batch_result = mft.analyze_causal_acausal_branches(
+        traces, traces, mft_periods;
+        state_labels=String.(labels),
+        max_modes=mft_max_modes,
+        velocity_range=velocity_range,
+        bandwidth_factor=bandwidth_factor,
+        zero_pad_factor=zero_pad_factor,
+    )
+
+    (; batch=batch_result, reference=reference_result,
+       pair_label=item.pair_label, seed=item.seed, mode)
 end
 
+# ╔═╡ c3000005-0000-0000-0000-000000000001
+WideCell(mft.plot_all_highcorr_groupvelocity_picks(
+    codebook_mft_analysis.batch;
+    correlation_threshold=0.0,
+    pair_and_average=true,
+    title="Codebook GV Picks ($(codebook_mft_analysis.pair_label) seed=$(codebook_mft_analysis.seed))",
+    velocity_tolerance_fraction=0.1,
+    reference_results=[codebook_mft_analysis.reference],
+    reference_labels=["Global avg"],
+))
+
+# ╔═╡ c3000003-0000-0000-0000-000000000001
+@bind ui_period_codebook Slider(codebook_mft_analysis.batch.periods;
+    default=mean(codebook_mft_analysis.batch.periods), show_value=true)
+
+# ╔═╡ c3000004-0000-0000-0000-000000000001
+WideCell(mft.plot_filtered_traces_by_period(
+    codebook_mft_analysis.batch;
+    period=ui_period_codebook,
+    correlation_threshold=nothing,
+    normalize_each=true,
+    scale=0.7,
+    spacing=2.2,
+    title="Codebook MFT Filtered Traces ($(codebook_mft_analysis.pair_label) seed=$(codebook_mft_analysis.seed); period=$(round(ui_period_codebook; digits=2))s)",
+))
+
 # ╔═╡ f06d6be1-7986-4d46-bb9a-dd634a6a44c5
-WideCell(plot_top_tomography_mixes(tomography_candidate_mixes, tomography_pair_inputs; n=20))
+WideCell(mft.plot_top_tomography_mixes(tomography_candidate_mixes, tomography_pair_inputs;
+    n=20, period_min=period_min, period_max=period_max))
 
 # ╔═╡ cc15f5d5-764d-4ee8-a8f2-862c5207c630
 md"""
@@ -1420,31 +1467,40 @@ version = "17.7.0+0"
 """
 
 # ╔═╡ Cell order:
+# ╟─b00fd94f-291e-46d8-84ff-48f8606c2a1e
+# ╠═dcbf026e-957a-4b9b-9757-bd0638a25b26
+# ╟─f842f93e-16e8-4ec9-9c7f-c63d1f18c9f9
+# ╟─e216a473-6433-4658-b2b7-a4eaa670cc5e
+# ╟─a4c73d31-cada-44dd-81c8-fbb0f5e84f6a
+# ╟─c3000006-0000-0000-0000-000000000001
+# ╟─d7a8effd-1bc2-4f21-a947-7e8bbf82349a
+# ╟─e3767110-37f7-4e37-a01f-93f72dcda465
+# ╠═5064e2e2-1272-48ad-a417-02772071be86
+# ╠═a55f4597-feda-4c04-ae53-75a082be08ed
+# ╟─c04cb032-ff13-4dfe-9338-70c5ce785db2
+# ╟─f30a7fe9-67f2-438e-9b9c-57e41b583c0e
+# ╟─c3000005-0000-0000-0000-000000000001
+# ╟─b584dc56-8127-402c-98d0-1da3135f8f9a
 # ╠═a0f8a2b4-8fb5-4f06-bda6-c362a61065a1
 # ╠═2f66e040-8d6d-4376-b97d-0169cbdc1efe
 # ╠═75e66ac1-57bf-468d-ab55-ada1d5e9ef91
 # ╠═c7d47e38-e24f-4b40-b3a4-bc894188a750
-# ╟─b00fd94f-291e-46d8-84ff-48f8606c2a1e
-# ╠═dcbf026e-957a-4b9b-9757-bd0638a25b26
 # ╟─d50d63be-d58b-4704-8211-ed7875e04857
 # ╠═c7ec82e0-d5b6-4f31-8600-c8b1d276dc92
 # ╠═e63099d0-5fb5-43b0-967c-b7c468dc4f83
 # ╠═ed704922-12f0-475b-b628-19a9c37bca7a
-# ╠═e216a473-6433-4658-b2b7-a4eaa670cc5e
 # ╠═b5a1cf7d-d464-4409-b43a-074c8aa22108
-# ╟─a4c73d31-cada-44dd-81c8-fbb0f5e84f6a
-# ╠═f842f93e-16e8-4ec9-9c7f-c63d1f18c9f9
 # ╟─e4499887-1a64-4eaa-a599-4ed4941a7b2d
 # ╠═e4f7b3cf-7f26-4ea9-b9bb-95f3df9e7790
 # ╠═02d134b5-7ce3-47a9-86ef-a43e6c52287a
 # ╠═ddfd42a8-4ae7-408a-8b8f-2d335746798b
 # ╟─b7c7a358-71c8-4797-a259-68bc75ab6e65
 # ╟─eec83733-193d-4f52-9a75-e6f1d03c7aa5
+# ╠═2c887c9a-4a41-4d07-a295-f5c14cfdd110
+# ╠═61b6bba8-38c5-43a4-9d32-a95b1b7ccfd8
 # ╠═067d2587-8eb1-41c3-95f8-9f785171f2ce
 # ╠═b01af348-c4b0-4ad1-81cd-116e9f2ed765
 # ╠═c61a6cfe-b14e-4aa9-a711-450e35a3a9bd
-# ╠═5064e2e2-1272-48ad-a417-02772071be86
-# ╠═c04cb032-ff13-4dfe-9338-70c5ce785db2
 # ╠═a7c6d7af-cec7-4c4c-adb6-e2b370a49042
 # ╟─ec938992-7a8a-45e0-b38e-4ba40bc7dfdc
 # ╟─b350e7a5-ae7e-46ca-a246-d60b66a68e17
@@ -1454,18 +1510,17 @@ version = "17.7.0+0"
 # ╠═d8609990-6852-40c4-81e5-59474f5ebd7c
 # ╟─e89d81cb-8596-4364-8241-01578fb81c6b
 # ╠═50bcfca1-b35c-4af5-8da7-26e6a9aa7914
-# ╟─f30a7fe9-67f2-438e-9b9c-57e41b583c0e
 # ╠═dccacb14-c2de-43a2-943c-0e52a5e1276f
-# ╠═b1b909cb-b1a2-4bb3-80ce-329bc4180f22
-# ╠═a9f48ca7-90de-43da-910a-2fd26c224973
-# ╠═e42e1c5e-3c20-4c64-a7a3-94c2dd7dbef8
-# ╠═a4e94c0e-0524-4aae-a105-1d30b941aaf8
-# ╠═ea9d425c-4285-4868-9a65-677e5dc7e7da
 # ╠═c753f15f-12ab-4f54-92f2-59d96197f85c
+# ╠═b2000001-0000-0000-0000-000000000001
+# ╠═b2000002-0000-0000-0000-000000000001
+# ╠═b2000003-0000-0000-0000-000000000001
+# ╠═b2000004-0000-0000-0000-000000000001
 # ╠═d1d675f4-ebea-4432-8d0e-ddeada2f5fa3
-# ╠═d7a8effd-1bc2-4f21-a947-7e8bbf82349a
-# ╠═e3767110-37f7-4e37-a01f-93f72dcda465
-# ╠═aa37837d-6ba8-4356-acfa-452e10b03a50
+# ╟─c3000001-0000-0000-0000-000000000001
+# ╠═c3000002-0000-0000-0000-000000000001
+# ╟─c3000003-0000-0000-0000-000000000001
+# ╠═c3000004-0000-0000-0000-000000000001
 # ╠═f06d6be1-7986-4d46-bb9a-dd634a6a44c5
 # ╠═b4c9a332-7e9f-4933-b12f-7c13f6d5f112
 # ╠═d8d742f8-b6d4-44e0-bf11-29ff4d22e117

@@ -39,6 +39,9 @@ using Distances
 # ╔═╡ 206a2c26-b3cc-4e74-83e1-fa92aa0bdd10
 using PlutoHooks
 
+# ╔═╡ c672d254-b73d-4191-86a5-ae11be0df3cb
+using ProgressLogging
+
 # ╔═╡ bdeb2eb2-6b5d-4677-837c-7072e3588430
 begin
     using ConcreteStructs,
@@ -70,15 +73,14 @@ trained source states to MFT.
     vqvae = @ingredients("/mnt/NAS/EQData/SeismicAutoencoders/VQVAE_architecture_v8.jl")
 
 
-# ╔═╡ 22ef4df8-9962-4443-aa48-cbc4bd5ddb59
- mft = @ingredients("/mnt/NAS/EQData/SeismicAutoencoders/MFT.jl")
-
 # ╔═╡ 10000004-0000-0000-0000-000000000001
 md"## Data and Pair Selection"
 
 # ╔═╡ 10000005-0000-0000-0000-000000000001
 begin
     data_filepath = "/mnt/NAS2/Sanket_data/California_TO_with_latlong/"
+	# data_filepath = "/mnt/NAS2/Sanket_data/California_XJ_13032026/"
+	# data_filepath = "/mnt/NAS2/Sanket_data/California_2013_BK_CI_20032026/"
     dt = 1.0
     period_min = 3
     period_max = 10
@@ -89,15 +91,19 @@ begin
     bandwidth_factor = 0.15
     zero_pad_factor = 4
     use_latest_run_per_seed = true
+    training_n_max = 12000  # maximum pooled waveforms per pair; use nothing for no cap
 end
 
 # ╔═╡ 1000000c-0000-0000-0000-000000000004
-whitening_kernel_length = 64   # FIR tap count for spectral whitening (longer = sharper freq resolution)
-
-# ╔═╡ d5000001-0000-0000-0000-000000000001
 begin
-	spike_threshold   = 5.5   # bins exceeding this × median PSD are treated as spikes
-	spike_suppression = 0.25   # fraction of spike power to keep after suppression (0=zero, 1=no change)
+	whitening_kernel_length = 256   # FIR tap count for spectral whitening (longer = sharper freq resolution)
+	per_waveform_whitening_kernel_length = 256  # per-waveform FIR taps; longer = closer to phase-only
+end
+
+# ╔═╡ c0000002-0000-0000-0000-000000000002
+bp_filter = let
+    responsetype = Bandpass(inv(period_max), inv(period_min))
+    digitalfilter(responsetype, Butterworth(2); fs=inv(dt))
 end
 
 # ╔═╡ 10000009-0000-0000-0000-000000000001
@@ -107,7 +113,7 @@ md"## Hyperparameters"
 vqvae_parameters = (;
     d=24,
     beta_commit=0.25f0,
-    K=[5],
+    K=[5,3],
     ema_decay=0.99f0,
     n_filters=32,
     ratios=[2, 5],
@@ -131,7 +137,7 @@ training_para = vqvae.VQVAE_Training_Para(
     weight_decay=0.0,
     Mnn_schedule=[(1, 128), (5, 256), (26, 256)],
     warmup_epochs=0,
-	verbose = true,
+	verbose = false,
 	knn_search_chunk_size_fraction = 0.25,
     index_refresh_every=2,
 )
@@ -159,16 +165,24 @@ begin
     if !@isdefined(compiled_model_key_cache_v8)
         const compiled_model_key_cache_v8 = Ref{Any}(nothing)
     end
+    # force recompile when notebook is re-evaluated
+    compiled_model_key_cache_v8[] = nothing
 end
+
+# ╔═╡ 10000008-0000-0000-0000-000000000003
+selected_pairs_key = (
+    vqvae_parameters=vqvae_parameters,
+    training_batchsize=training_para.batchsize,
+    warmup_epochs=training_para.warmup_epochs,
+    index_refresh_every=training_para.index_refresh_every,
+    training_n_max=training_n_max,
+)
 
 # ╔═╡ 1000000f-0000-0000-0000-000000000001
 md"## Inspect One Result"
 
-# ╔═╡ 10000015-0000-0000-0000-000000000001
-md"## Source-State Averages and MFT"
-
-# ╔═╡ baf864b2-8860-4486-b1b8-5967cb824c05
-velocity_range
+# ╔═╡ 7f4e1dc2-f3dd-45b2-8818-6eff1ed4f7b5
+@bind save_recon_examples_button CounterButton("Save 100 raw recon examples")
 
 # ╔═╡ b00b61c7-81c6-467a-b8bd-9f9e2ebd4d0c
 result_title_context(result) = begin
@@ -203,7 +217,7 @@ begin
 end
 
 # ╔═╡ 0bf6c416-bf64-4b2a-b55e-623a4f9daae2
-@bind selected_pair_names confirm(MultiCheckBox(pair_options; default=default_pair_names))
+@bind selected_pair_names confirm(MultiCheckBox(pair_options; default=default_pair_names, select_all=true))
 
 # ╔═╡ 272932ae-4c54-41a2-8c9a-e1cd4834150a
 selected_pair_names
@@ -221,136 +235,46 @@ end
 # ╔═╡ 10000008-0000-0000-0000-000000000005
 pairs_data = vqvae.load_pairs_data(selected_pairs;
     filepath=data_filepath, seed=1234,
-    dt=dt, period_min=period_min, period_max=period_max)
-
-# ╔═╡ c0000002-0000-0000-0000-000000000002
-pairs_data_whitened_raw = map(pairs_data) do pd
-    fir = vqvae.compute_whitening_fir(pd.data.D_train, Float64(dt);
-        kernel_length=whitening_kernel_length, min_power_fraction=0.05)
-    D_train_w = Float32.(MLUtils.normalise(vqvae.apply_whitening_fir(pd.data.D_train, fir); dims=1))
-    D_test_w  = Float32.(MLUtils.normalise(vqvae.apply_whitening_fir(pd.data.D_test,  fir); dims=1))
-    D_ac_w = Float32.(MLUtils.normalise(vqvae.apply_whitening_fir(pd.data.D_ac_all, fir); dims=1))
-    D_c_w = Float32.(MLUtils.normalise(vqvae.apply_whitening_fir(pd.data.D_c_all, fir); dims=1))
-    D_all_w = Float32.(hcat(D_ac_w, D_c_w))
-    merge(pd, (;
-        data=merge(pd.data, (; D_train=D_train_w, D_test=D_test_w,
-            D_all=D_all_w, D_ac_all=D_ac_w, D_c_all=D_c_w)),
-        data_bundle=merge(pd.data_bundle, (;
-            D1fac_raw=pd.data_bundle.D1fac,
-            D1fc_raw=pd.data_bundle.D1fc,
-            D1fac_whitened=D_ac_w,
-            D1fc_whitened=D_c_w,
-            D1fac=D_ac_w,
-            D1fc=D_c_w,
-            whitening_fir=fir,
-        )),
-        whitening_fir=fir,
-    ))
-end
+    dt=dt, period_min=period_min, period_max=period_max,
+    n_max=training_n_max)
 
 # ╔═╡ d5000002-0000-0000-0000-000000000002
-pairs_data_whitened = map(pairs_data_whitened_raw) do pd
-    spike_bins, _P_half, _med = vqvae.detect_spectral_spikes(pd.data.D_train;
-        spike_threshold=spike_threshold)
-    if isempty(spike_bins)
-        merge(pd, (;
-            data_bundle=merge(pd.data_bundle, (;
-                D1fac_despiked=pd.data.D_ac_all,
-                D1fc_despiked=pd.data.D_c_all,
+pairs_data_whitened = let
+    processed = map(pairs_data) do pd
+        process(X) = Float32.(MLUtils.normalise(
+            DSP.filtfilt(bp_filter, Float64.(vqvae.per_waveform_whiten(X;
+                kernel_length=per_waveform_whitening_kernel_length,
+                min_power_fraction=0.05))); dims=1))
+        D_ac_w    = process(pd.data.D_ac_all)
+        D_c_w     = process(pd.data.D_c_all)
+        D_train_w = process(pd.data.D_train)
+        D_test_w  = process(pd.data.D_test)
+        fir = nothing  # no longer used; kept for struct compatibility
+        (; pd, D_ac_w, D_c_w, D_train_w, D_test_w, fir)
+    end
+
+    map(processed) do p
+        D_ac_w    = p.D_ac_w
+        D_c_w     = p.D_c_w
+        D_train_w = p.D_train_w
+        D_test_w  = p.D_test_w
+        D_all_w   = Float32.(hcat(D_ac_w, D_c_w))
+        merge(p.pd, (;
+            data=merge(p.pd.data, (; D_train=D_train_w, D_test=D_test_w,
+                D_all=D_all_w, D_ac_all=D_ac_w, D_c_all=D_c_w)),
+            data_bundle=merge(p.pd.data_bundle, (;
+                D1fac_raw=p.pd.data_bundle.D1fac,
+                D1fc_raw=p.pd.data_bundle.D1fc,
+                D1fac=D_ac_w,
+                D1fc=D_c_w,
+                whitening_fir=p.fir,
                 spike_bins=Int[],
             )),
-        ))
-    else
-        @info "Spike suppression" pair=pd.pair n_spike_bins=length(spike_bins)
-        D_train_ds = Float32.(MLUtils.normalise(
-            vqvae.apply_spike_suppression(pd.data.D_train, spike_bins;
-                suppression_factor=spike_suppression); dims=1))
-        D_test_ds  = Float32.(MLUtils.normalise(
-            vqvae.apply_spike_suppression(pd.data.D_test,  spike_bins;
-                suppression_factor=spike_suppression); dims=1))
-        D_ac_ds = Float32.(MLUtils.normalise(
-            vqvae.apply_spike_suppression(pd.data.D_ac_all, spike_bins;
-                suppression_factor=spike_suppression); dims=1))
-        D_c_ds = Float32.(MLUtils.normalise(
-            vqvae.apply_spike_suppression(pd.data.D_c_all, spike_bins;
-                suppression_factor=spike_suppression); dims=1))
-        D_all_ds = Float32.(hcat(D_ac_ds, D_c_ds))
-        merge(pd, (;
-            data=merge(pd.data, (; D_train=D_train_ds, D_test=D_test_ds,
-                D_all=D_all_ds, D_ac_all=D_ac_ds, D_c_all=D_c_ds)),
-            data_bundle=merge(pd.data_bundle, (;
-                D1fac_despiked=D_ac_ds,
-                D1fc_despiked=D_c_ds,
-                D1fac=D_ac_ds,
-                D1fc=D_c_ds,
-                spike_bins=Int.(spike_bins),
-            )),
-            spike_bins=spike_bins,
+            whitening_fir=p.fir,
+            spike_bins=Int[],
         ))
     end
 end
-
-# ╔═╡ 66bc6645-a459-40fb-a871-2dd674e5bf9d
-pairs_data_whitened[1].data
-
-# ╔═╡ c0000003-0000-0000-0000-000000000003
-let
-    colors_raw = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
-                  "#8c564b", "#e377c2", "#7f7f7f"]
-    colors_whi = ["#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
-                  "#c49c94", "#f7b6d2", "#c7c7c7"]
-    colors_ds  = ["#ff9896", "#c5b0d5", "#8c564b", "#1f77b4", "#ff7f0e",
-                  "#2ca02c", "#d62728", "#9467bd"]
-    traces = [scatter()]
-    for (pi, (pd_raw, pd_whi, pd_ds)) in enumerate(zip(pairs_data, pairs_data_whitened_raw, pairs_data_whitened))
-        pair_label = "$(pd_raw.pair[1])-$(pd_raw.pair[2])"
-        X_raw = Float64.(pd_raw.data.D_train)
-        X_whi = Float64.(pd_whi.data.D_train)
-        X_ds  = Float64.(pd_ds.data.D_train)
-        nt = size(X_raw, 1)
-        fft_freqs = FFTW.fftfreq(nt, inv(Float64(dt)))
-        pos = fft_freqs .> 0
-        order = sortperm(1.0 ./ fft_freqs[pos])
-        periods_plot = (1.0 ./ fft_freqs[pos])[order]
-        P_raw = vec(mean(abs2.(FFTW.fft(X_raw, 1)); dims=2))
-        P_whi = vec(mean(abs2.(FFTW.fft(X_whi, 1)); dims=2))
-        P_ds  = vec(mean(abs2.(FFTW.fft(X_ds,  1)); dims=2))
-        norm = maximum(P_raw[pos])
-        ci = mod1(pi, length(colors_raw))
-        push!(traces, PlutoPlotly.scatter(
-            x=periods_plot, y=P_raw[pos][order]./norm, mode="lines",
-            line=PlutoPlotly.attr(color=colors_raw[ci], width=2),
-            name="$(pair_label) raw", legendgroup=pair_label))
-        push!(traces, PlutoPlotly.scatter(
-            x=periods_plot, y=P_whi[pos][order]./norm, mode="lines",
-            line=PlutoPlotly.attr(color=colors_whi[ci], width=1.5, dash="dash"),
-            name="$(pair_label) whitened", legendgroup=pair_label))
-        push!(traces, PlutoPlotly.scatter(
-            x=periods_plot, y=P_ds[pos][order]./norm, mode="lines",
-            line=PlutoPlotly.attr(color=colors_ds[ci], width=1.5, dash="dot"),
-            name="$(pair_label) despiked", legendgroup=pair_label))
-    end
-    WideCell(PlutoPlotly.plot(traces, PlutoPlotly.Layout(
-        title="Average PSD: raw (solid) → whitened (dashed) → despiked (dotted)",
-        xaxis_title="Period (s)", yaxis_title="Power (avg across waveforms, normalized to raw max)",
-        yaxis_type="log",
-		xaxis=attr(range=(0, 100)),
-        height=420, margin=PlutoPlotly.attr(l=60, r=20, t=60, b=50),
-    )))
-end
-
-# ╔═╡ 10000008-0000-0000-0000-000000000003
-selected_pairs_key = (
-    pairs=Tuple(selected_pairs),
-    vqvae_parameters=vqvae_parameters,
-    training_batchsize=training_para.batchsize,
-    warmup_epochs=training_para.warmup_epochs,
-    index_refresh_every=training_para.index_refresh_every,
-    filepath=data_filepath,
-    dt=dt,
-    period_min=period_min,
-    period_max=period_max,
-)
 
 # ╔═╡ 10000008-0000-0000-0000-000000000004
 compiled_model = let
@@ -373,16 +297,46 @@ compiled_model = let
     end
 end
 
-# ╔═╡ e0000001-0000-0000-0000-000000000001
+# ╔═╡ 66bc6645-a459-40fb-a871-2dd674e5bf9d
+pairs_data_whitened[1].data
 
-    @bind ui_mft_mode Select(
-        ["joint" => "K1×K2 (all joint codes)", "marginal" => "K1+K2 (marginal decomposition)"];
-        default="joint"
-    )
-
-
-# ╔═╡ ebb34459-2adf-4b90-8e06-2db4215548c8
-
+# ╔═╡ c0000003-0000-0000-0000-000000000003
+let
+    colors_raw = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                  "#8c564b", "#e377c2", "#7f7f7f"]
+    colors_whi = ["#aec7e8", "#ffbb78", "#98df8a", "#ff9896", "#c5b0d5",
+                  "#c49c94", "#f7b6d2", "#c7c7c7"]
+    traces = [scatter()]
+    for (pi, (pd_raw, pd_whi)) in enumerate(zip(pairs_data, pairs_data_whitened))
+        pair_label = "$(pd_raw.pair[1])-$(pd_raw.pair[2])"
+        X_raw = Float64.(pd_raw.data.D_train)
+        X_whi = Float64.(pd_whi.data.D_train)
+        nt = size(X_raw, 1)
+        fft_freqs = FFTW.fftfreq(nt, inv(Float64(dt)))
+        pos = fft_freqs .> 0
+        order = sortperm(1.0 ./ fft_freqs[pos])
+        periods_plot = (1.0 ./ fft_freqs[pos])[order]
+        P_raw = vec(mean(abs2.(FFTW.fft(X_raw, 1)); dims=2))
+        P_whi = vec(mean(abs2.(FFTW.fft(X_whi, 1)); dims=2))
+        norm = maximum(P_raw[pos])
+        ci = mod1(pi, length(colors_raw))
+        push!(traces, PlutoPlotly.scatter(
+            x=periods_plot, y=P_raw[pos][order]./norm, mode="lines",
+            line=PlutoPlotly.attr(color=colors_raw[ci], width=2),
+            name="$(pair_label) raw", legendgroup=pair_label))
+        push!(traces, PlutoPlotly.scatter(
+            x=periods_plot, y=P_whi[pos][order]./norm, mode="lines",
+            line=PlutoPlotly.attr(color=colors_whi[ci], width=1.5, dash="dash"),
+            name="$(pair_label) whitened+filtered", legendgroup=pair_label))
+    end
+    WideCell(PlutoPlotly.plot(traces, PlutoPlotly.Layout(
+        title="Average PSD: raw (solid) → whitened + bandpass (dashed)",
+        xaxis_title="Period (s)", yaxis_title="Power (avg across waveforms, normalized to raw max)",
+        yaxis_type="log",
+		xaxis=attr(range=(0, 100)),
+        height=420, margin=PlutoPlotly.attr(l=60, r=20, t=60, b=50),
+    )))
+end
 
 # ╔═╡ d1eec798-b7aa-4387-9a1e-71064e2660fd
 analysis_settings = (;
@@ -408,7 +362,7 @@ train_results = @use_memo([]) do
             pairs_data_whitened, compiled_model;
             seeds=run_seeds,
             training_para=training_para,
-            save_root=joinpath(data_filepath, "SavedModels", "vqvae_v8"),
+            save_root=joinpath(data_filepath, "SavedModels", "vqvae_v8_K=$(string(compiled_model.para.K))"),
             device=training_device,
             analysis_settings,
         )
@@ -511,408 +465,184 @@ else
     ))
 end
 
-# ╔═╡ 10000016-0000-0000-0000-000000000001
-state_averages = if isnothing(selected_result)
-    nothing
-else
-    vqvae.source_state_averages(
-        selected_result.model,
-        selected_result.ps,
-        selected_result.st,
-        selected_result.data;
-        device=training_device,
-    )
-end
-
-# ╔═╡ 10000019-0000-0000-0000-000000000001
-if isnothing(state_averages)
-    md""
-else
-    _hist_labels = hasproperty(state_averages, :combo_labels) ? state_averages.combo_labels : nothing
-    WideCell(vqvae.plot_cluster_histogram(state_averages.counts_ac, state_averages.counts_c;
-        title="Source State Usage ($(result_title_context(selected_result)))",
-        labels=_hist_labels))
-end
-
-# ╔═╡ c19d4c52-4a33-11f1-a3fa-677e8b10e883
-display_averages = if isnothing(state_averages)
-    nothing
-else
-    _mode = @isdefined(ui_mft_mode) ? ui_mft_mode : "joint"
-    _K = selected_result.para.K
-    if _mode == "marginal" && hasproperty(state_averages, :combo_labels) && length(_K) >= 2
-        K1, K2 = _K[1], _K[2]
-        dec_ac = vqvae.marginal_decomposition(
-            state_averages.acausal, state_averages.counts_ac; K1, K2)
-        dec_c = vqvae.marginal_decomposition(
-            state_averages.causal, state_averages.counts_c; K1, K2)
-        W = reshape(state_averages.counts_ac, K1, K2)
-        W2 = reshape(state_averages.counts_c, K1, K2)
-        (; acausal=hcat(dec_ac.stage1_waves, dec_ac.stage2_waves),
-           causal=hcat(dec_c.stage1_waves, dec_c.stage2_waves),
-           counts_ac=vcat(vec(sum(W; dims=2)), vec(sum(W; dims=1))),
-           counts_c=vcat(vec(sum(W2; dims=2)), vec(sum(W2; dims=1))),
-           labels=vcat(dec_ac.stage1_labels, dec_ac.stage2_labels))
+# ╔═╡ 9dbe9444-75f3-4d59-8b47-3f70d6bcf6b3
+raw_recon_examples_save = let
+    if isnothing(selected_result) || save_recon_examples_button === missing || save_recon_examples_button == 0
+        md""
     else
-        combo_labels = hasproperty(state_averages, :combo_labels) ?
-            state_averages.combo_labels : string.(1:size(state_averages.acausal, 2))
-        (; acausal=state_averages.acausal, causal=state_averages.causal,
-           counts_ac=state_averages.counts_ac, counts_c=state_averages.counts_c,
-           labels=combo_labels)
-    end
-end
+        n_save = 100
+        rng = MersenneTwister(20260511 + save_recon_examples_button)
+        cdev = vqvae.default_cdev()
 
-# ╔═╡ 10000017-0000-0000-0000-000000000001
-if isnothing(state_averages)
-    md""
-else
-    WideCell(vqvae.plot_state_average_matrix(display_averages.acausal;
-        title="Acausal Source-State Averages ($(result_title_context(selected_result)))",
-        dt=dt, reverse_time=false))
-end
+        raw_ac = hasproperty(selected_result.data_bundle, :D1fac_raw) ?
+            selected_result.data_bundle.D1fac_raw : selected_result.data_bundle.D1fac
+        raw_c = hasproperty(selected_result.data_bundle, :D1fc_raw) ?
+            selected_result.data_bundle.D1fc_raw : selected_result.data_bundle.D1fc
 
-# ╔═╡ 10000018-0000-0000-0000-000000000001
-if isnothing(state_averages)
-    md""
-else
-    WideCell(vqvae.plot_state_average_matrix(display_averages.causal;
-        title="Causal Source-State Averages ($(result_title_context(selected_result)))",
-        dt=dt, reverse_time=false))
-end
-
-# ╔═╡ b11c9e24-6593-497c-a706-146619251e36
-if isnothing(selected_result) || isnothing(state_averages)
-    md""
-else
-    let
-        cluster_avg_ac = normalise(display_averages.acausal, dims=1)
-        cluster_avg_c = normalise(display_averages.causal, dims=1)
-        nth = size(cluster_avg_ac, 1)
-        t_neg = [-(nth - i + 1) * dt for i in 1:nth]
-        t_pos = [i * dt for i in 1:nth]
-        t_full = [t_neg; t_pos]
-
-        global_avg_ac = normalise(vec(mean(selected_result.data.D_ac_all; dims=2)), dims=1)
-        global_avg_c = normalise(vec(mean(selected_result.data.D_c_all; dims=2)), dims=1)
-        global_full = [reverse(global_avg_ac); global_avg_c]
-        global_ac0 = global_avg_ac .- mean(global_avg_ac)
-        global_c0 = global_avg_c .- mean(global_avg_c)
-        global_ncc = dot(global_ac0, global_c0) / ((norm(global_ac0) * norm(global_c0)) + 1f-8)
-
-        combo_labels_local = string.(1:size(cluster_avg_ac, 2))
-        ncomb = length(combo_labels_local)
-        traces = AbstractTrace[]
-        colors = begin
-            nc = max(ncomb, 1)
-            cs = ColorSchemes.rainbow
-            [Colors.hex(get(cs, (i - 1) / max(1, nc - 1))) for i in 1:nc]
-        end
-
-        total_ac = size(selected_result.data.D_ac_all, 2)
-        total_c = size(selected_result.data.D_c_all, 2)
-        amp_peak = maximum(abs.(vcat(vec(cluster_avg_ac), vec(cluster_avg_c), global_full)))
-        vertical_spacing = amp_peak * 2.5 + 1f-3
-
-        for combo_idx in 1:ncomb
-            c = colors[mod1(combo_idx, length(colors))]
-            a = cluster_avg_ac[:, combo_idx]
-            b = cluster_avg_c[:, combo_idx]
-            full_k = [reverse(a); b]
-            a0 = a .- mean(a)
-            b0 = b .- mean(b)
-            ncc = dot(a0, b0) / ((norm(a0) * norm(b0)) + 1f-8)
-            pct_ac = 100 * state_averages.counts_ac[combo_idx] / max(total_ac, 1)
-            pct_c = 100 * state_averages.counts_c[combo_idx] / max(total_c, 1)
-            legend_label = "State $(combo_labels_local[combo_idx]) (ac: $(round(pct_ac; digits=1))%, c: $(round(pct_c; digits=1))%, corr=$(round(ncc; digits=3)))"
-            offset = (combo_idx - 1) * vertical_spacing
-			  push!(traces, PlutoPlotly.scatter(x=t_full, y=global_full .+ offset, mode="lines",
-                name=combo_idx == 1 ? "Global mean (corr=$(round(global_ncc; digits=3)))" : "Global mean",
-                showlegend=combo_idx == 1,
-                line=attr(color="black", width=3, opacity=0.1)))
-            push!(traces, PlutoPlotly.scatter(x=t_full, y=full_k .+ offset, mode="lines",
-                name=legend_label, line=attr(color=c, width=2)))
-          
-        end
-
-        shapes = let distance = selected_result.data_bundle.distance
-            if isnothing(distance)
-                []
-            else
-                vmin, vmax = velocity_range
-                t_fast = distance / vmax
-                t_slow = distance / vmin
-                vcat([
-                    attr(type="line", x0=t, x1=t, y0=0, y1=1, yref="paper",
-                        line=attr(color="rgba(0,0,0,0.25)", width=1, dash="dash"))
-                    for t in (-t_slow, -t_fast, t_fast, t_slow)
-                ])
-            end
-        end
-
-        layout = Layout(
-            title=attr(text="Source State Average Waveforms ($(result_title_context(selected_result)))",
-                font=attr(size=18, family="Computer Modern, serif")),
-            height=500*div(ncomb,5), width=900,
-            xaxis=attr(title="Lag (s)", zeroline=true, zerolinecolor="rgba(0,0,0,0.3)"),
-            yaxis=attr(title="Amplitude"),
-            plot_bgcolor="white", paper_bgcolor="white",
-            legend=attr(x=0.5, xanchor="center", y=-0.2, orientation="h",
-                font=attr(size=12, family="Computer Modern, serif")),
-            shapes=shapes,
+        X_ac = Float32.(selected_result.data.D_ac_all)
+        X_c = Float32.(selected_result.data.D_c_all)
+        X_model = Float32.(hcat(X_ac, X_c))
+        match_cols(X, n) = X[:, mod1.(1:n, size(X, 2))]
+        X_raw = Float32.(hcat(match_cols(raw_ac, size(X_ac, 2)), match_cols(raw_c, size(X_c, 2))))
+        branches = vcat(fill("acausal", size(X_ac, 2)), fill("causal", size(X_c, 2)))
+        branch_indices = vcat(
+            mod1.(1:size(X_ac, 2), size(raw_ac, 2)),
+            mod1.(1:size(X_c, 2), size(raw_c, 2)),
         )
-        WideCell(PlutoPlotly.plot(traces, layout))
-    end
-end
 
-# ╔═╡ 86843302-bb3b-494c-afe4-b9a43fcc0e7c
-if isnothing(selected_result) || isnothing(state_averages)
-    md""
-else
-    let
-    cluster_avg_ac = display_averages.acausal
-	    cluster_avg_c = display_averages.causal
-	    combo_labels = string.(1:size(cluster_avg_ac, 2))
-    labels = string.(combo_labels)
-    n = length(labels)
-
-    function norm_corr_matrix(A)
-        # A: (nt, n); returns (n, n) normalized correlation matrix
-        C = Matrix{Float32}(undef, n, n)
-        cols = [begin v = vec(A[:, i]); v .- mean(v) end for i in 1:n]
-        norms = [norm(c) + 1f-8 for c in cols]
-        for i in 1:n, j in 1:n
-            C[i, j] = dot(cols[i], cols[j]) / (norms[i] * norms[j])
-        end
-        C
-    end
-
-    C_ac = norm_corr_matrix(cluster_avg_ac)
-    C_c  = norm_corr_matrix(cluster_avg_c)
-    trace_ac = PlutoPlotly.heatmap(
-        z=C_ac, x=labels, y=labels,
-        colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
-        colorbar=attr(title="Corr", len=0.9, x=0.46),
-        xaxis="x1", yaxis="y1",
-    )
-    trace_c = PlutoPlotly.heatmap(
-        z=C_c, x=labels, y=labels,
-        colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
-        colorbar=attr(title="Corr", len=0.9, x=1.01),
-        xaxis="x2", yaxis="y2",
-    )
-
-    sz = max(350, n * 40)
-    layout = Layout(
-        title=attr(text="State-State Normalised Correlation ($(result_title_context(selected_result)))",
-            font=attr(size=16)),
-        grid=attr(rows=1, columns=2, pattern="independent"),
-        annotations=[
-            attr(text="Acausal", x=0.22, xref="paper", y=1.05, yref="paper",
-                 showarrow=false, font=attr(size=14)),
-            attr(text="Causal",  x=0.78, xref="paper", y=1.05, yref="paper",
-                 showarrow=false, font=attr(size=14)),
-        ],
-        xaxis=attr(title="State", tickangle=-45),
-        yaxis=attr(title="State"),
-        xaxis2=attr(title="State", tickangle=-45),
-        yaxis2=attr(title="State"),
-        width=900, height=sz + 80,
-        plot_bgcolor="white", paper_bgcolor="white",
-        margin=attr(t=80, b=80, l=80, r=80),
-    )
-    WideCell(PlutoPlotly.plot([trace_ac, trace_c], layout))
-    end
-end
-
-# ╔═╡ 4057ac26-f7b5-4c26-8a5e-4796de1be81f
-selected_pair_results = begin
-    if isnothing(train_results) || isempty(result_pair_options)
-        []
-    else
-        sort([
-            result for result in train_results
-            if "$(result.pair[1])-$(result.pair[2])" == selected_result_pair_label
-        ], by=result -> hasproperty(result, :seed) ? result.seed : 0)
-    end
-end
-
-# ╔═╡ 20ae1f67-cfaa-487d-8d94-a5f7b97b45fd
-all_seed_state_averages = let
-    if isempty(selected_pair_results)
-        nothing
-    else
-        [
-            vqvae.source_state_averages(
-                result.model,
-                result.ps,
-                result.st,
-                result.data;
-                device=training_device,
-            )
-            for result in selected_pair_results
-        ]
-    end
-end
-
-# ╔═╡ fd286392-4902-11f1-964f-65a304aae057
-mft_analysis = let
-if isnothing(all_seed_state_averages) || isempty(all_seed_state_averages)
-    nothing
-else
-    _mode = @isdefined(ui_mft_mode) ? ui_mft_mode : "joint"
-    ac_traces = mft.SeismicTrace[]
-    c_traces = mft.SeismicTrace[]
-    labels = String[]
-
-    for (result, averages) in zip(selected_pair_results, all_seed_state_averages)
-        dist = result.data_bundle.distance
-        seed_label = hasproperty(result, :seed) ? string(result.seed) : "seed?"
-        _K = result.para.K
-
-        if _mode == "marginal" && hasproperty(averages, :combo_labels) && length(_K) >= 2
-            K1, K2 = _K[1], _K[2]
-            dec_ac = vqvae.marginal_decomposition(
-                averages.acausal, averages.counts_ac; K1, K2)
-            dec_c  = vqvae.marginal_decomposition(
-                averages.causal,  averages.counts_c;  K1, K2)
-
-            for k in 1:K1
-                push!(ac_traces, mft.SeismicTrace(data=vec(dec_ac.stage1_waves[:, k]), dt=dt, distance=dist))
-                push!(c_traces,  mft.SeismicTrace(data=vec(dec_c.stage1_waves[:, k]),  dt=dt, distance=dist))
-                push!(labels, "seed $(seed_label) | $(dec_ac.stage1_labels[k])")
-            end
-            for k in 1:K2
-                push!(ac_traces, mft.SeismicTrace(data=vec(dec_ac.stage2_waves[:, k]), dt=dt, distance=dist))
-                push!(c_traces,  mft.SeismicTrace(data=vec(dec_c.stage2_waves[:, k]),  dt=dt, distance=dist))
-                push!(labels, "seed $(seed_label) | $(dec_ac.stage2_labels[k])")
-            end
-            push!(ac_traces, mft.SeismicTrace(data=vec(dec_ac.grand_mean), dt=dt, distance=dist))
-            push!(c_traces,  mft.SeismicTrace(data=vec(dec_c.grand_mean),  dt=dt, distance=dist))
-            push!(labels, "seed $(seed_label) | Grand mean")
+        cache = vqvae.encoded_cache(
+            selected_result.model,
+            selected_result.ps,
+            selected_result.st,
+            selected_result.data;
+            device=training_device,
+        )
+        stage_indices = Int.(hcat(cache.stage_ac, cache.stage_c))
+        if length(selected_result.para.K) >= 2
+            K1, K2 = selected_result.para.K[1], selected_result.para.K[2]
+            source_state = Int.((stage_indices[2, :] .- 1) .* K1 .+ stage_indices[1, :])
+            state_labels = ["($k1,$k2)" for k2 in 1:K2 for k1 in 1:K1]
+            nstates = K1 * K2
         else
-            nstates = size(averages.acausal, 2)
-            combo_labels = hasproperty(averages, :combo_labels) ?
-                averages.combo_labels : string.(1:nstates)
-            for i in 1:nstates
-                push!(ac_traces, mft.SeismicTrace(data=vec(averages.acausal[:, i]), dt=dt, distance=dist))
-                push!(c_traces,  mft.SeismicTrace(data=vec(averages.causal[:, i]),  dt=dt, distance=dist))
-                push!(labels, "seed $(seed_label) | $(combo_labels[i])")
+            source_state = Int.(vec(hcat(cache.coarse_ac, cache.coarse_c)))
+            state_labels = string.(1:selected_result.para.K[1])
+            nstates = selected_result.para.K[1]
+        end
+
+        shuffled_by_state = [
+            shuffle(rng, findall(==(state), source_state))
+            for state in 1:nstates
+        ]
+        cursors = ones(Int, nstates)
+        selected_ids = Int[]
+        while length(selected_ids) < min(n_save, length(source_state))
+            added_this_round = false
+            for state in 1:nstates
+                cursors[state] <= length(shuffled_by_state[state]) || continue
+                push!(selected_ids, shuffled_by_state[state][cursors[state]])
+                cursors[state] += 1
+                added_this_round = true
+                length(selected_ids) == min(n_save, length(source_state)) && break
             end
+            added_this_round || break
+        end
+        sort!(selected_ids)
+
+        result, _ = selected_result.model(
+            X_model[:, selected_ids],
+            cdev(selected_result.ps),
+            Lux.testmode(cdev(selected_result.st));
+            training=false,
+        )
+        recon = Float32.(cdev(result.xhat))
+        selected_state = source_state[selected_ids]
+        state_counts = [count(==(state), selected_state) for state in 1:nstates]
+        save_path = joinpath(selected_result.run_dir, "raw_reconstruction_examples_100.jld2")
+
+        jldsave(save_path;
+            pair=selected_result.pair,
+            seed=selected_result.seed,
+            dt=dt,
+            period_min=period_min,
+            period_max=period_max,
+            distance=selected_result.data_bundle.distance,
+            selected_ids=selected_ids,
+            branch=branches[selected_ids],
+            branch_index=branch_indices[selected_ids],
+            raw_waveforms=X_raw[:, selected_ids],
+            model_input_waveforms=X_model[:, selected_ids],
+            reconstruction_waveforms=recon,
+            source_state=selected_state,
+            state_labels=state_labels,
+            stage_indices=stage_indices[:, selected_ids],
+            state_counts=state_counts,
+        #     note="Reconstructions are in the model-input preprocessing space; raw_waveforms are the original selected pair traces before whitening/filtering.")
+			   )
+			@show  save_path
+
+        # md"Saved $(length(selected_ids)) examples to `$(save_path)`. State counts: $(state_counts)"
+    end
+end
+
+# ╔═╡ d5000002-0000-0000-0000-000000000003
+let
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+              "#8c564b", "#e377c2", "#7f7f7f"]
+    n_sample = 10  # number of individual waveforms to overlay
+    traces = [scatter()]
+    for (pi, (pd_raw, pd_whi)) in enumerate(zip(pairs_data, pairs_data_whitened))
+        pair_label = "$(pd_raw.pair[1])-$(pd_raw.pair[2])"
+        X_raw = Float64.(pd_raw.data.D_train)
+        X_whi = Float64.(pd_whi.data.D_train)
+        nt, nw = size(X_raw)
+        fft_freqs = FFTW.fftfreq(nt, inv(Float64(dt)))
+        pos = fft_freqs .> 0
+        order = sortperm(1.0 ./ fft_freqs[pos])
+        periods_plot = (1.0 ./ fft_freqs[pos])[order]
+        ci = mod1(pi, length(colors))
+        # std of log-PSD across all waveforms
+        logP_raw = log10.(abs2.(FFTW.fft(X_raw, 1))[pos, :] .+ 1f-30)
+        logP_whi = log10.(abs2.(FFTW.fft(X_whi, 1))[pos, :] .+ 1f-30)
+        std_raw = vec(std(logP_raw[order, :]; dims=2))
+        std_whi = vec(std(logP_whi[order, :]; dims=2))
+        push!(traces, PlutoPlotly.scatter(
+            x=periods_plot, y=std_raw, mode="lines",
+            line=PlutoPlotly.attr(color=colors[ci], width=2),
+            name="$(pair_label) raw σ", legendgroup="$(pair_label)_std"))
+        push!(traces, PlutoPlotly.scatter(
+            x=periods_plot, y=std_whi, mode="lines",
+            line=PlutoPlotly.attr(color=colors[ci], width=2, dash="dash"),
+            name="$(pair_label) whitened σ", legendgroup="$(pair_label)_std"))
+        # overlay a few individual waveform spectra (whitened only)
+        idx_sample = round.(Int, range(1, nw; length=min(n_sample, nw)))
+        for (si, i) in enumerate(idx_sample)
+            push!(traces, PlutoPlotly.scatter(
+                x=periods_plot, y=logP_whi[order, i], mode="lines",
+                line=PlutoPlotly.attr(color=colors[ci], width=0.5),
+                opacity=0.3, showlegend=(si == 1),
+                name="$(pair_label) individual",
+                legendgroup="$(pair_label)_ind"))
         end
     end
-
-    mft_periods = exp10.(range(log10(Float64(period_min)), log10(Float64(period_max)); length=mft_nperiods))
-    mft.analyze_causal_acausal_branches(
-        c_traces, ac_traces, mft_periods;
-        state_labels=labels,
-		max_modes=6,
-        velocity_range=velocity_range,
-        bandwidth_factor=bandwidth_factor,
-        zero_pad_factor=zero_pad_factor,
-    )
-end
+    WideCell(PlutoPlotly.plot(traces, PlutoPlotly.Layout(
+        title="Per-waveform whitening check: σ of log-PSD across waveforms (solid=raw, dashed=whitened) + individual whitened spectra",
+        xaxis_title="Period (s)",
+        yaxis_title="σ of log₁₀(PSD)  /  log₁₀(PSD) per waveform",
+        xaxis=attr(range=(0, 100)),
+        height=480, margin=PlutoPlotly.attr(l=60, r=20, t=60, b=50),
+    )))
 end
 
-# ╔═╡ 1000001a-0000-0000-0000-000000000001
-if isnothing(mft_analysis)
-    md""
-else
-    @bind ui_period Slider(mft_analysis.periods; default=mean(mft_analysis.periods), show_value=true)
+# ╔═╡ d5000002-0000-0000-0000-000000000004
+let
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+              "#8c564b", "#e377c2", "#7f7f7f"]
+    traces = [scatter()]
+    for (pi, (pd_raw, pd_whi)) in enumerate(zip(pairs_data, pairs_data_whitened))
+        pair_label = "$(pd_raw.pair[1])-$(pd_raw.pair[2])"
+        ci = mod1(pi, length(colors))
+        nt = size(pd_raw.data.D_ac_all, 1)
+        t = range(0; step=Float64(dt), length=nt)
+        avg_raw = vec(mean(Float64.(pd_raw.data.D_ac_all); dims=2))
+        avg_whi = vec(mean(Float64.(pd_whi.data.D_ac_all); dims=2))
+        norm_raw = maximum(abs.(avg_raw))
+        norm_whi = maximum(abs.(avg_whi))
+        push!(traces, PlutoPlotly.scatter(
+            x=collect(t), y=avg_raw ./ norm_raw, mode="lines",
+            line=PlutoPlotly.attr(color=colors[ci], width=2),
+            name="$(pair_label) raw (ac)", legendgroup=pair_label))
+        push!(traces, PlutoPlotly.scatter(
+            x=collect(t), y=avg_whi ./ norm_whi, mode="lines",
+            line=PlutoPlotly.attr(color=colors[ci], width=2, dash="dash"),
+            name="$(pair_label) whitened (ac)", legendgroup=pair_label))
+    end
+    WideCell(PlutoPlotly.plot(traces, PlutoPlotly.Layout(
+        title="Global average waveform: raw (solid) vs per-waveform whitened + bandpass (dashed), acausal branch",
+        xaxis_title="Time (s)",
+        yaxis_title="Amplitude (normalized to peak)",
+        height=420, margin=PlutoPlotly.attr(l=60, r=20, t=60, b=50),
+    )))
 end
-
-# ╔═╡ 1000001b-0000-0000-0000-000000000001
-if isnothing(mft_analysis)
-    md""
-else
-    WideCell(mft.plot_filtered_traces_by_period(
-        mft_analysis;
-        period=ui_period,
-        correlation_threshold=nothing,
-        normalize_each=true,
-        scale=0.7,
-        spacing=2.2,
-        title="MFT Filtered Source-State Traces ($(replace(result_title_context(selected_result), r" seed=[^ ]+" => " all seeds")); period=$(ui_period)s)",
-    ))
-end
-
-# ╔═╡ 1000001c-0000-0000-0000-000000000001
-if isnothing(mft_analysis)
-    md""
-else
-    WideCell(mft.plot_branch_correlation(
-        mft_analysis;
-        title="MFT Branch Correlation ($(replace(result_title_context(selected_result), r" seed=[^ ]+" => " all seeds")))",
-    ))
-end
-
-# ╔═╡ b48757f3-a9f1-4ff4-b714-de58221a1660
-WideCell(mft.plot_all_highcorr_groupvelocity_picks(mft_analysis; correlation_threshold=0.1, title=string("Group Velocity Picks ", replace(result_title_context(selected_result), r" seed=[^ ]+" => " all seeds"))))
-
-# ╔═╡ 52edc77f-d951-40a2-bae7-ed04e2c778ce
-WideCell(mft.plot_all_highcorr_groupvelocity_picks(mft_analysis; correlation_threshold=0.0, pair_and_average=true, title=string("Group Velocity Picks ", replace(result_title_context(selected_result), r" seed=[^ ]+" => " all seeds")), velocity_tolerance_fraction=0.1))
-
-# ╔═╡ 30265164-1bdf-493d-bbc4-6ef227a4fbfb
-consensus = mft.consensus_group_velocity_picks(
-    mft_analysis;
-    correlation_threshold=0.0,
-    velocity_tolerance_fraction=0.1,
-    cluster_tolerance_fraction=nothing,  # default: same as velocity_tolerance_fraction
-    max_candidates=5,
-    selection_mode=:low_velocity,
-    min_candidate_periods=3,
-    max_smooth_jump_fraction=0.08,
-    max_gap_periods=1,
-)
-
-# ╔═╡ 3207b4be-2278-4e89-afb7-205bcfdb839e
-WideCell(mft.plot_consensus_groupvelocity_picks(mft_analysis, consensus;
-    correlation_threshold=0.0,
-    velocity_tolerance_fraction=0.1,
-    title=string("Consensus Group Velocity Picks ", replace(result_title_context(selected_result), r" seed=[^ ]+" => " all seeds")),
-))
-
-# ╔═╡ 084f1241-bd18-49cd-911c-5eb396c0a364
-mft_analysis_global = let
-if isempty(selected_pair_results)
-    nothing
-else
-    global_avg_ac = vec(mean(hcat([vec(mean(result.data.D_ac_all; dims=2)) for result in selected_pair_results]...); dims=2))
-    global_avg_c  = vec(mean(hcat([vec(mean(result.data.D_c_all;  dims=2)) for result in selected_pair_results]...); dims=2))
-    dist = selected_pair_results[1].data_bundle.distance
-    mft_periods = exp10.(range(log10(Float64(period_min)), log10(Float64(period_max)); length=mft_nperiods))
-
-    mft.analyze_causal_acausal_branches(
-        [mft.SeismicTrace(data=global_avg_c,  dt=dt, distance=dist)],
-        [mft.SeismicTrace(data=global_avg_ac, dt=dt, distance=dist)],
-        mft_periods;
-        state_labels=["Global average"],
-        max_modes=6,
-        velocity_range=velocity_range,
-        bandwidth_factor=bandwidth_factor,
-        zero_pad_factor=zero_pad_factor,
-    )
-end
-end
-
-# ╔═╡ 124f7e8b-8d6a-4a25-af36-e78eb323f03b
-consensus_global = mft.consensus_group_velocity_picks(
-    mft_analysis_global;
-    correlation_threshold=0.0,
-    velocity_tolerance_fraction=0.1,
-    cluster_tolerance_fraction=nothing,  # default: same as velocity_tolerance_fraction
-    max_candidates=5,
-    selection_mode=:low_velocity,
-    min_candidate_periods=3,
-    max_smooth_jump_fraction=0.08,
-    max_gap_periods=1,
-)
-
-# ╔═╡ bc80aea7-5748-44c6-a0d4-f260e2a29c42
-WideCell(mft.plot_consensus_groupvelocity_picks(mft_analysis_global, consensus_global;
-    correlation_threshold=0.0,
-    velocity_tolerance_fraction=0.1,
-    title=string("Consensus Group Velocity Picks ", replace(result_title_context(selected_result), r" seed=[^ ]+" => " all seeds")),
-))
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
@@ -938,7 +668,7 @@ PlutoHooks = "0ff47ea0-7a50-410d-8455-4348d5de0774"
 PlutoLinks = "0ff47ea0-7a50-410d-8455-4348d5de0420"
 PlutoPlotly = "8e989ff0-3d88-8e9f-f020-2b208a939ff0"
 PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
-Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+ProgressLogging = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
@@ -965,6 +695,7 @@ PlutoHooks = "~0.1.0"
 PlutoLinks = "~0.1.8"
 PlutoPlotly = "~0.6.5"
 PlutoUI = "~0.7.80"
+ProgressLogging = "~0.1.6"
 Reactant = "~0.2.254"
 StatsBase = "~0.34.10"
 Zygote = "~0.7.10"
@@ -976,7 +707,7 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.12.4"
 manifest_format = "2.0"
-project_hash = "8cb90654adf0941e6c6fad17197e16431bdb3f8d"
+project_hash = "699356842bb353dbcce22e88ebfb125757bf70d8"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "bbc22a9a08a0ef6460041086d8a7b27940ed4ffd"
@@ -2299,6 +2030,12 @@ deps = ["Unicode"]
 uuid = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 version = "1.11.0"
 
+[[deps.ProgressLogging]]
+deps = ["Logging", "SHA", "UUIDs"]
+git-tree-sha1 = "f0803bc1171e455a04124affa9c21bba5ac4db32"
+uuid = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
+version = "0.1.6"
+
 [[deps.ProtoBuf]]
 deps = ["BufferedStreams", "EnumX", "TOML"]
 git-tree-sha1 = "da18083a52d9d57bbe6dadaacad39731e5f7be39"
@@ -2803,10 +2540,10 @@ version = "17.7.0+0"
 # ╠═b30b5f82-cbeb-41aa-9a4f-212d6aafa760
 # ╠═e0c79630-dbe0-4110-b880-a9ee9e4e1186
 # ╠═206a2c26-b3cc-4e74-83e1-fa92aa0bdd10
+# ╠═c672d254-b73d-4191-86a5-ae11be0df3cb
 # ╠═bdeb2eb2-6b5d-4677-837c-7072e3588430
 # ╟─10000002-0000-0000-0000-000000000001
 # ╠═10000003-0000-0000-0000-000000000001
-# ╠═22ef4df8-9962-4443-aa48-cbc4bd5ddb59
 # ╟─10000004-0000-0000-0000-000000000001
 # ╠═10000005-0000-0000-0000-000000000001
 # ╠═10000006-0000-0000-0000-000000000001
@@ -2816,7 +2553,6 @@ version = "17.7.0+0"
 # ╠═10000008-0000-0000-0000-000000000001
 # ╠═10000008-0000-0000-0000-000000000005
 # ╠═1000000c-0000-0000-0000-000000000004
-# ╠═d5000001-0000-0000-0000-000000000001
 # ╠═c0000002-0000-0000-0000-000000000002
 # ╠═d5000002-0000-0000-0000-000000000002
 # ╠═c0000003-0000-0000-0000-000000000003
@@ -2841,37 +2577,17 @@ version = "17.7.0+0"
 # ╠═3ef20afc-4c62-4aab-b96f-4e170f8d96dd
 # ╠═3ef20afc-4c62-4aab-b96f-4e170f8d96de
 # ╠═f41c2e62-efbf-47c8-8b7e-adf828ffde4f
-# ╠═4057ac26-f7b5-4c26-8a5e-4796de1be81f
 # ╠═10000011-0000-0000-0000-000000000001
 # ╠═10000013-0000-0000-0000-000000000001
 # ╠═10000014-0000-0000-0000-000000000001
-# ╟─13c7f289-d698-453f-a9b1-65bf2c87f465
-# ╟─10000015-0000-0000-0000-000000000001
-# ╠═10000016-0000-0000-0000-000000000001
-# ╠═20ae1f67-cfaa-487d-8d94-a5f7b97b45fd
-# ╠═10000017-0000-0000-0000-000000000001
-# ╠═10000018-0000-0000-0000-000000000001
-# ╠═baf864b2-8860-4486-b1b8-5967cb824c05
-# ╠═b11c9e24-6593-497c-a706-146619251e36
-# ╟─86843302-bb3b-494c-afe4-b9a43fcc0e7c
-# ╟─10000019-0000-0000-0000-000000000001
+# ╠═13c7f289-d698-453f-a9b1-65bf2c87f465
+# ╠═7f4e1dc2-f3dd-45b2-8818-6eff1ed4f7b5
+# ╠═9dbe9444-75f3-4d59-8b47-3f70d6bcf6b3
 # ╠═b00b61c7-81c6-467a-b8bd-9f9e2ebd4d0c
 # ╠═9c18f181-8d76-46a4-836d-c4fe2cad19c8
-# ╠═e0000001-0000-0000-0000-000000000001
-# ╠═fd286392-4902-11f1-964f-65a304aae057
-# ╠═ebb34459-2adf-4b90-8e06-2db4215548c8
-# ╠═084f1241-bd18-49cd-911c-5eb396c0a364
-# ╠═1000001a-0000-0000-0000-000000000001
-# ╠═1000001b-0000-0000-0000-000000000001
-# ╠═1000001c-0000-0000-0000-000000000001
 # ╠═ea4761ee-461d-4429-a13a-e872ae52cc66
-# ╠═b48757f3-a9f1-4ff4-b714-de58221a1660
-# ╠═52edc77f-d951-40a2-bae7-ed04e2c778ce
-# ╠═30265164-1bdf-493d-bbc4-6ef227a4fbfb
-# ╠═124f7e8b-8d6a-4a25-af36-e78eb323f03b
-# ╠═3207b4be-2278-4e89-afb7-205bcfdb839e
-# ╠═bc80aea7-5748-44c6-a0d4-f260e2a29c42
-# ╠═c19d4c52-4a33-11f1-a3fa-677e8b10e883
 # ╠═d1eec798-b7aa-4387-9a1e-71064e2660fd
+# ╠═d5000002-0000-0000-0000-000000000003
+# ╠═d5000002-0000-0000-0000-000000000004
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002

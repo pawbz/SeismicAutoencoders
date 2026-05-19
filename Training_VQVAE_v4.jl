@@ -153,6 +153,7 @@ end
 md"### Select Station Pair"
 
 # ╔═╡ 1000000e-0000-0000-0000-000000000001
+# data_filepath = "/mnt/NAS2/Sanket_data/California_2013_BK_CI_20032026/"
 data_filepath = "/mnt/NAS2/Sanket_data/California_2013_BK_CI_20032026/"
 # data_filepath = "/mnt/NAS2/Sanket_data/California_TO_with_latlong/"
 # data_filepath = "/mnt/NAS2/Sanket_data/California_XJ_13032026/"

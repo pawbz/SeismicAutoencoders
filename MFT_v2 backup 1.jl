@@ -228,6 +228,313 @@ function narrow_band_filter_analytic(data::AbstractVector{<:Real}, dt::Float64,
     return ifft(out)
 end
 
+# ╔═╡ fb000001-0000-0000-0000-000000000001
+"""
+    MFTFilterBank
+
+Pre-computed Gaussian filter bank for efficient repeated MFT analysis.
+Stores FFTW plans, workspace buffers, and filter coefficients so that
+`perform_mft_analysis_batch!` requires only one batch FFT + nfreq IFFTs
+for N waveforms, with no heap allocation after the first call.
+
+Construct once per notebook session (parameters fixed by dt, npts, periods).
+The workspace is resized lazily if called with more columns than N_initial.
+"""
+mutable struct MFTFilterBank
+    # geometry
+    periods::Vector{Float64}
+    frequencies::Vector{Float64}
+    dt::Float64                 # upsampled = dt_original / 10
+    dt_original::Float64
+    npts_original::Int          # length after 10× upsample (before pad)
+    npts_padded::Int            # npts_original * zero_pad_factor
+    nfreq::Int
+    velocity_range::Tuple{Float64,Float64}
+    bandwidth_factor::Float64
+    zero_pad_factor::Int
+    time::Vector{Float64}       # (npts_original,) time axis starting at dt
+
+    # pre-computed filter weights: one-sided Gaussians, ×2 on positive freqs, neg freqs = 0
+    H_full::Matrix{ComplexF64}  # (npts_padded × nfreq)
+
+    # workspace (sized for N_buf columns; resized lazily via _ensure_batch_size!)
+    N_buf::Int
+    W_pad_buf::Matrix{ComplexF64}    # (npts_padded × N_buf) input after upsample+pad
+    SPEC_buf::Matrix{ComplexF64}     # (npts_padded × N_buf) FFT of W_pad_buf
+    Z_buf::Matrix{ComplexF64}        # (npts_padded × N_buf) per-freq filtered spectrum
+    Z_time_buf::Matrix{ComplexF64}   # (npts_padded × N_buf) IFFT result (analytic signal)
+    envelopes_buf::Array{Float64,3}  # (npts_original × nfreq × N_buf) Hilbert envelopes
+    filtered_buf::Array{Float64,3}   # (npts_original × nfreq × N_buf) real filtered traces
+    arrivals_buf::Matrix{Float64}    # (nfreq × N_buf) group arrival times
+    phases_buf::Matrix{Float64}      # (nfreq × N_buf) wrapped phases at group arrival
+
+    # FFTW out-of-place plans: mul!(dst, plan, src) writes into dst without allocating
+    plan_fwd::Any   # plan_fft(W_pad_buf, 1)  — mul!(SPEC_buf, plan_fwd, W_pad_buf)
+    plan_inv::Any   # plan_ifft(Z_buf, 1)     — mul!(Z_time_buf, plan_inv, Z_buf)
+end
+
+function MFTFilterBank(dt_original::Float64, npts_raw::Int,
+                       periods::Vector{Float64};
+                       bandwidth_factor::Float64=sqrt(2.0/25.0),
+                       zero_pad_factor::Int=4,
+                       velocity_range::Tuple{Float64,Float64}=(2.0, 6.0),
+                       N_initial::Int=256)
+
+    dt = dt_original / 10.0
+    # Derive exact upsampled length using the same matrix code path as perform_mft_analysis_batch!
+    npts_original = size(DSP.resample(zeros(npts_raw, 1), 10.0; dims=1), 1)
+    npts_padded   = npts_original * zero_pad_factor
+    nfreq         = length(periods)
+    frequencies   = 1.0 ./ periods
+
+    # Build H_full: one-sided complex Gaussian filter matrix
+    freqs_full = fftfreq(npts_padded, 1.0 / dt)
+    H_full = zeros(ComplexF64, npts_padded, nfreq)
+    for ifreq in 1:nfreq
+        f0    = frequencies[ifreq]
+        sigma = f0 * bandwidth_factor / 2.0
+        for k in eachindex(freqs_full)
+            f = freqs_full[k]
+            if f > 0.0
+                H_full[k, ifreq] = 2.0 * exp(-0.5 * ((f - f0) / sigma)^2)
+            elseif f == 0.0
+                H_full[k, ifreq] = exp(-0.5 * (f0 / sigma)^2)
+            end
+            # f < 0: stays zero — one-sided analytic spectrum
+        end
+    end
+
+    time = collect(range(dt, step=dt, length=npts_original))
+
+    W_pad_buf  = zeros(ComplexF64, npts_padded, N_initial)
+    SPEC_buf   = zeros(ComplexF64, npts_padded, N_initial)
+    Z_buf      = zeros(ComplexF64, npts_padded, N_initial)
+    Z_time_buf = zeros(ComplexF64, npts_padded, N_initial)
+    envelopes_buf = zeros(Float64, npts_original, nfreq, N_initial)
+    filtered_buf  = zeros(Float64, npts_original, nfreq, N_initial)
+    arrivals_buf  = fill(NaN, nfreq, N_initial)
+    phases_buf    = fill(NaN, nfreq, N_initial)
+
+    # Out-of-place plans measured against the initial buffer shapes
+    plan_fwd = FFTW.plan_fft(W_pad_buf, 1)
+    plan_inv = FFTW.plan_ifft(Z_buf, 1)
+
+    MFTFilterBank(
+        periods, frequencies, dt, dt_original, npts_original, npts_padded, nfreq,
+        velocity_range, bandwidth_factor, zero_pad_factor, time, H_full,
+        N_initial, W_pad_buf, SPEC_buf, Z_buf, Z_time_buf,
+        envelopes_buf, filtered_buf, arrivals_buf, phases_buf,
+        plan_fwd, plan_inv,
+    )
+end
+
+function _ensure_batch_size!(bank::MFTFilterBank, N::Int)
+    N <= bank.N_buf && return
+    bank.N_buf         = N
+    bank.W_pad_buf     = zeros(ComplexF64, bank.npts_padded, N)
+    bank.SPEC_buf      = zeros(ComplexF64, bank.npts_padded, N)
+    bank.Z_buf         = zeros(ComplexF64, bank.npts_padded, N)
+    bank.Z_time_buf    = zeros(ComplexF64, bank.npts_padded, N)
+    bank.envelopes_buf = zeros(Float64, bank.npts_original, bank.nfreq, N)
+    bank.filtered_buf  = zeros(Float64, bank.npts_original, bank.nfreq, N)
+    bank.arrivals_buf  = fill(NaN, bank.nfreq, N)
+    bank.phases_buf    = fill(NaN, bank.nfreq, N)
+    bank.plan_fwd = FFTW.plan_fft(bank.W_pad_buf, 1)
+    bank.plan_inv = FFTW.plan_ifft(bank.Z_buf, 1)
+    return nothing
+end
+
+function _assemble_mft_result(bank::MFTFilterBank, dist::Float64, n::Int,
+                               all_peaks_n::Vector{Vector{Tuple{Float64,Float64}}};
+                               compute_phase::Bool=false,
+                               phvel_correction::Float64=0.0)
+    nfreq = bank.nfreq
+    phase_branch_numbers = collect(-3:3)
+    nbranches = length(phase_branch_numbers)
+
+    arrivals     = bank.arrivals_buf[:, n]
+    filtered     = bank.filtered_buf[:, :, n]
+    envelopes    = bank.envelopes_buf[:, :, n]
+
+    group_velocities      = fill(NaN, nfreq)
+    amplitudes            = zeros(Float64, nfreq)
+    quality_factors       = zeros(Float64, nfreq)
+    phase_velocities      = fill(NaN, nfreq)
+    phase_velocity_branches = fill(NaN, nfreq, nbranches)
+    raw_phases            = fill(NaN, nfreq)
+
+    for ifreq in 1:nfreq
+        t_g = arrivals[ifreq]
+        envelope = @view envelopes[:, ifreq]
+        peaks = all_peaks_n[ifreq]
+        amp_peak = isempty(peaks) ? 0.0 : first(peaks)[2]
+
+        if !isnan(t_g) && t_g > 0.0
+            group_velocities[ifreq] = dist / t_g
+        end
+        amplitudes[ifreq]     = isnan(t_g) ? maximum(envelope) : amp_peak
+        mean_env              = mean(envelope)
+        quality_factors[ifreq] = mean_env > 0.0 ? amplitudes[ifreq] / mean_env : 0.0
+
+        if compute_phase && !isnan(t_g) && t_g > 0.0
+            raw_phases[ifreq] = bank.phases_buf[ifreq, n]
+        end
+    end
+
+    if compute_phase
+        valid = .!isnan.(raw_phases) .& .!isnan.(arrivals) .& (arrivals .> 0.0)
+        valid_idxs = findall(valid)
+        if length(valid_idxs) >= 2
+            omegas = 2π .* bank.frequencies
+            order  = sortperm(bank.frequencies[valid_idxs])
+            valid_sorted = valid_idxs[order]
+            phase_diffs_valid = [
+                omegas[i] * arrivals[i] - raw_phases[i] + phvel_correction
+                for i in valid_sorted
+            ]
+            phase_diffs_unwrapped = DSP.unwrap(phase_diffs_valid)
+            for (j, i) in enumerate(valid_sorted)
+                denom0 = phase_diffs_unwrapped[j]
+                for (ib, branch) in enumerate(phase_branch_numbers)
+                    denom = denom0 + 2π * branch
+                    if abs(denom) > 1e-6
+                        c = omegas[i] * dist / denom
+                        phase_velocity_branches[i, ib] = (0.5 ≤ c ≤ 20.0) ? c : NaN
+                    end
+                end
+                phase_velocities[i] = phase_velocity_branches[i, findfirst(==(0), phase_branch_numbers)]
+            end
+        end
+    end
+
+    return MFTResult(
+        bank.periods, bank.frequencies,
+        group_velocities, phase_velocities,
+        phase_branch_numbers, phase_velocity_branches,
+        amplitudes, filtered, envelopes, arrivals,
+        dist, quality_factors, all_peaks_n, bank.time,
+    )
+end
+
+# --- Phase 1: dist-independent (upsample, FFT, filter, IFFT → fills envelopes_buf/filtered_buf)
+function _run_phase1!(bank::MFTFilterBank, W_flat::AbstractMatrix{Float64}, N::Int)
+    W_up = DSP.resample(W_flat, 10.0; dims=1)   # (npts_original × N) — one allocation
+    @views bank.W_pad_buf[:, 1:N] .= 0
+    @views bank.W_pad_buf[1:bank.npts_original, 1:N] .= W_up
+    mul!(bank.SPEC_buf, bank.plan_fwd, bank.W_pad_buf)
+    for ifreq in 1:bank.nfreq
+        @views @. bank.Z_buf[:, 1:N] = bank.H_full[:, ifreq] * bank.SPEC_buf[:, 1:N]
+        mul!(bank.Z_time_buf, bank.plan_inv, bank.Z_buf)
+        @views @. bank.filtered_buf[1:bank.npts_original, ifreq, 1:N]  =
+            real(bank.Z_time_buf[1:bank.npts_original, 1:N])
+        @views @. bank.envelopes_buf[1:bank.npts_original, ifreq, 1:N] =
+            abs(bank.Z_time_buf[1:bank.npts_original, 1:N])
+    end
+end
+
+# --- Phase 2: dist-dependent (peak finding + assembly → returns Vector{MFTResult})
+function _run_phase2!(bank::MFTFilterBank, dists_flat::AbstractVector{Float64}, N::Int;
+                      compute_phase::Bool=false, phvel_correction::Float64=0.0)
+    bank.arrivals_buf[:, 1:N] .= NaN
+    bank.phases_buf[:, 1:N]   .= NaN
+    min_vel, max_vel = bank.velocity_range
+
+    all_peaks = [[Tuple{Float64,Float64}[] for _ in 1:bank.nfreq] for _ in 1:N]
+    for n in 1:N
+        dist  = dists_flat[n]
+        t_min = dist / max_vel
+        t_max = dist / min_vel
+        for ifreq in 1:bank.nfreq
+            env   = @view bank.envelopes_buf[:, ifreq, n]
+            peaks = find_group_arrivals(env, bank.time, (t_min, t_max); max_peaks=4)
+            all_peaks[n][ifreq] = peaks
+            t_g   = isempty(peaks) ? NaN : first(peaks)[1]
+            bank.arrivals_buf[ifreq, n] = t_g
+            if compute_phase && isfinite(t_g) && t_g > 0.0
+                i_g = clamp(round(Int, (t_g - bank.time[1]) / bank.dt) + 1, 1, bank.npts_original)
+                re      = bank.filtered_buf[i_g, ifreq, n]
+                env_val = bank.envelopes_buf[i_g, ifreq, n]
+                bank.phases_buf[ifreq, n] = atan(sqrt(max(env_val^2 - re^2, 0.0)), re)
+            end
+        end
+    end
+
+    results = Vector{MFTResult}(undef, N)
+    for n in 1:N
+        results[n] = _assemble_mft_result(bank, dists_flat[n], n, all_peaks[n];
+                                          compute_phase, phvel_correction)
+    end
+    return results
+end
+
+"""
+    perform_mft_analysis_batch!(bank, W, dist; compute_phase=false) -> Vector{MFTResult}
+    perform_mft_analysis_batch!(bank, W, dists; compute_phase=false) -> Array{MFTResult}
+
+Run MFT on a batch of waveforms using a pre-computed `MFTFilterBank`.
+
+**2-D form** — `W::AbstractMatrix{Float64}` of shape `(nt × N)`, `dist::Float64`:
+Returns `Vector{MFTResult}` of length N. One shared distance for all waveforms.
+
+**N-D form** — `W::AbstractArray{Float64}` of shape `(nt × d1 × d2 × ...)`,
+`dists::AbstractArray{Float64}` of shape `(d1 × d2 × ...)`:
+Returns `Array{MFTResult}` with the same shape `(d1 × d2 × ...)`.
+Each position uses its own distance from `dists`. All waveforms are FFT'd in one
+batch pass (Phase 1), then peak-finding and assembly use the per-position distance
+(Phase 2). `reshape` is zero-copy so no data is duplicated.
+
+Scalar-dist convenience: passing `dist::Float64` to the N-D form broadcasts to
+`fill(dist, size(W)[2:end])` — equivalent to the 2-D form.
+"""
+function perform_mft_analysis_batch!(bank::MFTFilterBank,
+                                     W::AbstractMatrix{Float64},
+                                     dist::Float64;
+                                     compute_phase::Bool=false,
+                                     phvel_correction::Float64=0.0)
+    N = size(W, 2)
+    _ensure_batch_size!(bank, N)
+    _run_phase1!(bank, W, N)
+    return _run_phase2!(bank, fill(dist, N), N; compute_phase, phvel_correction)
+end
+
+function perform_mft_analysis_batch!(bank::MFTFilterBank,
+                                     W::AbstractArray{Float64},
+                                     dists::AbstractArray{Float64};
+                                     compute_phase::Bool=false,
+                                     phvel_correction::Float64=0.0)
+    dims = size(W)[2:end]
+    @assert size(dists) == dims "dists shape $(size(dists)) must match trailing dims of W $(dims)"
+    N = prod(dims)
+    _ensure_batch_size!(bank, N)
+    _run_phase1!(bank, reshape(W, size(W, 1), N), N)
+    results_flat = _run_phase2!(bank, vec(dists), N; compute_phase, phvel_correction)
+    return reshape(results_flat, dims)
+end
+
+# Scalar-dist convenience for N-D arrays (broadcasts one distance to all positions)
+function perform_mft_analysis_batch!(bank::MFTFilterBank,
+                                     W::AbstractArray{Float64},
+                                     dist::Float64;
+                                     kwargs...)
+    dims = size(W)[2:end]
+    return perform_mft_analysis_batch!(bank, W, fill(dist, dims); kwargs...)
+end
+
+"""
+    perform_mft_analysis(trace, bank; compute_phase=true, phvel_correction=0.0)
+
+Single-trace MFT using a pre-computed `MFTFilterBank`.
+Drop-in replacement for `perform_mft_analysis(trace, periods; ...)` with
+pre-planned FFTs and no per-call filter recomputation.
+"""
+function perform_mft_analysis(trace::SeismicTrace, bank::MFTFilterBank;
+                               compute_phase::Bool=true,
+                               phvel_correction::Float64=0.0)
+    W = reshape(Float64.(trace.data), :, 1)
+    return only(perform_mft_analysis_batch!(bank, W, trace.distance;
+                                            compute_phase, phvel_correction))
+end
+
 # ╔═╡ e9bfb21b-f29d-410f-827f-e66d1117020f
 """
     compute_phase_velocity(analytic_signal, time, t_group, freq, distance;
@@ -323,7 +630,7 @@ Peaks are returned as `(time, amplitude)` tuples sorted by descending amplitude.
 If no strict local maxima are found, the absolute maximum in the window is returned.
 Returns an empty vector when the window is empty.
 """
-function find_group_arrivals(envelope::Vector{Float64}, time::Vector{Float64},
+function find_group_arrivals(envelope::AbstractVector{Float64}, time::AbstractVector{Float64},
                              search_window::Tuple{Float64,Float64};
                              max_peaks::Int=4)
     t_start, t_end = search_window

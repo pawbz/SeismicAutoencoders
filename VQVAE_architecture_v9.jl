@@ -6,7 +6,7 @@ using InteractiveUtils
 
 # ╔═╡ 10000001-0000-0000-0000-000000000001
 begin
-    using ConcreteStructs,
+    using CUDA, ConcreteStructs,
         Dates,
         DSP,
         FFTW,
@@ -14,7 +14,7 @@ begin
         EnzymeCore,
         JLD2,
         LinearAlgebra,
-        Lux,
+        Lux, LuxCUDA,
         MLUtils,
         NNlib,
         Optimisers,
@@ -31,13 +31,17 @@ end
 # ╔═╡ 330652f1-0754-48a4-9a0f-4fb9d6824222
 using Distances
 
+# ╔═╡ 30f19c4c-fbdc-46c0-9163-45192675858f
+gpu_device(force=true)
+
 # ╔═╡ 10000002-0000-0000-0000-000000000001
 md"""
-# VQ-VAE v8 Architecture
+# VQ-VAE v10 Architecture — Split-Decoder Interferometric Mixture VQ
 
-Lux/Reactant single-pair RVQ VQ-VAE with SEANet-style encoder/decoder.
-Each station pair trains an independent model, so there are no pair ids,
-pair-specific codebooks, or receiver-geometry conditioners in this version.
+Lux/Reactant single-pair Interferometric Split-Decoder VQ-VAE with SEANet-style encoder/decoder.
+Each station pair trains an independent model. Two separate encoder heads map shared features
+to z_e1 and z_e2 (each d÷2), quantized independently. Two separate decoders produce x1_hat
+and x2_hat; reconstruction is additive: x_hat = x1_hat + x2_hat, forcing specialization.
 """
 
 # ╔═╡ 10000003-0000-0000-0000-000000000001
@@ -57,6 +61,9 @@ begin
     default_cdev() = cpu_device()
 end
 
+# ╔═╡ dd763937-85f6-4de0-b6c8-699eb0de7ab1
+default_xdev()
+
 # ╔═╡ 10000004-0000-0000-0000-000000000001
 md"## Parameters"
 
@@ -73,11 +80,10 @@ Base.@kwdef struct VQVAE_Para
     enc_kernel_size::Int = 7
     dec_kernel_size::Int = 7
     use_bn::Bool = false
-    K::Vector{Int} = [5]
+    K::Vector{Int} = [5, 5]
     ema_decay::Float32 = 0.99f0
     epsilon::Float32 = 1f-5
     dead_threshold::Int = 50
-    p_stage2_shuffle::Float32 = 0.25f0
     entropy_weight::Float32 = 0.01f0
     reconstruction_loss::Symbol = :l2
     seed::Int = 1234
@@ -171,7 +177,7 @@ function make_encoder(para)
 end
 
 # ╔═╡ a0416f71-242a-44a7-b8f6-186726318611
-function make_decoder(para, latent_len::Int)
+function make_decoder(para, latent_len::Int; latent_dim::Int=para.d)
     ratios = para.ratios
     mult = 2 ^ length(ratios)
 
@@ -193,7 +199,7 @@ function make_decoder(para, latent_len::Int)
     push!(layers, Conv((para.dec_kernel_size,), para.n_filters => 1; pad=SamePad()))
     upchain = Chain(layers...)
 
-    linear = Dense(para.d, bottleneck_len * bottleneck_channels, activation)
+    linear = Dense(latent_dim, bottleneck_len * bottleneck_channels, activation)
     return @compact(; linear, upchain, bottleneck_len, bottleneck_channels) do z
         y = linear(z)
         y3 = reshape(y, bottleneck_len, bottleneck_channels, size(y, 2))
@@ -438,15 +444,138 @@ begin
 	end
 end
 
+# ╔═╡ 10000010-0000-0000-0000-000000000002
+md"## Split VQ (v10)"
+
+# ╔═╡ 10000010-0000-0000-0000-000000000003
+begin
+	# Independent quantization of two separate z_e halves — no amplitude mixing.
+	function split_vq_quantize(z_e1, z_e2, rvq_state, K::Tuple;
+	    beta_commit::Float32, ema_decay::Float32, epsilon::Float32,
+	    dead_threshold::Int, training::Bool)
+
+	    stage1 = rvq_state.stages[1]
+	    stage2 = rvq_state.stages[2]
+
+	    _, idx1 = EnzymeCore.ignore_derivatives(vq_lookup(stage1.embedding, z_e1))
+	    _, idx2 = EnzymeCore.ignore_derivatives(vq_lookup(stage2.embedding, z_e2))
+	    z_q1_det = EnzymeCore.ignore_derivatives(stage1.embedding[:, idx1])
+	    z_q2_det = EnzymeCore.ignore_derivatives(stage2.embedding[:, idx2])
+
+	    # STE per sub-vector
+	    z_q1 = z_e1 .+ EnzymeCore.ignore_derivatives(z_q1_det .- z_e1)
+	    z_q2 = z_e2 .+ EnzymeCore.ignore_derivatives(z_q2_det .- z_e2)
+
+	    commit_loss = (beta_commit * mse_loss(z_e1, z_q1_det)
+	                 + beta_commit * mse_loss(z_e2, z_q2_det)) / 2f0
+
+	    new_stages = rvq_state.stages
+	    counts1 = if training
+	        new_s1, c1_loc = update_rvq_stage_state(stage1, z_e1, idx1,
+	            ema_decay, epsilon, dead_threshold)
+	        new_stages = replace_tuple(new_stages, 1, new_s1)
+	        c1_loc
+	    else
+	        counts_and_sums(EnzymeCore.ignore_derivatives(z_e1), idx1, K[1])[1]
+	    end
+	    counts2 = if training
+	        new_s2, c2_loc = update_rvq_stage_state(stage2, z_e2, idx2,
+	            ema_decay, epsilon, dead_threshold)
+	        new_stages = replace_tuple(new_stages, 2, new_s2)
+	        c2_loc
+	    else
+	        counts_and_sums(EnzymeCore.ignore_derivatives(z_e2), idx2, K[2])[1]
+	    end
+
+	    perp1, ent1, _ = probs_entropy(counts1)
+	    perp2, ent2, _ = probs_entropy(counts2)
+	    stage_indices  = training ? nothing : vcat(reshape(idx1, 1, :), reshape(idx2, 1, :))
+	    coarse_indices = training ? nothing : reshape(idx1, 1, :)
+
+	    return (;
+	        z_q1, z_q2,
+	        stage_indices,
+	        coarse_indices,
+	        commit_loss,
+	        entropy_loss=(ent1 + ent2) / 2f0,
+	        perplexity=(perp1 + perp2) / 2f0,
+	        stage_perplexities=(training ? nothing : (perp1, perp2)),
+	    ), (; stages=new_stages)
+	end
+
+	# CPU-side precomputation: independent lookups + EMA, stores detached z_q halves.
+	function prepare_split_payload(z_e1, z_e2, rvq_state, K::Tuple;
+	    ema_decay::Float32, epsilon::Float32, dead_threshold::Int, training::Bool)
+
+	    stages = rvq_state.stages
+	    new_stages = stages
+
+	    _, idx1 = vq_lookup(stages[1].embedding, z_e1)
+	    _, idx2 = vq_lookup(stages[2].embedding, z_e2)
+
+	    z_q1_det = Float32.(stages[1].embedding[:, idx1])
+	    z_q2_det = Float32.(stages[2].embedding[:, idx2])
+
+	    counts1 = if training
+	        new_s1, c1_loc = update_rvq_stage_state(stages[1], z_e1, idx1,
+	            ema_decay, epsilon, dead_threshold)
+	        new_stages = replace_tuple(new_stages, 1, new_s1)
+	        c1_loc
+	    else
+	        counts_and_sums(z_e1, idx1, K[1])[1]
+	    end
+	    counts2 = if training
+	        new_s2, c2_loc = update_rvq_stage_state(stages[2], z_e2, idx2,
+	            ema_decay, epsilon, dead_threshold)
+	        new_stages = replace_tuple(new_stages, 2, new_s2)
+	        c2_loc
+	    else
+	        counts_and_sums(z_e2, idx2, K[2])[1]
+	    end
+
+	    perp1, ent1, _ = probs_entropy(Float32.(counts1))
+	    perp2, ent2, _ = probs_entropy(Float32.(counts2))
+
+	    payload = (;
+	        z_q_stages=(z_q1_det, z_q2_det),
+	        counts_stages=(Float32.(counts1), Float32.(counts2)),
+	        entropy_loss=Float32((ent1 + ent2) / 2f0),
+	        perplexity=Float32((perp1 + perp2) / 2f0),
+	    )
+	    return payload, (; stages=new_stages)
+	end
+
+	# Compiled training step: frozen codebook lookups from payload, STE only.
+	function split_vq_quantize_precomputed(z_e1, z_e2, payload, K::Tuple; beta_commit::Float32)
+	    z_q1_det = EnzymeCore.ignore_derivatives(payload.z_q_stages[1])
+	    z_q2_det = EnzymeCore.ignore_derivatives(payload.z_q_stages[2])
+	    z_q1 = z_e1 .+ EnzymeCore.ignore_derivatives(z_q1_det .- z_e1)
+	    z_q2 = z_e2 .+ EnzymeCore.ignore_derivatives(z_q2_det .- z_e2)
+	    commit_loss = (beta_commit * mse_loss(z_e1, z_q1_det)
+	                 + beta_commit * mse_loss(z_e2, z_q2_det)) / 2f0
+	    return (;
+	        z_q1, z_q2,
+	        stage_indices=nothing,
+	        coarse_indices=nothing,
+	        commit_loss,
+	        entropy_loss=EnzymeCore.ignore_derivatives(payload.entropy_loss),
+	        perplexity=EnzymeCore.ignore_derivatives(payload.perplexity),
+	        stage_perplexities=nothing,
+	    )
+	end
+end
+
 # ╔═╡ 1000000e-0000-0000-0000-000000000001
 md"## VQ-VAE Model"
 
 # ╔═╡ 1000000f-0000-0000-0000-000000000001
 begin
-	@concrete struct VQVAE <: AbstractLuxContainerLayer{(:encoder, :pre_vq, :decoder)}
-	    encoder <: AbstractLuxLayer
-	    pre_vq <: AbstractLuxLayer
-	    decoder <: AbstractLuxLayer
+	@concrete struct VQVAE <: AbstractLuxContainerLayer{(:encoder, :head1, :head2, :decoder1, :decoder2)}
+	    encoder  <: AbstractLuxLayer
+	    head1    <: AbstractLuxLayer   # Conv+Dense → z_e1 (d÷2)
+	    head2    <: AbstractLuxLayer   # Conv+Dense → z_e2 (d÷2)
+	    decoder1 <: AbstractLuxLayer   # z_q1 → x1_hat
+	    decoder2 <: AbstractLuxLayer   # z_q2 → x2_hat
 	    K::Tuple
 	    d::Int
 	    latent_len::Int
@@ -455,40 +584,44 @@ begin
 	    epsilon::Float32
 	    dead_threshold::Int
 	end
-	
+
 	function Lux.initialparameters(rng::AbstractRNG, m::VQVAE)
 	    return (;
 	        encoder=Lux.initialparameters(rng, m.encoder),
-	        pre_vq=Lux.initialparameters(rng, m.pre_vq),
-	        decoder=Lux.initialparameters(rng, m.decoder),
+	        head1=Lux.initialparameters(rng, m.head1),
+	        head2=Lux.initialparameters(rng, m.head2),
+	        decoder1=Lux.initialparameters(rng, m.decoder1),
+	        decoder2=Lux.initialparameters(rng, m.decoder2),
 	    )
 	end
 
 	function Lux.initialstates(rng::AbstractRNG, m::VQVAE)
 	    return (;
 	        encoder=Lux.initialstates(rng, m.encoder),
-	        pre_vq=Lux.initialstates(rng, m.pre_vq),
-	        decoder=Lux.initialstates(rng, m.decoder),
-	        rvq=init_rvq_state(rng, m.d, m.K),
+	        head1=Lux.initialstates(rng, m.head1),
+	        head2=Lux.initialstates(rng, m.head2),
+	        decoder1=Lux.initialstates(rng, m.decoder1),
+	        decoder2=Lux.initialstates(rng, m.decoder2),
+	        rvq=init_rvq_state(rng, m.d ÷ 2, m.K),   # each codebook is (d÷2, K[s])
 	    )
 	end
-	
+
 	function encoder_latents(m, x, ps, st)
 	    feat, st_enc = m.encoder(waveform_to_conv3(x), ps.encoder, st.encoder)
-	    L, C, B = size(feat)
-	    feat_flat = reshape(permutedims(feat, (2, 1, 3)), C * L, B)
-	    z_e, st_pre = m.pre_vq(feat_flat, ps.pre_vq, st.pre_vq)
-	    return (; feat, feat_flat, z_e), (; encoder=st_enc, pre_vq=st_pre)
+	    z_e1, st_h1 = m.head1(feat, ps.head1, st.head1)   # (d÷2, B)
+	    z_e2, st_h2 = m.head2(feat, ps.head2, st.head2)   # (d÷2, B)
+	    z_e = vcat(z_e1, z_e2)                             # (d, B) — for kNN
+	    return (; feat, z_e, z_e1, z_e2),
+	           (; encoder=st_enc, head1=st_h1, head2=st_h2)
 	end
-	
+
 	function encode(m, ps, st, x; beta_commit::Float32=m.beta_commit, training::Bool=false)
 	    lat, st_lat = encoder_latents(m, x, ps, st)
-	    # pass 0 during inference so rvq_quantize never touches the RNG — safe for @compile
-	    _p_shuffle = training ? m.p_stage2_shuffle : 0f0
-	    q, st_rvq = rvq_quantize(lat.z_e, st.rvq, m.K; beta_commit,
-	        ema_decay=m.ema_decay, epsilon=m.epsilon,
-	        dead_threshold=m.dead_threshold, p_stage2_shuffle=_p_shuffle, training)
-	    st_new = (; encoder=st_lat.encoder, pre_vq=st_lat.pre_vq, decoder=st.decoder, rvq=st_rvq)
+	    q, st_rvq = split_vq_quantize(lat.z_e1, lat.z_e2, st.rvq, m.K;
+	        beta_commit, ema_decay=m.ema_decay, epsilon=m.epsilon,
+	        dead_threshold=m.dead_threshold, training)
+	    st_new = (; encoder=st_lat.encoder, head1=st_lat.head1, head2=st_lat.head2,
+	        decoder1=st.decoder1, decoder2=st.decoder2, rvq=st_rvq)
 	    return merge(lat, q), st_new
 	end
 
@@ -498,14 +631,17 @@ begin
 	    return enc.z_e
 	end
 
-    function encode_z_e_training(m, ps, st, x)
-        lat, _ = encoder_latents(m, x, ps, st)
-        return lat.z_e
-    end
+	function encode_z_e_training(m, ps, st, x)
+	    lat, _ = encoder_latents(m, x, ps, st)
+	    return lat.z_e
+	end
 
 	function decode_from_latents(m, ps, st, result)
-	    xhat, st_dec = m.decoder(result.z_q, ps.decoder, st.decoder)
-	    return merge(result, (; xhat)), merge(st, (; decoder=st_dec))
+	    x1hat, st_dec1 = m.decoder1(result.z_q1, ps.decoder1, st.decoder1)
+	    x2hat, st_dec2 = m.decoder2(result.z_q2, ps.decoder2, st.decoder2)
+	    xhat = x1hat .+ x2hat
+	    st_new = merge(st, (; decoder1=st_dec1, decoder2=st_dec2))
+	    return merge(result, (; xhat, x1hat, x2hat)), st_new
 	end
 
 	function (m::VQVAE)(x, ps, st; beta_commit::Float32=m.beta_commit, training::Bool=true)
@@ -513,15 +649,15 @@ begin
 	    return decode_from_latents(m, ps, st_enc, enc)
 	end
 
-    function forward_with_precomputed_vq(m, x, ps, st, payload;
-        beta_commit::Float32=m.beta_commit)
-        lat, st_lat = encoder_latents(m, x, ps, st)
-        q = rvq_quantize_precomputed(lat.z_e, payload, m.K; beta_commit)
-        st_mid = (; encoder=st_lat.encoder, pre_vq=st_lat.pre_vq,
-            decoder=st.decoder, rvq=st.rvq)
-        return decode_from_latents(m, ps, st_mid, merge(lat, q))
-    end
-	
+	function forward_with_precomputed_vq(m, x, ps, st, payload;
+	    beta_commit::Float32=m.beta_commit)
+	    lat, st_lat = encoder_latents(m, x, ps, st)
+	    q = split_vq_quantize_precomputed(lat.z_e1, lat.z_e2, payload, m.K; beta_commit)
+	    st_mid = (; encoder=st_lat.encoder, head1=st_lat.head1, head2=st_lat.head2,
+	        decoder1=st.decoder1, decoder2=st.decoder2, rvq=st.rvq)
+	    return decode_from_latents(m, ps, st_mid, merge(lat, q))
+	end
+
 	codebook_size(m) = m.K[1]
 	num_rvq_stages(m) = length(m.K)
 	get_codebook(st, stage::Int=1) = Array(st.rvq.stages[stage].embedding)
@@ -541,7 +677,7 @@ begin
 	        commit_loss=result.commit_loss, entropy_loss=result.entropy_loss,
 	        perplexity=result.perplexity, stage_perplexities=result.stage_perplexities)
 	end
-	
+
 	function vqvae_precomputed_loss(model, ps, st, batch, para)
 	    result, st_new = forward_with_precomputed_vq(
 	        model, batch.x, ps, st, batch.vq_payload; beta_commit=para.beta_commit
@@ -822,17 +958,20 @@ begin
 	        ps_cpu = cdev(ps)
 	        st_cpu = Lux.testmode(cdev(st))
 	        lat, _ = encoder_latents(model, batch.x, ps_cpu, st_cpu)
-	        z_e_cpu = lat.z_e
+	        z_e1_cpu = lat.z_e1
+	        z_e2_cpu = lat.z_e2
 	        rvq_cpu = st_cpu.rvq
 	    else
 	        z_e_cpu = Float32.(cdev(encode_compiled(model, ps, Lux.testmode(st), device(batch.x))))
+	        half = model.d ÷ 2
+	        z_e1_cpu = z_e_cpu[1:half, :]
+	        z_e2_cpu = z_e_cpu[half+1:end, :]
 	        rvq_cpu = cdev(st.rvq)
 	    end
-	    payload_cpu, rvq_cpu = prepare_rvq_payload(z_e_cpu, rvq_cpu, model.K;
+	    payload_cpu, rvq_cpu = prepare_split_payload(z_e1_cpu, z_e2_cpu, rvq_cpu, model.K;
 	        ema_decay=para.ema_decay,
 	        epsilon=para.epsilon,
 	        dead_threshold=para.dead_threshold,
-	        p_stage2_shuffle=para.p_stage2_shuffle,
 	        training=true)
 	    st_dev = merge(st, (; rvq=device(rvq_cpu)))
 	    payload_time = time() - payload_start
@@ -879,37 +1018,6 @@ begin
 	    push!(loss_history.throughput, Float32(throughput))
 	    return loss_history
 	end
-end
-
-# ╔═╡ 10000010-0000-0000-0000-000000000001
-function get_vqvae(para; rng=Random.default_rng(), device=identity)
-    isempty(para.K) && error("K must contain at least one RVQ stage size.")
-    all(>(1), para.K) || error("All K entries must be > 1.")
-    Random.seed!(rng, para.seed)
-
-    encoder = make_encoder(para)
-    ps_enc, st_enc = Lux.setup(rng, encoder)
-    dummy = randn(rng, Float32, para.nt, 2)
-    enc_dummy, _ = encoder(waveform_to_conv3(dummy), ps_enc, Lux.testmode(st_enc))
-    latent_len, enc_channels, _ = size(enc_dummy)
-
-    pre_vq_in = latent_len * enc_channels
-    pre_vq = Dense(pre_vq_in, para.d)
-    decoder = make_decoder(para, latent_len)
-    ps_dec, st_dec = Lux.setup(rng, decoder)
-    dec_dummy, _ = decoder(randn(rng, Float32, para.d, 2), ps_dec, Lux.testmode(st_dec))
-    size(dec_dummy, 1) == para.nt ||
-        error("Decoder geometry mismatch: output length $(size(dec_dummy, 1)) != nt $(para.nt). Adjust decoder strides/kernels.")
-    model = VQVAE(encoder, pre_vq, decoder, Tuple(Int.(para.K)),
-        para.d, latent_len,
-        para.beta_commit, para.ema_decay,
-        para.epsilon, para.dead_threshold)
-    ps, st = Lux.setup(rng, model)
-    ps, st = (ps, st) |> device
-
-    loss_history = fresh_loss_history()
-    @info "VQ-VAE v8 geometry" nt=para.nt d=para.d latent_len K=para.K enc_channels
-    return model, ps, st, loss_history
 end
 
 # ╔═╡ 2ed0a636-4fc5-4bbe-9886-1aa351510c67
@@ -1007,7 +1115,7 @@ function compile_vqvae_helpers(model, ps, st, train_x_cpu, training_para::VQVAE_
         error("Training set N=$(size(train_x_cpu, 2)) is smaller than batchsize=$(training_para.batchsize).")
     sample_batch_x = isnothing(sample_batch_x) ?
         device(train_x_cpu[:, 1:training_para.batchsize]) : sample_batch_x
-    @info "Compiling v8 pair helpers" N=size(train_x_cpu, 2) batchsize=training_para.batchsize
+    @info "Compiling v10 pair helpers" N=size(train_x_cpu, 2) batchsize=training_para.batchsize
     return maybe_compile_inference(
         model, ps, st, device(train_x_cpu), training_para;
         device,
@@ -1035,7 +1143,7 @@ end
 # ╔═╡ 7f8c942b-1957-4721-8c21-37f9278e342d
 function compile_train_step(model, ps, st, train_x_cpu, para, training_para::VQVAE_Training_Para;
     device=identity, cdev=default_cdev())
-    @info "Compiling v8 training step (forward+backward+optimizer)"
+    @info "Compiling v10 training step (forward+backward+optimizer)"
     start = time()
     opt = Optimisers.AdamW(; eta=Float64(training_para.initial_learning_rate),
         lambda=Float64(training_para.weight_decay))
@@ -1043,10 +1151,11 @@ function compile_train_step(model, ps, st, train_x_cpu, para, training_para::VQV
     ad_backend = training_backend(training_para, device)
     dummy_batch_cpu = train_x_cpu[:, 1:training_para.batchsize]
     dummy_target_cpu = Float32.(MLUtils.normalise(dummy_batch_cpu; dims=1))
-    lat, _ = encoder_latents(model, dummy_batch_cpu, cdev(ps), Lux.testmode(cdev(st)))
-    payload_cpu, rvq_cpu = prepare_rvq_payload(lat.z_e, cdev(st.rvq), model.K;
+    ps_cpu = cdev(ps); st_cpu = Lux.testmode(cdev(st))
+    lat, _ = encoder_latents(model, dummy_batch_cpu, ps_cpu, st_cpu)
+    payload_cpu, rvq_cpu = prepare_split_payload(lat.z_e1, lat.z_e2, st_cpu.rvq, model.K;
         ema_decay=para.ema_decay, epsilon=para.epsilon,
-        dead_threshold=para.dead_threshold, p_stage2_shuffle=para.p_stage2_shuffle, training=true)
+        dead_threshold=para.dead_threshold, training=true)
     st_dev = merge(st, (; rvq=device(rvq_cpu)))
     dummy_bdev = (;
         x=device(Float32.(dummy_batch_cpu)),
@@ -1119,7 +1228,7 @@ function trim_training_bundle(bundle; n_max::Union{Nothing,Integer}=nothing,
     n_windows = min(size(bundle.D1fac, 2), size(bundle.D1fc, 2))
     n_windows == n_windows_max && return bundle
     if n_windows > n_windows_max
-        @info "Trimming v8 pair waveforms to n_max" pair=bundle.pair n_original=2n_windows n_kept=2n_windows_max n_max
+        @info "Trimming v10 pair waveforms to n_max" pair=bundle.pair n_original=2n_windows n_kept=2n_windows_max n_max
         trim_headers(headers) = headers === nothing ? nothing :
             (length(headers) == n_windows ? headers[1:n_windows_max] : headers)
         return merge(bundle, (;
@@ -1128,7 +1237,7 @@ function trim_training_bundle(bundle; n_max::Union{Nothing,Integer}=nothing,
             headers=trim_headers(bundle.headers),
         ))
     else
-        @info "Upsampling v8 pair waveforms to n_max" pair=bundle.pair n_original=2n_windows n_target=2n_windows_max n_max
+        @info "Upsampling v10 pair waveforms to n_max" pair=bundle.pair n_original=2n_windows n_target=2n_windows_max n_max
         idx_ac = rand(rng, 1:n_windows, n_windows_max)
         idx_c  = rand(rng, 1:n_windows, n_windows_max)
         return merge(bundle, (;
@@ -1167,36 +1276,15 @@ function load_pairs_data(selected_pairs; filepath::String,
     pairs_data = Any[]
     for pair_raw in selected_pairs
         pair = (String(pair_raw[1]), String(pair_raw[2]))
-        @info "Loading v8 pair data" pair
+        @info "Loading v10 pair data" pair
         bundle = build_training_bundle(pair; filepath, dt, period_min, period_max)
         bundle = trim_training_bundle(bundle; n_max, rng)
-        @info "Loaded v8 pair bundle" pair distance=bundle.distance D1fac_size=size(bundle.D1fac) D1fc_size=size(bundle.D1fc)
+        @info "Loaded v10 pair bundle" pair distance=bundle.distance D1fac_size=size(bundle.D1fac) D1fc_size=size(bundle.D1fc)
         data = make_pooled_split(bundle.D1fac, bundle.D1fc; rng)
-        @info "Built v8 train/test split" pair train_size=size(data.D_train) test_size=size(data.D_test)
+        @info "Built v10 train/test split" pair train_size=size(data.D_train) test_size=size(data.D_test)
         push!(pairs_data, (; pair, data, data_bundle=bundle))
     end
     return pairs_data
-end
-
-# ╔═╡ a74f1dab-d658-4f37-9d26-4ddd9097d15e
-function compile_model(nt::Int, n_train::Int; vqvae_parameters::NamedTuple,
-    training_para::VQVAE_Training_Para, seed::Int=1234, device=nothing)
-    ensure_reactant_xla_flags!()
-    xdev = isnothing(device) ? default_xdev(; force=true) : device
-    cdev = default_cdev()
-    rng = Xoshiro(seed)
-    para = VQVAE_Para(; merge(vqvae_parameters, (; nt, seed))...)
-    model, ps, st, _ = get_vqvae(para; rng, device=xdev)
-    # latent-index encoder compiled at n_train (minimum across all pairs)
-    # batch encoder compiled at batchsize — these are separate XLA graphs
-    dummy_full_cpu = randn(rng, Float32, nt, n_train)
-    dummy_batch_cpu = dummy_full_cpu[:, 1:training_para.batchsize]
-    compiled = compile_vqvae_helpers(model, ps, st, dummy_full_cpu, training_para;
-        device=xdev, sample_batch_x=xdev(dummy_batch_cpu))
-    train_step_cache = compile_train_step(model, xdev(ps), xdev(st),
-        dummy_batch_cpu, para, training_para; device=xdev, cdev)
-    @info "compile_model complete" nt n_train batchsize=training_para.batchsize
-    return (; model, para, compiled, train_step_cache, compile_seed=seed, n_train)
 end
 
 # ╔═╡ a4957762-faf0-40d2-a71e-1d65fe873065
@@ -1378,7 +1466,7 @@ function marginal_decomposition(averages::AbstractMatrix{Float32}, counts::Abstr
 end
 
 # ╔═╡ 70a460bf-b3e4-4e7c-aa4d-2674a450379a
-function plot_training_dashboard(loss_history; title="VQ-VAE v8 Training")
+function plot_training_dashboard(loss_history; title="VQ-VAE v10 Training")
     epochs = collect(1:length(loss_history.train_target_mse))
     traces = [
         PlutoPlotly.scatter(x=epochs, y=loss_history.train_objective, mode="lines", name="train_objective"),
@@ -1515,7 +1603,7 @@ function update(model, ps, st, loss_history, train_data, test_data,
             inference_compiled = (; encode_z_e=nothing, encode_z_e_train=nothing)
         end
     end
-    training_para.verbose && @info "Prepared v8 update loop" setup_time_s=round(time() - setup_start; digits=3) N=size(train_x_cpu, 2) batchsize=training_para.batchsize compiled_helpers=!isnothing(compiled)
+    training_para.verbose && @info "Prepared v10 update loop" setup_time_s=round(time() - setup_start; digits=3) N=size(train_x_cpu, 2) batchsize=training_para.batchsize compiled_helpers=!isnothing(compiled)
 
     @progress name = "VQ-VAE training" for epoch in 1:training_para.nepoch
         phase = ensemble_phase(epoch, training_para)
@@ -1837,54 +1925,79 @@ function per_waveform_whiten(X_cpu::AbstractMatrix{Float32};
     return Float32.(X_whitened)
 end
 
+# ╔═╡ f5000001-0000-0000-0000-000000000001
+function whiten_pair_entry(pd; bp_filter, per_waveform_whitening_kernel_length::Int)
+    process(X) = Float32.(MLUtils.normalise(
+        DSP.filtfilt(bp_filter, Float64.(per_waveform_whiten(X;
+            kernel_length=per_waveform_whitening_kernel_length,
+            min_power_fraction=0.05))); dims=1))
+    D_ac_w    = process(pd.data.D_ac_all)
+    D_c_w     = process(pd.data.D_c_all)
+    D_train_w = process(pd.data.D_train)
+    D_test_w  = process(pd.data.D_test)
+    D_all_w   = Float32.(hcat(D_ac_w, D_c_w))
+    return merge(pd, (;
+        data=merge(pd.data, (; D_train=D_train_w, D_test=D_test_w,
+            D_all=D_all_w, D_ac_all=D_ac_w, D_c_all=D_c_w)),
+        data_bundle=merge(pd.data_bundle, (;
+            D1fac_raw=pd.data_bundle.D1fac,
+            D1fc_raw=pd.data_bundle.D1fc,
+            D1fac=D_ac_w,
+            D1fc=D_c_w,
+            whitening_fir=nothing,
+            spike_bins=Int[],
+        )),
+        whitening_fir=nothing,
+        spike_bins=Int[],
+    ))
+end
+
 # ╔═╡ a1b2c3d4-0000-0000-0000-000000000002
-# Decode every codebook entry through the decoder on CPU.
-# For a single-stage model returns (nt, K1) matrix.
-# For a two-stage model returns:
-#   joint    : (nt, K1*K2)  — decoder(e1[:,k1] + e2[:,k2]), col order (k2-1)*K1+k1
-#   stage1   : (nt, K1)     — decoder(e1[:,k1])  (stage-2 contribution = 0)
-#   stage2   : (nt, K2)     — decoder(e2[:,k2])
+# Decode every codebook entry through the separate decoders on CPU.
+# For v10 (split-decoder) returns:
+#   joint    : (nt, K1*K2)  — decoder1(e1[:,k1]) + decoder2(e2[:,k2]), col order (k2-1)*K1+k1
+#   stage1   : (nt, K1)     — decoder1(e1[:,k1]) alone
+#   stage2   : (nt, K2)     — decoder2(e2[:,k2]) alone
 #   joint_labels  : K1*K2 strings "(k1,k2)"
 #   stage1_labels : K1 strings
 #   stage2_labels : K2 strings
 function decode_codebook_waveforms(model, ps, st; cdev=default_cdev())
     ps_cpu = cdev(ps)
     st_cpu = Lux.testmode(cdev(st))
-    embeddings = [Array(stage.embedding) for stage in st_cpu.rvq.stages]  # [(d,K1), (d,K2), ...]
+    embeddings = [Array(stage.embedding) for stage in st_cpu.rvq.stages]  # [(d÷2,K1), (d÷2,K2)]
 
-    function _decode_batch(Z::Matrix{Float32})
-        # Z : (d, n)  →  xhat : (nt, n)
-        result = (; z_q=Z)
-        out, _ = decode_from_latents(model, ps_cpu, st_cpu, result)
-        return Array(out.xhat)
-    end
+    K1, K2 = model.K[1], model.K[2]
+    e1 = embeddings[1]   # (d÷2, K1)
+    e2 = embeddings[2]   # (d÷2, K2)
 
-    if length(model.K) == 1
-        K1 = model.K[1]
-        e1 = embeddings[1]                         # (d, K1)
-        waves = _decode_batch(Float32.(e1))        # (nt, K1)
-        return (; stage1=waves, stage1_labels=["s1=$k" for k in 1:K1])
-    else
-        K1, K2 = model.K[1], model.K[2]
-        e1 = embeddings[1]   # (d, K1)
-        e2 = embeddings[2]   # (d, K2)
+    # stage-1 marginal: decoder1 applied to each K1 codebook vector
+    Z1_all = Float32.(e1)   # (d÷2, K1)
+    result1 = (; z_q1=Z1_all, z_q2=zeros(Float32, model.d÷2, K1))
+    out1, _ = decode_from_latents(model, ps_cpu, st_cpu, result1)
+    stage1_waves = Array(out1.x1hat)   # (nt, K1) — decoder1 contribution only
 
-        # joint: all K1*K2 combinations
-        Z_joint = hcat([e1[:, k1] .+ e2[:, k2] for k2 in 1:K2 for k1 in 1:K1]...)
-        joint_waves = _decode_batch(Float32.(Z_joint))
+    # stage-2 marginal: decoder2 applied to each K2 codebook vector
+    Z2_all = Float32.(e2)   # (d÷2, K2)
+    result2 = (; z_q1=zeros(Float32, model.d÷2, K2), z_q2=Z2_all)
+    out2, _ = decode_from_latents(model, ps_cpu, st_cpu, result2)
+    stage2_waves = Array(out2.x2hat)   # (nt, K2) — decoder2 contribution only
 
-        stage1_waves = _decode_batch(Float32.(e1))
-        stage2_waves = _decode_batch(Float32.(e2))
+    # joint: additive combination of all K1*K2 pairs
+    n_joint = K1 * K2
+    Z1_rep = hcat([e1[:, k1] for k2 in 1:K2 for k1 in 1:K1]...)   # (d÷2, n_joint)
+    Z2_rep = hcat([e2[:, k2] for k2 in 1:K2 for k1 in 1:K1]...)   # (d÷2, n_joint)
+    result_joint = (; z_q1=Float32.(Z1_rep), z_q2=Float32.(Z2_rep))
+    out_joint, _ = decode_from_latents(model, ps_cpu, st_cpu, result_joint)
+    joint_waves = Array(out_joint.xhat)   # (nt, K1*K2)
 
-        return (;
-            joint=joint_waves,
-            stage1=stage1_waves,
-            stage2=stage2_waves,
-            joint_labels=["($k1,$k2)" for k2 in 1:K2 for k1 in 1:K1],
-            stage1_labels=["s1=$k" for k in 1:K1],
-            stage2_labels=["s2=$k" for k in 1:K2],
-        )
-    end
+    return (;
+        joint=joint_waves,
+        stage1=stage1_waves,
+        stage2=stage2_waves,
+        joint_labels=["($k1,$k2)" for k2 in 1:K2 for k1 in 1:K1],
+        stage1_labels=["s1=$k" for k in 1:K1],
+        stage2_labels=["s2=$k" for k in 1:K2],
+    )
 end
 
 # ╔═╡ a6066ca6-1350-4c54-9857-99d195873e6c
@@ -1941,6 +2054,10 @@ function save_vqvae_run(run_dir; model, ps, st, para, training_para, loss_histor
         marginal_stage2_c=isnothing(marginals_c) ? Float32[;;] : Float32.(marginals_c.stage2_waves),
         marginal_stage1_labels=isnothing(marginals_ac) ? String[] : marginals_ac.stage1_labels,
         marginal_stage2_labels=isnothing(marginals_ac) ? String[] : marginals_ac.stage2_labels,
+        marginal_stage1_counts_ac=isnothing(marginals_ac) ? Int[] : Int.(round.(vec(sum(reshape(Int.(averages.counts_ac), model.K[1], model.K[2]); dims=2)))),
+        marginal_stage2_counts_ac=isnothing(marginals_ac) ? Int[] : Int.(round.(vec(sum(reshape(Int.(averages.counts_ac), model.K[1], model.K[2]); dims=1)))),
+        marginal_stage1_counts_c=isnothing(marginals_c) ? Int[] : Int.(round.(vec(sum(reshape(Int.(averages.counts_c), model.K[1], model.K[2]); dims=2)))),
+        marginal_stage2_counts_c=isnothing(marginals_c) ? Int[] : Int.(round.(vec(sum(reshape(Int.(averages.counts_c), model.K[1], model.K[2]); dims=1)))),
         global_avg_ac=Float32.(global_avg_ac),
         global_avg_c=Float32.(global_avg_c),
         window_headers=window_headers,
@@ -1980,7 +2097,7 @@ function save_vqvae_run(run_dir; model, ps, st, para, training_para, loss_histor
         longitudes=data_bundle.longitudes,
         loss_history=loss_history)
     jldsave(joinpath(run_dir, "loss_history.jld2"); loss_history)
-    @info "Saved v8 source-state analysis artifact" run_dir
+    @info "Saved v10 source-state analysis artifact" run_dir
     return run_dir
 end
 
@@ -1996,10 +2113,10 @@ function train_selected_pairs(pairs_data, compiled_model;
     for pair_entry in pairs_data
         for (run_index, seed) in enumerate(seeds)
             pair = pair_entry.pair
-            @info "Training v8 pair run" pair run_index seed
+            @info "Training v10 pair run" pair run_index seed
             reset_start = time()
             ps, st = reset_vqvae(compiled_model.model; seed, device=xdev)
-            training_para.verbose && @info "Reset v8 model parameters" pair run_index seed reset_time_s=round(time() - reset_start; digits=3)
+            training_para.verbose && @info "Reset v10 model parameters" pair run_index seed reset_time_s=round(time() - reset_start; digits=3)
             loss_history = fresh_loss_history()
             train_start = time()
             n_pair = size(pair_entry.data.D_train, 2)
@@ -2015,7 +2132,7 @@ function train_selected_pairs(pairs_data, compiled_model;
                 n_compiled=compiled_model.n_train,
                 compile_missing=false,
             )
-            @info "Finished v8 pair run" pair run_index seed time_s=round(time() - train_start; digits=3)
+            @info "Finished v10 pair run" pair run_index seed time_s=round(time() - train_start; digits=3)
             run_dir = run_dir_for_seed(save_root, pair, seed)
             save_vqvae_run(run_dir; model=compiled_model.model, ps, st,
                 para=compiled_model.para, training_para, loss_history, pair,
@@ -2029,10 +2146,135 @@ function train_selected_pairs(pairs_data, compiled_model;
     return results
 end
 
+# ╔═╡ f5000002-0000-0000-0000-000000000001
+function train_selected_pairs_lazy(selected_pairs, compiled_model;
+    seeds, training_para::VQVAE_Training_Para, save_root::String,
+    filepath::String, dt::Real=1.0, period_min::Real=10, period_max::Real=50,
+    n_max::Union{Nothing,Integer}=nothing,
+    bp_filter, per_waveform_whitening_kernel_length::Int,
+    device=nothing, analysis_settings=(;))
+    isempty(selected_pairs) && return Any[]
+    isempty(seeds) && error("Provide at least one seed.")
+    xdev = isnothing(device) ? default_xdev(; force=true) : device
+    cdev = default_cdev()
+    rng = Xoshiro(1234)
+    results = Any[]
+    for pair_raw in selected_pairs
+        pair = (String(pair_raw[1]), String(pair_raw[2]))
+        @info "Loading pair" pair
+        bundle = build_training_bundle(pair; filepath, dt, period_min, period_max)
+        bundle = trim_training_bundle(bundle; n_max, rng)
+        data = make_pooled_split(bundle.D1fac, bundle.D1fc; rng)
+        pd_raw = (; pair, data, data_bundle=bundle)
+        @info "Whitening pair" pair
+        pd = whiten_pair_entry(pd_raw; bp_filter, per_waveform_whitening_kernel_length)
+        for (run_index, seed) in enumerate(seeds)
+            @info "Training pair" pair run_index seed
+            reset_start = time()
+            ps, st = reset_vqvae(compiled_model.model; seed, device=xdev)
+            loss_history = fresh_loss_history()
+            n_pair = size(pd.data.D_train, 2)
+            n_ignored = max(0, n_pair - compiled_model.n_train)
+            n_ignored > 0 && @info "Excess waveforms ignored" pair n_pair n_compiled=compiled_model.n_train ignored=n_ignored
+            ps, st, loss_history = update(
+                compiled_model.model, ps, st, loss_history,
+                pd.data.D_train, pd.data.D_test,
+                compiled_model.para, training_para;
+                device=xdev, cdev,
+                compiled=compiled_model.compiled,
+                train_step_cache=compiled_model.train_step_cache,
+                n_compiled=compiled_model.n_train,
+                compile_missing=false,
+            )
+            @info "Finished pair run" pair run_index seed time_s=round(time() - reset_start; digits=3)
+            run_dir = run_dir_for_seed(save_root, pair, seed)
+            save_vqvae_run(run_dir; model=compiled_model.model, ps, st,
+                para=compiled_model.para, training_para, loss_history, pair,
+                data_bundle=pd.data_bundle, analysis_settings)
+            push!(results, (; pair, run_index, seed, run_dir,
+                model=compiled_model.model, ps, st, para=compiled_model.para,
+                training_para, loss_history, data=pd.data,
+                data_bundle=pd.data_bundle))
+        end
+        # discard raw and whitened data for this pair before loading the next
+        pd = nothing
+        pd_raw = nothing
+        GC.gc()
+    end
+    return results
+end
+
+# ╔═╡ a1b2c3d5-0000-0000-0000-000000000001
+function make_encoder_head(para, latent_len::Int, enc_channels::Int)
+    conv = Conv((3,), enc_channels => enc_channels, activation; pad=SamePad())
+    dense = Dense(latent_len * enc_channels, para.d ÷ 2)
+    return @compact(; conv, dense, latent_len, enc_channels) do feat
+        # feat: (L, C, B)
+        y = conv(feat)                                              # (L, C, B)
+        B = size(feat, 3)
+        y_flat = reshape(permutedims(y, (2, 1, 3)), enc_channels * latent_len, B)
+        @return dense(y_flat)                                       # (d÷2, B)
+    end
+end
+
+# ╔═╡ 10000010-0000-0000-0000-000000000001
+function get_vqvae(para; rng=Random.default_rng(), device=identity)
+    length(para.K) == 2 || error("v10 requires exactly 2 codebook stages (length(K) must be 2). Got K=$(para.K).")
+    all(>(1), para.K) || error("All K entries must be > 1.")
+    iseven(para.d) || error("d must be even for v10 (required for split heads). Got d=$(para.d).")
+    Random.seed!(rng, para.seed)
+
+    encoder = make_encoder(para)
+    ps_enc, st_enc = Lux.setup(rng, encoder)
+    dummy = randn(rng, Float32, para.nt, 2)
+    enc_dummy, _ = encoder(waveform_to_conv3(dummy), ps_enc, Lux.testmode(st_enc))
+    latent_len, enc_channels, _ = size(enc_dummy)
+
+    head1 = make_encoder_head(para, latent_len, enc_channels)
+    head2 = make_encoder_head(para, latent_len, enc_channels)
+    decoder1 = make_decoder(para, latent_len; latent_dim=para.d ÷ 2)
+    decoder2 = make_decoder(para, latent_len; latent_dim=para.d ÷ 2)
+    ps_dec1, st_dec1 = Lux.setup(rng, decoder1)
+    dec_dummy, _ = decoder1(randn(rng, Float32, para.d ÷ 2, 2), ps_dec1, Lux.testmode(st_dec1))
+    size(dec_dummy, 1) == para.nt ||
+        error("Decoder geometry mismatch: output length $(size(dec_dummy, 1)) != nt $(para.nt). Adjust decoder strides/kernels.")
+    model = VQVAE(encoder, head1, head2, decoder1, decoder2, Tuple(Int.(para.K)),
+        para.d, latent_len,
+        para.beta_commit, para.ema_decay,
+        para.epsilon, para.dead_threshold)
+    ps, st = Lux.setup(rng, model)
+    ps, st = (ps, st) |> device
+
+    loss_history = fresh_loss_history()
+    @info "VQ-VAE v10 geometry" nt=para.nt d=para.d half=para.d÷2 latent_len K=para.K enc_channels
+    return model, ps, st, loss_history
+end
+
+# ╔═╡ a74f1dab-d658-4f37-9d26-4ddd9097d15e
+function compile_model(nt::Int, n_train::Int; vqvae_parameters::NamedTuple,
+    training_para::VQVAE_Training_Para, seed::Int=1234, device=nothing)
+    ensure_reactant_xla_flags!()
+    xdev = isnothing(device) ? default_xdev(; force=true) : device
+    cdev = default_cdev()
+    rng = Xoshiro(seed)
+    para = VQVAE_Para(; merge(vqvae_parameters, (; nt, seed))...)
+    model, ps, st, _ = get_vqvae(para; rng, device=xdev)
+    # latent-index encoder compiled at n_train (minimum across all pairs)
+    # batch encoder compiled at batchsize — these are separate XLA graphs
+    dummy_full_cpu = randn(rng, Float32, nt, n_train)
+    dummy_batch_cpu = dummy_full_cpu[:, 1:training_para.batchsize]
+    compiled = compile_vqvae_helpers(model, ps, st, dummy_full_cpu, training_para;
+        device=xdev, sample_batch_x=xdev(dummy_batch_cpu))
+    train_step_cache = compile_train_step(model, xdev(ps), xdev(st),
+        dummy_batch_cpu, para, training_para; device=xdev, cdev)
+    @info "compile_model complete" nt n_train batchsize=training_para.batchsize
+    return (; model, para, compiled, train_step_cache, compile_seed=seed, n_train)
+end
+
 # ╔═╡ a848319e-7bda-4844-a916-2bbdef1d5417
 function train_one_pair(pair::Tuple{<:AbstractString,<:AbstractString}; filepath::String,
     vqvae_parameters::NamedTuple, training_para::VQVAE_Training_Para,
-    save_root::String=joinpath(filepath, "SavedModels", "vqvae_v8"),
+    save_root::String=joinpath(filepath, "SavedModels", "vqvae_v10"),
     seed::Int=1234, dt::Real=1.0, period_min::Real=10, period_max::Real=50,
     device=nothing, n_max::Union{Nothing,Integer}=nothing)
     pairs_data = load_pairs_data([pair]; filepath, seed, dt, period_min, period_max, n_max=n_max)
@@ -2046,21 +2288,24 @@ end
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
 [deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 ConcreteStructs = "2569d6c7-a4a2-43d3-a901-331e8e4be471"
 DSP = "717857b8-e6f2-59f4-9121-6e50c889abd2"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
-FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+Distances = "b4f34e82-e78d-54a5-968a-f98e89d6e8f7"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
+FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
 InlineStrings = "842dd82b-1e85-43dc-bf29-5d0ee9dffc48"
 JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
+LuxCUDA = "d0bbae9a-e099-4d5b-a835-1c6931763bda"
 MLUtils = "f1d291b0-491e-4a28-83b9-f70985020b54"
 NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
 Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
-ProgressLogging = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
 PlutoPlotly = "8e989ff0-3d88-8e9f-f020-2b208a939ff0"
+ProgressLogging = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
@@ -2068,19 +2313,22 @@ StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 
 [compat]
+CUDA = "~5.11.1"
 ConcreteStructs = "~0.2.3"
 DSP = "~0.8.4"
-FFTW = "~1.10"
+Distances = "~0.10.12"
 Enzyme = "~0.13.138"
 EnzymeCore = "~0.8.19"
+FFTW = "~1.10"
 InlineStrings = "~1.4.5"
 JLD2 = "~0.6.4"
 Lux = "~1.31.4"
+LuxCUDA = "~0.3.6"
 MLUtils = "~0.4.8"
 NNlib = "~0.9.34"
 Optimisers = "~0.4.7"
-ProgressLogging = "~0.1.6"
 PlutoPlotly = "~0.6.5"
+ProgressLogging = "~0.1.6"
 Reactant = "~0.2.254"
 StatsBase = "~0.34.10"
 Zygote = "~0.7.10"
@@ -2092,7 +2340,7 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.12.4"
 manifest_format = "2.0"
-project_hash = "74a02a238cbd7860fd6b2f4f16967c245fce5b3a"
+project_hash = "52467699db3581cb93278aeecea6e6cf8705d95c"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "f7304359109c768cf32dc5fa2d371565bb63b68a"
@@ -2292,6 +2540,54 @@ deps = ["CpuId", "IfElse", "PrecompileTools", "Preferences", "Static"]
 git-tree-sha1 = "f3a21d7fc84ba618a779d1ed2fcca2e682865bab"
 uuid = "2a0fbf3d-bb9c-48f3-b0a9-814d99fd7ab9"
 version = "0.2.7"
+
+[[deps.CUDA]]
+deps = ["AbstractFFTs", "Adapt", "BFloat16s", "CEnum", "CUDA_Compiler_jll", "CUDA_Driver_jll", "CUDA_Runtime_Discovery", "CUDA_Runtime_jll", "Crayons", "ExprTools", "GPUArrays", "GPUCompiler", "GPUToolbox", "KernelAbstractions", "LLVM", "LLVMLoopInfo", "LazyArtifacts", "Libdl", "LinearAlgebra", "Logging", "NVTX", "Preferences", "PrettyTables", "Printf", "Random", "Random123", "RandomNumbers", "Reexport", "SparseArrays", "StaticArrays", "Statistics", "demumble_jll"]
+git-tree-sha1 = "b267c611dcbbcb70d42e398192ee0af160358075"
+uuid = "052768ef-5323-5732-b1bb-66c8b64840ba"
+version = "5.11.1"
+
+    [deps.CUDA.extensions]
+    ChainRulesCoreExt = "ChainRulesCore"
+    EnzymeCoreExt = "EnzymeCore"
+    SparseMatricesCSRExt = "SparseMatricesCSR"
+    SpecialFunctionsExt = "SpecialFunctions"
+
+    [deps.CUDA.weakdeps]
+    ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+    EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
+    SparseMatricesCSR = "a0a7dd2c-ebf4-11e9-1f05-cf50bc540ca1"
+    SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
+
+[[deps.CUDA_Compiler_jll]]
+deps = ["Artifacts", "CUDA_Driver_jll", "CUDA_Runtime_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
+git-tree-sha1 = "b977706846cb0a75d3842a1fed810ab2e6ab2f94"
+uuid = "d1e2174e-dfdc-576e-b43e-73b79eb1aca8"
+version = "0.4.3+0"
+
+[[deps.CUDA_Driver_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "TOML"]
+git-tree-sha1 = "3b759ec65ac87ad192c2925114fa5c126657a5bd"
+uuid = "4ee394cb-3365-5eb0-8335-949819d2adfc"
+version = "13.2.1+0"
+
+[[deps.CUDA_Runtime_Discovery]]
+deps = ["Libdl"]
+git-tree-sha1 = "f9a521f52d236fe49f1028d69e549e7f2644bb72"
+uuid = "1af6417a-86b4-443c-805f-a4643ffb695f"
+version = "1.0.0"
+
+[[deps.CUDA_Runtime_jll]]
+deps = ["Artifacts", "CUDA_Driver_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
+git-tree-sha1 = "c0314d9fb0ebd00e404feba4c3fbc04c9975abc1"
+uuid = "76a88914-d11a-5bdc-97e0-2f5a05c973a2"
+version = "0.21.0+1"
+
+[[deps.CUDNN_jll]]
+deps = ["Artifacts", "CUDA_Runtime_jll", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
+git-tree-sha1 = "70dea6a7133d2100a143b515a00d6d887e208500"
+uuid = "62b44479-cb7b-5706-934f-f13b2eb2e645"
+version = "9.20.0+0"
 
 [[deps.ChainRules]]
 deps = ["Adapt", "ChainRulesCore", "Compat", "Distributed", "GPUArraysCore", "IrrationalConstants", "LinearAlgebra", "Random", "RealDot", "SparseArrays", "SparseInverseSubset", "Statistics", "StructArrays", "SuiteSparse"]
@@ -2509,6 +2805,17 @@ weakdeps = ["ChainRulesCore", "EnzymeCore"]
     DispatchDoctorChainRulesCoreExt = "ChainRulesCore"
     DispatchDoctorEnzymeCoreExt = "EnzymeCore"
 
+[[deps.Distances]]
+deps = ["LinearAlgebra", "Statistics", "StatsAPI"]
+git-tree-sha1 = "c7e3a542b999843086e2f29dac96a618c105be1d"
+uuid = "b4f34e82-e78d-54a5-968a-f98e89d6e8f7"
+version = "0.10.12"
+weakdeps = ["ChainRulesCore", "SparseArrays"]
+
+    [deps.Distances.extensions]
+    DistancesChainRulesCoreExt = "ChainRulesCore"
+    DistancesSparseArraysExt = "SparseArrays"
+
 [[deps.Distributed]]
 deps = ["Random", "Serialization", "Sockets"]
 uuid = "8ba89e20-285c-5b6f-9357-94700520ee1b"
@@ -2664,6 +2971,16 @@ deps = ["Random"]
 uuid = "9fa8497b-333b-5362-9e8d-4d0656e87820"
 version = "1.11.0"
 
+[[deps.GPUArrays]]
+deps = ["Adapt", "GPUArraysCore", "KernelAbstractions", "LLVM", "LinearAlgebra", "Printf", "Random", "Reexport", "ScopedValues", "Serialization", "SparseArrays", "Statistics"]
+git-tree-sha1 = "34fd745547978beb471f029f447290ef4dbc7bbd"
+uuid = "0c68f7d7-f131-5f86-a1c3-88cf8149b2d7"
+version = "11.5.3"
+weakdeps = ["JLD2"]
+
+    [deps.GPUArrays.extensions]
+    JLD2Ext = "JLD2"
+
 [[deps.GPUArraysCore]]
 deps = ["Adapt"]
 git-tree-sha1 = "83cf05ab16a73219e5f6bd1bdfa9848fa24ac627"
@@ -2675,6 +2992,12 @@ deps = ["ExprTools", "InteractiveUtils", "LLVM", "Libdl", "Logging", "Precompile
 git-tree-sha1 = "fedfe5e7db7035271c3f58359007f971da1dde87"
 uuid = "61eb1bfa-7361-4325-ad38-22787b887f55"
 version = "1.9.1"
+
+[[deps.GPUToolbox]]
+deps = ["LLVM"]
+git-tree-sha1 = "a589b6c1a0eff953571f5d8b0474f5020831114d"
+uuid = "096a3bc2-3ced-46d0-87f4-dd12716f4bfc"
+version = "1.1.1"
 
 [[deps.HTTP]]
 deps = ["Base64", "CodecZlib", "ConcurrentUtilities", "Dates", "ExceptionUnwrapping", "Logging", "LoggingExtras", "MbedTLS", "NetworkOptions", "OpenSSL", "PrecompileTools", "Random", "SimpleBufferStream", "Sockets", "URIs", "UUIDs"]
@@ -2786,6 +3109,12 @@ version = "1.5.0"
     [deps.JSON.weakdeps]
     ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
 
+[[deps.JuliaNVTXCallbacks_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
+git-tree-sha1 = "af433a10f3942e882d3c671aacb203e006a5808f"
+uuid = "9c1d0b0a-7046-5b2e-a33f-ea22f176ac7e"
+version = "0.2.1+0"
+
 [[deps.JuliaSyntaxHighlighting]]
 deps = ["StyledStrings"]
 uuid = "ac6e5ff7-fb65-4e79-a425-ec3bc9c03011"
@@ -2824,6 +3153,11 @@ deps = ["Artifacts", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
 git-tree-sha1 = "f1d1adfff151fd02b4062d1af82df02052dc4a0c"
 uuid = "dad2f222-ce93-54a1-a47d-0025e8a3acab"
 version = "0.0.42+0"
+
+[[deps.LLVMLoopInfo]]
+git-tree-sha1 = "2e5c102cfc41f48ae4740c7eca7743cc7e7b75ea"
+uuid = "8b046642-f1f6-4319-8d3c-209ddc03c586"
+version = "1.0.0"
 
 [[deps.LLVMOpenMP_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
@@ -2946,6 +3280,12 @@ version = "1.31.4"
     SimpleChains = "de6bee2f-e2f4-4ec7-b6ed-219cc6f6e9e5"
     Tracker = "9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c"
     Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
+
+[[deps.LuxCUDA]]
+deps = ["CUDA", "Reexport", "cuDNN"]
+git-tree-sha1 = "8f4b360da604b166d34220ee94ab83244da11e6d"
+uuid = "d0bbae9a-e099-4d5b-a835-1c6931763bda"
+version = "0.3.6"
 
 [[deps.LuxCore]]
 deps = ["DispatchDoctor", "Random", "SciMLPublic"]
@@ -3159,6 +3499,22 @@ version = "0.9.34"
     SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
     cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
+[[deps.NVTX]]
+deps = ["JuliaNVTXCallbacks_jll", "Libdl", "NVTX_jll"]
+git-tree-sha1 = "a9083c3e469e63cca454d1fc3b19472d9d92c14a"
+uuid = "5da4648a-3479-48b8-97b9-01cb529c0a1f"
+version = "1.0.3"
+weakdeps = ["Colors"]
+
+    [deps.NVTX.extensions]
+    NVTXColorsExt = "Colors"
+
+[[deps.NVTX_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "af2232f69447494514c25742ba1503ec7e9877fe"
+uuid = "e98f9f5b-d649-5603-91fd-7774390e6439"
+version = "3.2.2+0"
+
 [[deps.NaNMath]]
 deps = ["OpenLibm_jll"]
 git-tree-sha1 = "9b8215b1ee9e78a293f99797cd31375471b2bcae"
@@ -3332,6 +3688,12 @@ deps = ["Unicode"]
 uuid = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 version = "1.11.0"
 
+[[deps.ProgressLogging]]
+deps = ["Logging", "SHA", "UUIDs"]
+git-tree-sha1 = "f0803bc1171e455a04124affa9c21bba5ac4db32"
+uuid = "33c8b6b6-d38a-422a-b730-caa89a2f386c"
+version = "0.1.6"
+
 [[deps.ProtoBuf]]
 deps = ["BufferedStreams", "EnumX", "TOML"]
 git-tree-sha1 = "da18083a52d9d57bbe6dadaacad39731e5f7be39"
@@ -3352,6 +3714,18 @@ version = "1.11.0"
 deps = ["SHA"]
 uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 version = "1.11.0"
+
+[[deps.Random123]]
+deps = ["Random", "RandomNumbers"]
+git-tree-sha1 = "dbe5fd0b334694e905cb9fda73cd8554333c46e2"
+uuid = "74087812-796a-5b5d-8853-05524746bad3"
+version = "1.7.1"
+
+[[deps.RandomNumbers]]
+deps = ["Random"]
+git-tree-sha1 = "c6ec94d2aaba1ab2ff983052cf6a606ca5985902"
+uuid = "e6cf234a-135c-5ec9-84dd-332b85af5143"
+version = "1.6.0"
 
 [[deps.Reactant]]
 deps = ["Adapt", "BFloat16s", "CEnum", "Crayons", "Downloads", "EnumX", "Enzyme", "EnzymeCore", "FileWatching", "Functors", "GPUArraysCore", "GPUCompiler", "HTTP", "JSON", "LLVM", "LLVMOpenMP_jll", "Libdl", "LinearAlgebra", "OrderedCollections", "PrecompileTools", "Preferences", "PrettyTables", "ProtoBuf", "Random", "ReactantCore", "Reactant_jll", "ScopedValues", "Scratch", "Serialization", "Setfield", "Sockets", "StableRNGs", "StructUtils", "StyledStrings", "UUIDs", "p7zip_jll"]
@@ -3792,6 +4166,18 @@ git-tree-sha1 = "434b3de333c75fc446aa0d19fc394edafd07ab08"
 uuid = "700de1a5-db45-46bc-99cf-38207098b444"
 version = "0.2.7"
 
+[[deps.cuDNN]]
+deps = ["CEnum", "CUDA", "CUDA_Runtime_Discovery", "CUDNN_jll"]
+git-tree-sha1 = "5494b0ae3ddc5ca0f64159d5ed3a396f36e0fcfe"
+uuid = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
+version = "1.4.7"
+
+[[deps.demumble_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "6498e3581023f8e530f34760d18f75a69e3a4ea8"
+uuid = "1e29f10c-031c-5a83-9565-69cddfc27673"
+version = "1.3.0+0"
+
 [[deps.libblastrampoline_jll]]
 deps = ["Artifacts", "Libdl"]
 uuid = "8e850b90-86db-534c-a0d3-1478176c7d93"
@@ -3817,6 +4203,8 @@ version = "17.7.0+0"
 # ╔═╡ Cell order:
 # ╠═10000001-0000-0000-0000-000000000001
 # ╠═330652f1-0754-48a4-9a0f-4fb9d6824222
+# ╠═30f19c4c-fbdc-46c0-9163-45192675858f
+# ╠═dd763937-85f6-4de0-b6c8-699eb0de7ab1
 # ╟─10000002-0000-0000-0000-000000000001
 # ╠═10000003-0000-0000-0000-000000000001
 # ╠═10000004-0000-0000-0000-000000000001
@@ -3838,6 +4226,8 @@ version = "17.7.0+0"
 # ╠═5e71db90-a0d1-47a4-bb32-dba21163e029
 # ╠═0652338c-5ab5-463d-8a4f-1f2314a01ba8
 # ╠═66ddf04d-ee60-4a0b-9444-d09af23685ea
+# ╠═10000010-0000-0000-0000-000000000002
+# ╠═10000010-0000-0000-0000-000000000003
 # ╠═1000000e-0000-0000-0000-000000000001
 # ╠═1000000f-0000-0000-0000-000000000001
 # ╠═10000010-0000-0000-0000-000000000001
@@ -3875,6 +4265,8 @@ version = "17.7.0+0"
 # ╠═a74f1dab-d658-4f37-9d26-4ddd9097d15e
 # ╠═a4957762-faf0-40d2-a71e-1d65fe873065
 # ╠═4eac1994-2dae-428c-a70d-5d5de672e4bf
+# ╠═f5000001-0000-0000-0000-000000000001
+# ╠═f5000002-0000-0000-0000-000000000001
 # ╠═a848319e-7bda-4844-a916-2bbdef1d5417
 # ╠═10000017-0000-0000-0000-000000000001
 # ╠═2f151b20-b956-404d-8fee-1e9cddfd6b62
@@ -3903,5 +4295,6 @@ version = "17.7.0+0"
 # ╠═5492fa27-20fc-4526-aaab-9bee3f866c52
 # ╠═6322b22f-ce89-475f-9073-fdca44f212b2
 # ╠═a1b2c3d4-0000-0000-0000-000000000002
+# ╠═a1b2c3d5-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002

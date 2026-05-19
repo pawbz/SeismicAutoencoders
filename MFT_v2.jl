@@ -323,7 +323,7 @@ Peaks are returned as `(time, amplitude)` tuples sorted by descending amplitude.
 If no strict local maxima are found, the absolute maximum in the window is returned.
 Returns an empty vector when the window is empty.
 """
-function find_group_arrivals(envelope::Vector{Float64}, time::Vector{Float64},
+function find_group_arrivals(envelope::AbstractVector{Float64}, time::AbstractVector{Float64},
                              search_window::Tuple{Float64,Float64};
                              max_peaks::Int=4)
     t_start, t_end = search_window
@@ -503,13 +503,6 @@ function perform_mft_analysis(trace::SeismicTrace, periods::Vector{Float64};
                      amplitudes, filtered_traces, envelopes, arrival_times,
                      trace.distance, quality_factors, all_peaks, time)
 end
-
-# ╔═╡ 2de6446f-d07c-4151-8e13-0719c3056826
-res = perform_mft_analysis(Xsynthetic, (period_min, period_max), n_periods;
-    bandwidth_factor = bandwidth_percent / 100.0,
-    zero_pad_factor = zero_pad_factor,
-	phvel_correction = phvel_mode == "noise_cc" ? π/4 : 0.0,
-	compute_phase    = phvel_mode != "none")
 
 # ╔═╡ 74f5430a-8d8a-41cf-b683-52cc29bb12c0
 """
@@ -696,9 +689,6 @@ function plot_envelopes(res::MFTResult;
     
     return PlutoPlotly.plot(traces, layout)
 end
-
-# ╔═╡ 09d3b269-c8bd-425a-ad4a-1ecd29150507
-plot_envelopes(res, title="Envelopes")
 
 # ╔═╡ df761225-7a00-4a7c-b56f-611243a75e97
 function plot_dispersion_curve(results::AbstractVector{MFTResult};
@@ -936,9 +926,6 @@ function plot_dispersion_curve(res::MFTResult;
 
     return PlutoPlotly.plot(traces, layout)
 end
-
-# ╔═╡ 1585e739-23c2-4a23-8e80-6f132d503765
-plot_dispersion_curve([res, res], title=string("Group Velocity"))
 
 # ╔═╡ 3bab4eab-92da-4539-b3df-d5c637d1ce77
 # Plot all individual CCs with the stack overlaid
@@ -1201,203 +1188,6 @@ log_period_bands = begin
     exp10.(range(log10(Tmin), log10(Tmax), length=prefilter_nbands))
 end
 
-# ╔═╡ 7b8ea90d-a09d-4952-bd66-943808dc9d3b
-res_synthetic_test = let
-	# plot(synthetic_data)
-			
-	       
-
-	        # Apply multi-band pre-filter if enabled
-	        filtered_components = nothing
-	        D = if apply_prefilter_flag
-
-	            filtered_components = multiple_narrow_band_filters(synthetic_test_data.data, synthetic_test_data.dt, log_period_bands, prefilter_bw)
-	            @info "Applied multi-band pre-filter: T=$(log_period_bands) s, BW=$(prefilter_bw)%"
-				mean(filtered_components)
-			else
-				synthetic_test_data.data
-	        end
-
-	 # Create seismic trace
-	        trace = SeismicTrace(
-	            data=D,
-	            dt=synthetic_test_data.dt,
-	            distance=synthetic_test_data.distance
-	        )
-
-	
-	        # Perform MFT analysis
-	        periods_analysis = synthetic_test_data.periods
-	        (; res=perform_mft_analysis(
-	            trace,
-	            periods_analysis,
-	            velocity_range = (2.0 - 0.5, 5.0 + 0.5),
-                bandwidth_factor = synth_bandwidth / 100.0,
-                zero_pad_factor = synth_zero_pad_factor,
-	            compute_phase  = true
-	        ), filtered_trace=trace, filtered_components=filtered_components)
-end
-
-# ╔═╡ c169578d-3dd2-42f8-8e57-4146a8dca2cd
-plot_dispersion_curve(res_synthetic_test.res)
-
-# ╔═╡ 2ba1a355-d9fa-4268-b046-0b201191c11e
-plot_envelopes(res_synthetic_test.res)
-
-# ╔═╡ 44fad356-ff66-4bbc-a83b-5d8d996d95a5
-plot(res_synthetic_test.filtered_trace.data)
-
-# ╔═╡ 8dc0f4bc-00cb-11f1-9443-a59380edd23b
-let
-	# Show original vs pre-filtered data with individual components
-    if apply_prefilter_flag
-        trace_original = SeismicTrace(
-            data=synthetic_test_data.data,
-            dt=synthetic_test_data.dt,
-            distance=synthetic_test_data.distance
-        )
-        
-        central_periods = log_period_bands
-        
-        # Get filtered components and sum
-        filtered_trace = res_synthetic_test.filtered_trace
-        filtered_components = res_synthetic_test.filtered_components
-        
-        # Plot comparison
-        traces = [scatter()]
-        
-        # Original signal
-        push!(traces, scatter(
-            x = synthetic_test_data.t,
-            y = synthetic_test_data.data ./ maximum(abs.(synthetic_test_data.data)),
-            mode = "lines",
-            name = "Original",
-            line = attr(color = "lightgray", width = 1),
-            opacity = 0.3
-        ))
-        
-        # Individual filtered components
-        if !isnothing(filtered_components)
-            colors = ["blue", "green", "orange"]
-            for (i, (T, filt, color)) in enumerate(zip(central_periods, filtered_components, colors))
-                # Normalize for display
-                filt_norm = filt ./ maximum(abs.(filt)) .* 0.5
-                push!(traces, scatter(
-                    x = synthetic_test_data.t,
-                    y = filt_norm,
-                    mode = "lines",
-                    name = "T=$(T)s band",
-                    line = attr(color = color, width = 1.5, dash = "dot"),
-                    opacity = 0.6
-                ))
-            end
-        end
-        
-        # Summed filtered signal
-        push!(traces, scatter(
-            x = synthetic_test_data.t,
-            y = filtered_trace.data ./ maximum(abs.(filtered_trace.data)),
-            mode = "lines",
-            name = "Sum of 3 bands",
-            line = attr(color = "red", width = 2.5)
-        ))
-        
-        layout = Layout(
-            title = "Multi-band Pre-filtering: Individual Components + Sum",
-            xaxis = attr(title = "Time (s)"),
-            yaxis = attr(title = "Amplitude"),
-            width = 900,
-            height = 500,
-            plot_bgcolor = "white",
-            legend = attr(x = 0.02, y = 0.98)
-        )
-        
-        PlutoPlotly.plot(traces, layout)
-    else
-        md"**Pre-filter disabled.** Check the box above to enable."
-    end
-end
-
-# ╔═╡ 8dc0fc46-00cb-11f1-9407-453086ae541f
-let
-	if apply_prefilter_flag
-        # Compute FFT of original and filtered data
-        original_fft = fft(synthetic_test_data.data)
-        filtered_fft = fft(res_synthetic_test.filtered_trace.data)
-        
-        # Frequency vector
-        n = length(synthetic_test_data.data)
-        freqs = fftfreq(n, 1.0/synthetic_test_data.dt)
-        
-        # Only positive frequencies
-        pos_idx = freqs .> 0
-        freqs_pos = freqs[pos_idx]
-        
-        # Amplitude spectrum
-        amp_original = abs.(original_fft[pos_idx])
-        amp_filtered = abs.(filtered_fft[pos_idx])
-        
-        # Normalize
-        amp_original ./= maximum(amp_original)
-        amp_filtered ./= maximum(amp_filtered)
-        
-        traces_spec = [scatter()]
-        
-        push!(traces_spec, scatter(
-            x = freqs_pos,
-            y = amp_original,
-            mode = "lines",
-            name = "Original Spectrum",
-            line = attr(color = "gray", width = 2),
-            opacity = 0.5
-        ))
-        
-        push!(traces_spec, scatter(
-            x = freqs_pos,
-            y = amp_filtered,
-            mode = "lines",
-            name = "Filtered Spectrum (sum)",
-            line = attr(color = "red", width = 2.5)
-        ))
-        
-        # Mark center frequencies for all three periods
-        central_periods = log_period_bands
-        colors = ["blue", "green", "orange"]
-        for (T, color) in zip(central_periods, colors)
-            fc = 1.0 / T
-            push!(traces_spec, scatter(
-                x = [fc, fc],
-                y = [1e-4, 1],
-                mode = "lines",
-                name = "fc=$(round(fc, digits=3)) Hz (T=$(T)s)",
-                line = attr(color = color, width = 2, dash = "dash")
-            ))
-        end
-        
-        layout_spec = Layout(
-            title = "Frequency Domain: 3-Band Pre-filtering",
-            xaxis = attr(
-                title = "Frequency (Hz)",
-                range = [-2, log10(0.3)],
-                type = "log"
-            ),
-            yaxis = attr(
-                title = "Normalized Amplitude",
-                type = "log",
-                range = [-4, 0]
-            ),
-            width = 900,
-            height = 500,
-            plot_bgcolor = "white",
-            legend = attr(x = 0.65, y = 0.98, font=attr(size=10))
-        )
-        
-        PlutoPlotly.plot(traces_spec, layout_spec)
-    else
-        md"Enable pre-filter to see spectrum comparison."
-    end
-end
-
 # ╔═╡ 64882ed3-eea4-45a7-bf0f-6d0c1e14d5af
 
 
@@ -1445,54 +1235,6 @@ end
 
 # ╔═╡ 7fd65030-f541-4fd4-aea8-8ab6d9cc6d0e
 @bind run_synth_suite CounterButton("Run synthetic MFT suite")
-
-# ╔═╡ 78a3288f-6b85-4ed1-a399-b4528799f95a
-let
-    run_synth_suite
-
-    distances = [100.0, 250.0, 500.0, 1000.0]
-    noises = [0.0, 5.0, 10.0]
-    freqs = collect(0.02:0.01:0.30)
-    periods = inv.(freqs)
-
-    rows = String[]
-    push!(rows, "Synthetic MFT benchmark (group + phase errors)")
-    push!(rows, "dist[km] noise[%] g_mean[%] g_max[%] p_mean[%] p_max[%] n_g n_p")
-
-    for dist in distances
-        for noise in noises
-            dt = inv(2.0 * maximum(freqs))
-            t = collect(0:dt:300)
-
-            u, cg, cp, tg = multi_frequency_cosine_sum(
-                t, dist;
-                freqs=freqs,
-                c0=3.5,
-                α=1.0
-            )
-            data = u ./ maximum(abs, u) .+ noise / 100.0 * randn(length(u))
-            trace = SeismicTrace(data=data, dt=dt, distance=dist)
-
-            res_case = perform_mft_analysis(
-                trace,
-                periods;
-                velocity_range=(1.5, 6.5),
-                bandwidth_factor=synth_bandwidth / 100.0,
-                zero_pad_factor=synth_zero_pad_factor,
-                compute_phase=true
-            )
-
-            m = compute_velocity_error_metrics(res_case, periods, cg, cp)
-            push!(rows,
-                @sprintf("%7.1f %8.1f %8.2f %8.2f %8.2f %8.2f %4d %4d",
-                         dist, noise, m.group_mean, m.group_max,
-                         m.phase_mean, m.phase_max, m.n_group, m.n_phase)
-            )
-        end
-    end
-
-    print("```\n" * join(rows, "\n") * "\n```")
-end
 
 # ╔═╡ 871ae074-31c8-4b62-8a94-3aa018b1de87
 
@@ -1608,9 +1350,6 @@ function plot_phase_velocities(res::MFTResult;
 
     return PlutoPlotly.plot(traces, layout)
 end
-
-# ╔═╡ 9db0d269-d3ca-48fc-9583-91b5e11822d2
-WideCell(plot_phase_velocities(res_synthetic_test.res))
 
 # ╔═╡ 76f5c114-3cdb-11f1-917c-2b05ca51409f
 """
@@ -1906,43 +1645,6 @@ function zero_lag_correlation(filtered_traces_causal::Matrix{Float64}, filtered_
     end
     
     return correlations
-end
-
-# ╔═╡ 347f9eb0-3cdc-11f1-a7ce-4d4b3258205b
-"""
-    analyze_causal_acausal_branches(trace_causal::SeismicTrace, trace_acausal::SeismicTrace,
-                                   periods::Vector{Float64}; max_modes=4,
-                                   compute_correlation=true, kwargs...) -> BranchAnalysisResult
-
-Single-source-state branch analysis (backward-compatible API).
-"""
-function analyze_causal_acausal_branches(trace_causal::SeismicTrace,
-                                         trace_acausal::SeismicTrace,
-                                         periods::Vector{Float64};
-                                         max_modes::Int=4,
-                                         compute_correlation::Bool=true,
-                                         kwargs...)
-    # Validate input
-    @assert length(trace_causal.data) == length(trace_acausal.data) "Causal and acausal traces must have same length"
-    @assert trace_causal.dt ≈ trace_acausal.dt "Causal and acausal traces must have same sampling interval"
-    
-    # Perform MFT analysis on both branches
-    result_causal = perform_mft_analysis(trace_causal, periods; kwargs...)
-    result_acausal = perform_mft_analysis(trace_acausal, periods; kwargs...)
-    
-    # Extract modes from both branches
-    modes_causal = extract_all_modes(result_causal; distance=trace_causal.distance, max_modes=max_modes)
-    modes_acausal = extract_all_modes(result_acausal; distance=trace_causal.distance, max_modes=max_modes)
-    
-    # Compute branch correlation if requested
-    correlations = fill(NaN, length(periods))
-    if compute_correlation
-        correlations = zero_lag_correlation(result_causal.filtered_traces, result_acausal.filtered_traces)
-    end
-    
-    return BranchAnalysisResult(result_causal, result_acausal, 
-                               modes_causal, modes_acausal,
-                               correlations, periods, trace_causal.distance)
 end
 
 # ╔═╡ 4c915e4e-3cdc-11f1-9235-33f20a13a658
@@ -4258,6 +3960,726 @@ function plot_top_tomography_mixes(mixes, pairs; n::Int=25,
     ))
 end
 
+# ╔═╡ 1f405df8-9fef-436a-a713-1e2cab48b541
+begin
+	"""
+	    MFTFilterBank
+	
+	Pre-computed Gaussian filter bank for efficient repeated MFT analysis.
+	Stores FFTW plans, workspace buffers, and filter coefficients so that
+	`perform_mft_analysis_batch!` requires only one batch FFT + nfreq IFFTs
+	for N waveforms, with no heap allocation after the first call.
+	
+	Construct once per notebook session (parameters fixed by dt, npts, periods).
+	The workspace is resized lazily if called with more columns than N_initial.
+	"""
+	mutable struct MFTFilterBank
+	    # geometry
+	    periods::Vector{Float64}
+	    frequencies::Vector{Float64}
+	    dt::Float64                 # upsampled = dt_original / 10
+	    dt_original::Float64
+	    npts_original::Int          # length after 10× upsample (before pad)
+	    npts_padded::Int            # npts_original * zero_pad_factor
+	    nfreq::Int
+	    velocity_range::Tuple{Float64,Float64}
+	    bandwidth_factor::Float64
+	    zero_pad_factor::Int
+	    time::Vector{Float64}       # (npts_original,) time axis starting at dt
+	
+	    # pre-computed filter weights: one-sided Gaussians, ×2 on positive freqs, neg freqs = 0
+	    H_full::Matrix{ComplexF64}  # (npts_padded × nfreq)
+	
+	    # workspace (sized for N_buf columns; resized lazily via _ensure_batch_size!)
+	    N_buf::Int
+	    W_pad_buf::Matrix{ComplexF64}    # (npts_padded × N_buf) input after upsample+pad
+	    SPEC_buf::Matrix{ComplexF64}     # (npts_padded × N_buf) FFT of W_pad_buf
+	    Z_buf::Matrix{ComplexF64}        # (npts_padded × N_buf) per-freq filtered spectrum
+	    Z_time_buf::Matrix{ComplexF64}   # (npts_padded × N_buf) IFFT result (analytic signal)
+	    envelopes_buf::Array{Float64,3}  # (npts_original × nfreq × N_buf) Hilbert envelopes
+	    filtered_buf::Array{Float64,3}   # (npts_original × nfreq × N_buf) real filtered traces
+	    arrivals_buf::Matrix{Float64}    # (nfreq × N_buf) group arrival times
+	    phases_buf::Matrix{Float64}      # (nfreq × N_buf) wrapped phases at group arrival
+	
+	    # FFTW out-of-place plans: mul!(dst, plan, src) writes into dst without allocating
+	    plan_fwd::Any   # plan_fft(W_pad_buf, 1)  — mul!(SPEC_buf, plan_fwd, W_pad_buf)
+	    plan_inv::Any   # plan_ifft(Z_buf, 1)     — mul!(Z_time_buf, plan_inv, Z_buf)
+	end
+	
+	function MFTFilterBank(dt_original::Float64, npts_raw::Int,
+	                       periods::Vector{Float64};
+	                       bandwidth_factor::Float64=sqrt(2.0/25.0),
+	                       zero_pad_factor::Int=4,
+	                       velocity_range::Tuple{Float64,Float64}=(2.0, 6.0),
+	                       N_initial::Int=256)
+	
+	    dt = dt_original / 10.0
+	    # Derive exact upsampled length using the same matrix code path as perform_mft_analysis_batch!
+	    npts_original = size(DSP.resample(zeros(npts_raw, 1), 10.0; dims=1), 1)
+	    npts_padded   = npts_original * zero_pad_factor
+	    nfreq         = length(periods)
+	    frequencies   = 1.0 ./ periods
+	
+	    # Build H_full: one-sided complex Gaussian filter matrix
+	    freqs_full = fftfreq(npts_padded, 1.0 / dt)
+	    H_full = zeros(ComplexF64, npts_padded, nfreq)
+	    for ifreq in 1:nfreq
+	        f0    = frequencies[ifreq]
+	        sigma = f0 * bandwidth_factor / 2.0
+	        for k in eachindex(freqs_full)
+	            f = freqs_full[k]
+	            if f > 0.0
+	                H_full[k, ifreq] = 2.0 * exp(-0.5 * ((f - f0) / sigma)^2)
+	            elseif f == 0.0
+	                H_full[k, ifreq] = exp(-0.5 * (f0 / sigma)^2)
+	            end
+	            # f < 0: stays zero — one-sided analytic spectrum
+	        end
+	    end
+	
+	    time = collect(range(dt, step=dt, length=npts_original))
+	
+	    W_pad_buf  = zeros(ComplexF64, npts_padded, N_initial)
+	    SPEC_buf   = zeros(ComplexF64, npts_padded, N_initial)
+	    Z_buf      = zeros(ComplexF64, npts_padded, N_initial)
+	    Z_time_buf = zeros(ComplexF64, npts_padded, N_initial)
+	    envelopes_buf = zeros(Float64, npts_original, nfreq, N_initial)
+	    filtered_buf  = zeros(Float64, npts_original, nfreq, N_initial)
+	    arrivals_buf  = fill(NaN, nfreq, N_initial)
+	    phases_buf    = fill(NaN, nfreq, N_initial)
+	
+	    # Out-of-place plans measured against the initial buffer shapes
+	    plan_fwd = FFTW.plan_fft(W_pad_buf, 1)
+	    plan_inv = FFTW.plan_ifft(Z_buf, 1)
+	
+	    MFTFilterBank(
+	        periods, frequencies, dt, dt_original, npts_original, npts_padded, nfreq,
+	        velocity_range, bandwidth_factor, zero_pad_factor, time, H_full,
+	        N_initial, W_pad_buf, SPEC_buf, Z_buf, Z_time_buf,
+	        envelopes_buf, filtered_buf, arrivals_buf, phases_buf,
+	        plan_fwd, plan_inv,
+	    )
+	end
+end
+
+# ╔═╡ c062cc38-7e5e-4df7-8a19-ae23191c343c
+
+
+# ╔═╡ c9da28e0-64ae-491f-879e-47b2490babac
+function _ensure_batch_size!(bank::MFTFilterBank, N::Int)
+    N <= bank.N_buf && return
+    bank.N_buf         = N
+    bank.W_pad_buf     = zeros(ComplexF64, bank.npts_padded, N)
+    bank.SPEC_buf      = zeros(ComplexF64, bank.npts_padded, N)
+    bank.Z_buf         = zeros(ComplexF64, bank.npts_padded, N)
+    bank.Z_time_buf    = zeros(ComplexF64, bank.npts_padded, N)
+    bank.envelopes_buf = zeros(Float64, bank.npts_original, bank.nfreq, N)
+    bank.filtered_buf  = zeros(Float64, bank.npts_original, bank.nfreq, N)
+    bank.arrivals_buf  = fill(NaN, bank.nfreq, N)
+    bank.phases_buf    = fill(NaN, bank.nfreq, N)
+    bank.plan_fwd = FFTW.plan_fft(bank.W_pad_buf, 1)
+    bank.plan_inv = FFTW.plan_ifft(bank.Z_buf, 1)
+    return nothing
+end
+
+# ╔═╡ bdb2f320-c713-43aa-bb6b-98cca0606266
+function _assemble_mft_result(bank::MFTFilterBank, dist::Float64, n::Int,
+                               all_peaks_n::Vector{Vector{Tuple{Float64,Float64}}};
+                               compute_phase::Bool=false,
+                               phvel_correction::Float64=0.0)
+    nfreq = bank.nfreq
+    phase_branch_numbers = collect(-3:3)
+    nbranches = length(phase_branch_numbers)
+
+    arrivals     = bank.arrivals_buf[:, n]
+    filtered     = bank.filtered_buf[:, :, n]
+    envelopes    = bank.envelopes_buf[:, :, n]
+
+    group_velocities      = fill(NaN, nfreq)
+    amplitudes            = zeros(Float64, nfreq)
+    quality_factors       = zeros(Float64, nfreq)
+    phase_velocities      = fill(NaN, nfreq)
+    phase_velocity_branches = fill(NaN, nfreq, nbranches)
+    raw_phases            = fill(NaN, nfreq)
+
+    for ifreq in 1:nfreq
+        t_g = arrivals[ifreq]
+        envelope = @view envelopes[:, ifreq]
+        peaks = all_peaks_n[ifreq]
+        amp_peak = isempty(peaks) ? 0.0 : first(peaks)[2]
+
+        if !isnan(t_g) && t_g > 0.0
+            group_velocities[ifreq] = dist / t_g
+        end
+        amplitudes[ifreq]     = isnan(t_g) ? maximum(envelope) : amp_peak
+        mean_env              = mean(envelope)
+        quality_factors[ifreq] = mean_env > 0.0 ? amplitudes[ifreq] / mean_env : 0.0
+
+        if compute_phase && !isnan(t_g) && t_g > 0.0
+            raw_phases[ifreq] = bank.phases_buf[ifreq, n]
+        end
+    end
+
+    if compute_phase
+        valid = .!isnan.(raw_phases) .& .!isnan.(arrivals) .& (arrivals .> 0.0)
+        valid_idxs = findall(valid)
+        if length(valid_idxs) >= 2
+            omegas = 2π .* bank.frequencies
+            order  = sortperm(bank.frequencies[valid_idxs])
+            valid_sorted = valid_idxs[order]
+            phase_diffs_valid = [
+                omegas[i] * arrivals[i] - raw_phases[i] + phvel_correction
+                for i in valid_sorted
+            ]
+            phase_diffs_unwrapped = DSP.unwrap(phase_diffs_valid)
+            for (j, i) in enumerate(valid_sorted)
+                denom0 = phase_diffs_unwrapped[j]
+                for (ib, branch) in enumerate(phase_branch_numbers)
+                    denom = denom0 + 2π * branch
+                    if abs(denom) > 1e-6
+                        c = omegas[i] * dist / denom
+                        phase_velocity_branches[i, ib] = (0.5 ≤ c ≤ 20.0) ? c : NaN
+                    end
+                end
+                phase_velocities[i] = phase_velocity_branches[i, findfirst(==(0), phase_branch_numbers)]
+            end
+        end
+    end
+
+    return MFTResult(
+        bank.periods, bank.frequencies,
+        group_velocities, phase_velocities,
+        phase_branch_numbers, phase_velocity_branches,
+        amplitudes, filtered, envelopes, arrivals,
+        dist, quality_factors, all_peaks_n, bank.time,
+    )
+end
+
+# ╔═╡ 9a6cb7e1-6ea0-4dd1-97f3-47f3b8a717de
+# --- Phase 1: dist-independent (upsample, FFT, filter, IFFT → fills envelopes_buf/filtered_buf)
+function _run_phase1!(bank::MFTFilterBank, W_flat::AbstractMatrix{Float64}, N::Int)
+    W_up = DSP.resample(W_flat, 10.0; dims=1)   # (npts_original × N) — one allocation
+    @views bank.W_pad_buf[:, 1:N] .= 0
+    @views bank.W_pad_buf[1:bank.npts_original, 1:N] .= W_up
+    mul!(bank.SPEC_buf, bank.plan_fwd, bank.W_pad_buf)
+    for ifreq in 1:bank.nfreq
+        @views @. bank.Z_buf[:, 1:N] = bank.H_full[:, ifreq] * bank.SPEC_buf[:, 1:N]
+        mul!(bank.Z_time_buf, bank.plan_inv, bank.Z_buf)
+        @views @. bank.filtered_buf[1:bank.npts_original, ifreq, 1:N]  =
+            real(bank.Z_time_buf[1:bank.npts_original, 1:N])
+        @views @. bank.envelopes_buf[1:bank.npts_original, ifreq, 1:N] =
+            abs(bank.Z_time_buf[1:bank.npts_original, 1:N])
+    end
+end
+
+# ╔═╡ 6a5c34ae-f358-40bd-8954-6d7e8fb0fa8f
+# --- Phase 2: dist-dependent (peak finding + assembly → returns Vector{MFTResult})
+function _run_phase2!(bank::MFTFilterBank, dists_flat::AbstractVector{Float64}, N::Int;
+                      compute_phase::Bool=false, phvel_correction::Float64=0.0)
+    bank.arrivals_buf[:, 1:N] .= NaN
+    bank.phases_buf[:, 1:N]   .= NaN
+    min_vel, max_vel = bank.velocity_range
+
+    all_peaks = [[Tuple{Float64,Float64}[] for _ in 1:bank.nfreq] for _ in 1:N]
+    for n in 1:N
+        dist  = dists_flat[n]
+        t_min = dist / max_vel
+        t_max = dist / min_vel
+        for ifreq in 1:bank.nfreq
+            env   = @view bank.envelopes_buf[:, ifreq, n]
+            peaks = find_group_arrivals(env, bank.time, (t_min, t_max); max_peaks=4)
+            all_peaks[n][ifreq] = peaks
+            t_g   = isempty(peaks) ? NaN : first(peaks)[1]
+            bank.arrivals_buf[ifreq, n] = t_g
+            if compute_phase && isfinite(t_g) && t_g > 0.0
+                i_g = clamp(round(Int, (t_g - bank.time[1]) / bank.dt) + 1, 1, bank.npts_original)
+                re      = bank.filtered_buf[i_g, ifreq, n]
+                env_val = bank.envelopes_buf[i_g, ifreq, n]
+                bank.phases_buf[ifreq, n] = atan(sqrt(max(env_val^2 - re^2, 0.0)), re)
+            end
+        end
+    end
+
+    results = Vector{MFTResult}(undef, N)
+    for n in 1:N
+        results[n] = _assemble_mft_result(bank, dists_flat[n], n, all_peaks[n];
+                                          compute_phase, phvel_correction)
+    end
+    return results
+end
+
+# ╔═╡ 0a2beec9-fe91-4af8-8646-064ec215c1e6
+"""
+    perform_mft_analysis_batch!(bank, W, dist; compute_phase=false) -> Vector{MFTResult}
+    perform_mft_analysis_batch!(bank, W, dists; compute_phase=false) -> Array{MFTResult}
+
+Run MFT on a batch of waveforms using a pre-computed `MFTFilterBank`.
+
+**2-D form** — `W::AbstractMatrix{Float64}` of shape `(nt × N)`, `dist::Float64`:
+Returns `Vector{MFTResult}` of length N. One shared distance for all waveforms.
+
+**N-D form** — `W::AbstractArray{Float64}` of shape `(nt × d1 × d2 × ...)`,
+`dists::AbstractArray{Float64}` of shape `(d1 × d2 × ...)`:
+Returns `Array{MFTResult}` with the same shape `(d1 × d2 × ...)`.
+Each position uses its own distance from `dists`. All waveforms are FFT'd in one
+batch pass (Phase 1), then peak-finding and assembly use the per-position distance
+(Phase 2). `reshape` is zero-copy so no data is duplicated.
+
+Scalar-dist convenience: passing `dist::Float64` to the N-D form broadcasts to
+`fill(dist, size(W)[2:end])` — equivalent to the 2-D form.
+"""
+function perform_mft_analysis_batch!(bank::MFTFilterBank,
+                                     W::AbstractMatrix{Float64},
+                                     dist::Float64;
+                                     compute_phase::Bool=false,
+                                     phvel_correction::Float64=0.0)
+    N = size(W, 2)
+    _ensure_batch_size!(bank, N)
+    _run_phase1!(bank, W, N)
+    return _run_phase2!(bank, fill(dist, N), N; compute_phase, phvel_correction)
+end
+
+# ╔═╡ f57cbf2e-5dcb-4e0a-90a5-5f2c363990cd
+function perform_mft_analysis_batch!(bank::MFTFilterBank,
+                                     W::AbstractArray{Float64},
+                                     dists::AbstractArray{Float64};
+                                     compute_phase::Bool=false,
+                                     phvel_correction::Float64=0.0)
+    dims = size(W)[2:end]
+    @assert size(dists) == dims "dists shape $(size(dists)) must match trailing dims of W $(dims)"
+    N = prod(dims)
+    _ensure_batch_size!(bank, N)
+    _run_phase1!(bank, reshape(W, size(W, 1), N), N)
+    results_flat = _run_phase2!(bank, vec(dists), N; compute_phase, phvel_correction)
+    return reshape(results_flat, dims)
+end
+
+# ╔═╡ f310a7fd-cab6-4d92-b54e-060e113ab2f1
+# Scalar-dist convenience for N-D arrays (broadcasts one distance to all positions)
+function perform_mft_analysis_batch!(bank::MFTFilterBank,
+                                     W::AbstractArray{Float64},
+                                     dist::Float64;
+                                     kwargs...)
+    dims = size(W)[2:end]
+    return perform_mft_analysis_batch!(bank, W, fill(dist, dims); kwargs...)
+end
+
+# ╔═╡ 4c5a5106-95ab-4b29-9cd8-6def65e72b87
+"""
+    perform_mft_analysis(trace, bank; compute_phase=true, phvel_correction=0.0)
+
+Single-trace MFT using a pre-computed `MFTFilterBank`.
+Drop-in replacement for `perform_mft_analysis(trace, periods; ...)` with
+pre-planned FFTs and no per-call filter recomputation.
+"""
+function perform_mft_analysis(trace::SeismicTrace, bank::MFTFilterBank;
+                               compute_phase::Bool=true,
+                               phvel_correction::Float64=0.0)
+    W = reshape(Float64.(trace.data), :, 1)
+    return only(perform_mft_analysis_batch!(bank, W, trace.distance;
+                                            compute_phase, phvel_correction))
+end
+
+# ╔═╡ 2de6446f-d07c-4151-8e13-0719c3056826
+res = perform_mft_analysis(Xsynthetic, (period_min, period_max), n_periods;
+    bandwidth_factor = bandwidth_percent / 100.0,
+    zero_pad_factor = zero_pad_factor,
+	phvel_correction = phvel_mode == "noise_cc" ? π/4 : 0.0,
+	compute_phase    = phvel_mode != "none")
+
+# ╔═╡ 09d3b269-c8bd-425a-ad4a-1ecd29150507
+plot_envelopes(res, title="Envelopes")
+
+# ╔═╡ 1585e739-23c2-4a23-8e80-6f132d503765
+plot_dispersion_curve([res, res], title=string("Group Velocity"))
+
+# ╔═╡ 7b8ea90d-a09d-4952-bd66-943808dc9d3b
+res_synthetic_test = let
+	# plot(synthetic_data)
+			
+	       
+
+	        # Apply multi-band pre-filter if enabled
+	        filtered_components = nothing
+	        D = if apply_prefilter_flag
+
+	            filtered_components = multiple_narrow_band_filters(synthetic_test_data.data, synthetic_test_data.dt, log_period_bands, prefilter_bw)
+	            @info "Applied multi-band pre-filter: T=$(log_period_bands) s, BW=$(prefilter_bw)%"
+				mean(filtered_components)
+			else
+				synthetic_test_data.data
+	        end
+
+	 # Create seismic trace
+	        trace = SeismicTrace(
+	            data=D,
+	            dt=synthetic_test_data.dt,
+	            distance=synthetic_test_data.distance
+	        )
+
+	
+	        # Perform MFT analysis
+	        periods_analysis = synthetic_test_data.periods
+	        (; res=perform_mft_analysis(
+	            trace,
+	            periods_analysis,
+	            velocity_range = (2.0 - 0.5, 5.0 + 0.5),
+                bandwidth_factor = synth_bandwidth / 100.0,
+                zero_pad_factor = synth_zero_pad_factor,
+	            compute_phase  = true
+	        ), filtered_trace=trace, filtered_components=filtered_components)
+end
+
+# ╔═╡ c169578d-3dd2-42f8-8e57-4146a8dca2cd
+plot_dispersion_curve(res_synthetic_test.res)
+
+# ╔═╡ 9db0d269-d3ca-48fc-9583-91b5e11822d2
+WideCell(plot_phase_velocities(res_synthetic_test.res))
+
+# ╔═╡ 2ba1a355-d9fa-4268-b046-0b201191c11e
+plot_envelopes(res_synthetic_test.res)
+
+# ╔═╡ 44fad356-ff66-4bbc-a83b-5d8d996d95a5
+plot(res_synthetic_test.filtered_trace.data)
+
+# ╔═╡ 8dc0f4bc-00cb-11f1-9443-a59380edd23b
+let
+	# Show original vs pre-filtered data with individual components
+    if apply_prefilter_flag
+        trace_original = SeismicTrace(
+            data=synthetic_test_data.data,
+            dt=synthetic_test_data.dt,
+            distance=synthetic_test_data.distance
+        )
+        
+        central_periods = log_period_bands
+        
+        # Get filtered components and sum
+        filtered_trace = res_synthetic_test.filtered_trace
+        filtered_components = res_synthetic_test.filtered_components
+        
+        # Plot comparison
+        traces = [scatter()]
+        
+        # Original signal
+        push!(traces, scatter(
+            x = synthetic_test_data.t,
+            y = synthetic_test_data.data ./ maximum(abs.(synthetic_test_data.data)),
+            mode = "lines",
+            name = "Original",
+            line = attr(color = "lightgray", width = 1),
+            opacity = 0.3
+        ))
+        
+        # Individual filtered components
+        if !isnothing(filtered_components)
+            colors = ["blue", "green", "orange"]
+            for (i, (T, filt, color)) in enumerate(zip(central_periods, filtered_components, colors))
+                # Normalize for display
+                filt_norm = filt ./ maximum(abs.(filt)) .* 0.5
+                push!(traces, scatter(
+                    x = synthetic_test_data.t,
+                    y = filt_norm,
+                    mode = "lines",
+                    name = "T=$(T)s band",
+                    line = attr(color = color, width = 1.5, dash = "dot"),
+                    opacity = 0.6
+                ))
+            end
+        end
+        
+        # Summed filtered signal
+        push!(traces, scatter(
+            x = synthetic_test_data.t,
+            y = filtered_trace.data ./ maximum(abs.(filtered_trace.data)),
+            mode = "lines",
+            name = "Sum of 3 bands",
+            line = attr(color = "red", width = 2.5)
+        ))
+        
+        layout = Layout(
+            title = "Multi-band Pre-filtering: Individual Components + Sum",
+            xaxis = attr(title = "Time (s)"),
+            yaxis = attr(title = "Amplitude"),
+            width = 900,
+            height = 500,
+            plot_bgcolor = "white",
+            legend = attr(x = 0.02, y = 0.98)
+        )
+        
+        PlutoPlotly.plot(traces, layout)
+    else
+        md"**Pre-filter disabled.** Check the box above to enable."
+    end
+end
+
+# ╔═╡ 8dc0fc46-00cb-11f1-9407-453086ae541f
+let
+	if apply_prefilter_flag
+        # Compute FFT of original and filtered data
+        original_fft = fft(synthetic_test_data.data)
+        filtered_fft = fft(res_synthetic_test.filtered_trace.data)
+        
+        # Frequency vector
+        n = length(synthetic_test_data.data)
+        freqs = fftfreq(n, 1.0/synthetic_test_data.dt)
+        
+        # Only positive frequencies
+        pos_idx = freqs .> 0
+        freqs_pos = freqs[pos_idx]
+        
+        # Amplitude spectrum
+        amp_original = abs.(original_fft[pos_idx])
+        amp_filtered = abs.(filtered_fft[pos_idx])
+        
+        # Normalize
+        amp_original ./= maximum(amp_original)
+        amp_filtered ./= maximum(amp_filtered)
+        
+        traces_spec = [scatter()]
+        
+        push!(traces_spec, scatter(
+            x = freqs_pos,
+            y = amp_original,
+            mode = "lines",
+            name = "Original Spectrum",
+            line = attr(color = "gray", width = 2),
+            opacity = 0.5
+        ))
+        
+        push!(traces_spec, scatter(
+            x = freqs_pos,
+            y = amp_filtered,
+            mode = "lines",
+            name = "Filtered Spectrum (sum)",
+            line = attr(color = "red", width = 2.5)
+        ))
+        
+        # Mark center frequencies for all three periods
+        central_periods = log_period_bands
+        colors = ["blue", "green", "orange"]
+        for (T, color) in zip(central_periods, colors)
+            fc = 1.0 / T
+            push!(traces_spec, scatter(
+                x = [fc, fc],
+                y = [1e-4, 1],
+                mode = "lines",
+                name = "fc=$(round(fc, digits=3)) Hz (T=$(T)s)",
+                line = attr(color = color, width = 2, dash = "dash")
+            ))
+        end
+        
+        layout_spec = Layout(
+            title = "Frequency Domain: 3-Band Pre-filtering",
+            xaxis = attr(
+                title = "Frequency (Hz)",
+                range = [-2, log10(0.3)],
+                type = "log"
+            ),
+            yaxis = attr(
+                title = "Normalized Amplitude",
+                type = "log",
+                range = [-4, 0]
+            ),
+            width = 900,
+            height = 500,
+            plot_bgcolor = "white",
+            legend = attr(x = 0.65, y = 0.98, font=attr(size=10))
+        )
+        
+        PlutoPlotly.plot(traces_spec, layout_spec)
+    else
+        md"Enable pre-filter to see spectrum comparison."
+    end
+end
+
+# ╔═╡ 78a3288f-6b85-4ed1-a399-b4528799f95a
+let
+    run_synth_suite
+
+    distances = [100.0, 250.0, 500.0, 1000.0]
+    noises = [0.0, 5.0, 10.0]
+    freqs = collect(0.02:0.01:0.30)
+    periods = inv.(freqs)
+
+    rows = String[]
+    push!(rows, "Synthetic MFT benchmark (group + phase errors)")
+    push!(rows, "dist[km] noise[%] g_mean[%] g_max[%] p_mean[%] p_max[%] n_g n_p")
+
+    for dist in distances
+        for noise in noises
+            dt = inv(2.0 * maximum(freqs))
+            t = collect(0:dt:300)
+
+            u, cg, cp, tg = multi_frequency_cosine_sum(
+                t, dist;
+                freqs=freqs,
+                c0=3.5,
+                α=1.0
+            )
+            data = u ./ maximum(abs, u) .+ noise / 100.0 * randn(length(u))
+            trace = SeismicTrace(data=data, dt=dt, distance=dist)
+
+            res_case = perform_mft_analysis(
+                trace,
+                periods;
+                velocity_range=(1.5, 6.5),
+                bandwidth_factor=synth_bandwidth / 100.0,
+                zero_pad_factor=synth_zero_pad_factor,
+                compute_phase=true
+            )
+
+            m = compute_velocity_error_metrics(res_case, periods, cg, cp)
+            push!(rows,
+                @sprintf("%7.1f %8.1f %8.2f %8.2f %8.2f %8.2f %4d %4d",
+                         dist, noise, m.group_mean, m.group_max,
+                         m.phase_mean, m.phase_max, m.n_group, m.n_phase)
+            )
+        end
+    end
+
+    print("```\n" * join(rows, "\n") * "\n```")
+end
+
+# ╔═╡ 347f9eb0-3cdc-11f1-a7ce-4d4b3258205b
+"""
+    analyze_causal_acausal_branches(trace_causal::SeismicTrace, trace_acausal::SeismicTrace,
+                                   periods::Vector{Float64}; max_modes=4,
+                                   compute_correlation=true, kwargs...) -> BranchAnalysisResult
+
+Single-source-state branch analysis (backward-compatible API).
+"""
+function analyze_causal_acausal_branches(trace_causal::SeismicTrace,
+                                         trace_acausal::SeismicTrace,
+                                         periods::Vector{Float64};
+                                         max_modes::Int=4,
+                                         compute_correlation::Bool=true,
+                                         kwargs...)
+    # Validate input
+    @assert length(trace_causal.data) == length(trace_acausal.data) "Causal and acausal traces must have same length"
+    @assert trace_causal.dt ≈ trace_acausal.dt "Causal and acausal traces must have same sampling interval"
+    
+    # Perform MFT analysis on both branches
+    result_causal = perform_mft_analysis(trace_causal, periods; kwargs...)
+    result_acausal = perform_mft_analysis(trace_acausal, periods; kwargs...)
+    
+    # Extract modes from both branches
+    modes_causal = extract_all_modes(result_causal; distance=trace_causal.distance, max_modes=max_modes)
+    modes_acausal = extract_all_modes(result_acausal; distance=trace_causal.distance, max_modes=max_modes)
+    
+    # Compute branch correlation if requested
+    correlations = fill(NaN, length(periods))
+    if compute_correlation
+        correlations = zero_lag_correlation(result_causal.filtered_traces, result_acausal.filtered_traces)
+    end
+    
+    return BranchAnalysisResult(result_causal, result_acausal, 
+                               modes_causal, modes_acausal,
+                               correlations, periods, trace_causal.distance)
+end
+
+# ╔═╡ fb000010-0000-0000-0000-000000000001
+"""
+    analyze_causal_acausal_branches(W_c, W_ac, dists, bank; ...)
+        -> BranchBatchAnalysisResult
+
+Array-based, bank-accelerated multi-state analysis. All 2·nstates waveforms
+are FFT'd in a single batch (one `_run_phase1!` call), then peak-finding and
+assembly run per-trace.
+
+# Arguments
+- `W_c`   : `(nt × nstates)` causal waveforms
+- `W_ac`  : `(nt × nstates)` acausal waveforms
+- `dists` : distances [km], either a scalar `Float64` or length-`nstates` vector
+- `bank`  : pre-computed `MFTFilterBank` (sets periods, bandwidth, etc.)
+"""
+function analyze_causal_acausal_branches(W_c::AbstractMatrix{<:Real},
+                                         W_ac::AbstractMatrix{<:Real},
+                                         dists::Union{Float64,AbstractVector{<:Real}},
+                                         bank::MFTFilterBank;
+                                         state_labels=nothing,
+                                         max_modes::Int=4,
+                                         compute_correlation::Bool=true,
+                                         compute_phase::Bool=false,
+                                         phvel_correction::Float64=0.0)
+    nt, nstates = size(W_c)
+    @assert size(W_ac) == (nt, nstates) "W_c and W_ac must have the same shape"
+    dists_vec = dists isa Float64 ? fill(dists, nstates) : Float64.(dists)
+    @assert length(dists_vec) == nstates "dists length must equal nstates"
+
+    labels = if isnothing(state_labels)
+        ["State $(i)" for i in 1:nstates]
+    else
+        @assert length(state_labels) == nstates
+        string.(state_labels)
+    end
+
+    periods = bank.periods
+    W_all     = Matrix{Float64}(undef, nt, 2 * nstates)
+    dists_all = Vector{Float64}(undef, 2 * nstates)
+    for i in 1:nstates
+        W_all[:, i]           = Float64.(W_c[:, i])
+        W_all[:, nstates + i] = Float64.(W_ac[:, i])
+        dists_all[i]           = dists_vec[i]
+        dists_all[nstates + i] = dists_vec[i]
+    end
+
+    _ensure_batch_size!(bank, 2 * nstates)
+    _run_phase1!(bank, W_all, 2 * nstates)
+    results_all = _run_phase2!(bank, dists_all, 2 * nstates;
+                               compute_phase=compute_phase,
+                               phvel_correction=phvel_correction)
+
+    state_results = BranchAnalysisResult[]
+    corr_matrix   = fill(NaN, length(periods), nstates)
+    for i in 1:nstates
+        res_c = results_all[i]
+        res_a = results_all[nstates + i]
+        d     = dists_vec[i]
+        modes_c = extract_all_modes(res_c; distance=d, max_modes=max_modes)
+        modes_a = extract_all_modes(res_a; distance=d, max_modes=max_modes)
+        correlations = fill(NaN, length(periods))
+        if compute_correlation
+            correlations = zero_lag_correlation(res_c.filtered_traces, res_a.filtered_traces)
+        end
+        push!(state_results,
+              BranchAnalysisResult(res_c, res_a, modes_c, modes_a, correlations, periods, d))
+        corr_matrix[:, i] = correlations
+    end
+    return BranchBatchAnalysisResult(state_results, corr_matrix, periods, labels)
+end
+
+# ╔═╡ fb000011-0000-0000-0000-000000000001
+"""
+    analyze_causal_acausal_branches(w_c, w_ac, dist, bank; ...)
+        -> BranchAnalysisResult
+
+Array-based, bank-accelerated single-state analysis. Both vectors are FFT'd
+together in a 2-column batch.
+
+# Arguments
+- `w_c`  : length-`nt` causal waveform vector
+- `w_ac` : length-`nt` acausal waveform vector
+- `dist` : source–receiver distance [km]
+- `bank` : pre-computed `MFTFilterBank`
+"""
+function analyze_causal_acausal_branches(w_c::AbstractVector{<:Real},
+                                         w_ac::AbstractVector{<:Real},
+                                         dist::Float64,
+                                         bank::MFTFilterBank;
+                                         max_modes::Int=4,
+                                         compute_correlation::Bool=true,
+                                         compute_phase::Bool=false,
+                                         phvel_correction::Float64=0.0)
+    W_c  = reshape(Float64.(w_c),  :, 1)
+    W_ac = reshape(Float64.(w_ac), :, 1)
+    res = analyze_causal_acausal_branches(W_c, W_ac, dist, bank;
+              max_modes=max_modes, compute_correlation=compute_correlation,
+              compute_phase=compute_phase, phvel_correction=phvel_correction,
+              state_labels=["state 1"])
+    return only(res.state_results)
+end
+
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
 [deps]
@@ -5070,5 +5492,17 @@ version = "17.7.0+0"
 # ╠═a1000006-0000-0000-0000-000000000001
 # ╠═a1000007-0000-0000-0000-000000000001
 # ╠═a1000008-0000-0000-0000-000000000001
+# ╠═1f405df8-9fef-436a-a713-1e2cab48b541
+# ╠═c062cc38-7e5e-4df7-8a19-ae23191c343c
+# ╠═c9da28e0-64ae-491f-879e-47b2490babac
+# ╠═bdb2f320-c713-43aa-bb6b-98cca0606266
+# ╠═9a6cb7e1-6ea0-4dd1-97f3-47f3b8a717de
+# ╠═6a5c34ae-f358-40bd-8954-6d7e8fb0fa8f
+# ╠═0a2beec9-fe91-4af8-8646-064ec215c1e6
+# ╠═f57cbf2e-5dcb-4e0a-90a5-5f2c363990cd
+# ╠═f310a7fd-cab6-4d92-b54e-060e113ab2f1
+# ╠═4c5a5106-95ab-4b29-9cd8-6def65e72b87
+# ╠═fb000010-0000-0000-0000-000000000001
+# ╠═fb000011-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
